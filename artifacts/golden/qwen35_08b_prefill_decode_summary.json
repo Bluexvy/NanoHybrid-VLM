@@ -1,0 +1,1072 @@
+{
+  "model_id": "Qwen/Qwen3.5-0.8B",
+  "checkpoint_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "dtype": "torch.bfloat16",
+  "prompt": "一句话解释什么是KV cache",
+  "prompt_token_ids": [
+    248045,
+    846,
+    198,
+    110827,
+    98682,
+    108829,
+    79852,
+    6297,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+  ],
+  "prefill": {
+    "input_shape": [
+      1,
+      17
+    ],
+    "logits_shape": [
+      1,
+      1,
+      248320
+    ],
+    "logits": {
+      "argmax_token_id": 79852,
+      "argmax_token_text": "KV",
+      "top_token_ids": [
+        79852,
+        42,
+        332,
+        1536,
+        96540,
+        97018,
+        7976,
+        108966,
+        63,
+        111734
+      ],
+      "top_token_texts": [
+        "KV",
+        "K",
+        "**",
+        "Key",
+        "它",
+        "为了",
+        "Cache",
+        "它是",
+        "`",
+        "缓存"
+      ],
+      "top_values": [
+        24.125,
+        19.625,
+        18.125,
+        18.0,
+        17.375,
+        17.25,
+        17.0,
+        16.75,
+        16.625,
+        16.5
+      ],
+      "minimum": -7.875,
+      "maximum": 24.125,
+      "mean": 1.3040189743041992,
+      "std": 2.5087013244628906
+    },
+    "cache": {
+      "sequence_length": 17,
+      "layers": [
+        {
+          "layer_idx": 0,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 1,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 2,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 3,
+          "layer_type": "full_attention",
+          "cache_class": "DynamicLayer",
+          "key_shape": [
+            1,
+            2,
+            17,
+            256
+          ],
+          "value_shape": [
+            1,
+            2,
+            17,
+            256
+          ],
+          "key_dtype": "torch.bfloat16",
+          "value_dtype": "torch.bfloat16",
+          "num_bytes": 34816
+        },
+        {
+          "layer_idx": 4,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 5,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 6,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 7,
+          "layer_type": "full_attention",
+          "cache_class": "DynamicLayer",
+          "key_shape": [
+            1,
+            2,
+            17,
+            256
+          ],
+          "value_shape": [
+            1,
+            2,
+            17,
+            256
+          ],
+          "key_dtype": "torch.bfloat16",
+          "value_dtype": "torch.bfloat16",
+          "num_bytes": 34816
+        },
+        {
+          "layer_idx": 8,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 9,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 10,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 11,
+          "layer_type": "full_attention",
+          "cache_class": "DynamicLayer",
+          "key_shape": [
+            1,
+            2,
+            17,
+            256
+          ],
+          "value_shape": [
+            1,
+            2,
+            17,
+            256
+          ],
+          "key_dtype": "torch.bfloat16",
+          "value_dtype": "torch.bfloat16",
+          "num_bytes": 34816
+        },
+        {
+          "layer_idx": 12,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 13,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 14,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 15,
+          "layer_type": "full_attention",
+          "cache_class": "DynamicLayer",
+          "key_shape": [
+            1,
+            2,
+            17,
+            256
+          ],
+          "value_shape": [
+            1,
+            2,
+            17,
+            256
+          ],
+          "key_dtype": "torch.bfloat16",
+          "value_dtype": "torch.bfloat16",
+          "num_bytes": 34816
+        },
+        {
+          "layer_idx": 16,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 17,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 18,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 19,
+          "layer_type": "full_attention",
+          "cache_class": "DynamicLayer",
+          "key_shape": [
+            1,
+            2,
+            17,
+            256
+          ],
+          "value_shape": [
+            1,
+            2,
+            17,
+            256
+          ],
+          "key_dtype": "torch.bfloat16",
+          "value_dtype": "torch.bfloat16",
+          "num_bytes": 34816
+        },
+        {
+          "layer_idx": 20,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 21,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 22,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 23,
+          "layer_type": "full_attention",
+          "cache_class": "DynamicLayer",
+          "key_shape": [
+            1,
+            2,
+            17,
+            256
+          ],
+          "value_shape": [
+            1,
+            2,
+            17,
+            256
+          ],
+          "key_dtype": "torch.bfloat16",
+          "value_dtype": "torch.bfloat16",
+          "num_bytes": 34816
+        }
+      ],
+      "total_num_bytes": 19968000
+    }
+  },
+  "decode": {
+    "input_token_id": 79852,
+    "input_shape": [
+      1,
+      1
+    ],
+    "logits_shape": [
+      1,
+      1,
+      248320
+    ],
+    "logits": {
+      "argmax_token_id": 18887,
+      "argmax_token_text": " Cache",
+      "top_token_ids": [
+        18887,
+        6297,
+        220,
+        9616,
+        35464,
+        318,
+        351,
+        7976,
+        7415,
+        111734
+      ],
+      "top_token_texts": [
+        " Cache",
+        " cache",
+        " ",
+        "（",
+        "-cache",
+        " (",
+        " C",
+        "Cache",
+        "-C",
+        "缓存"
+      ],
+      "top_values": [
+        21.25,
+        20.25,
+        18.625,
+        16.125,
+        15.9375,
+        15.5,
+        15.3125,
+        15.0,
+        14.9375,
+        13.9375
+      ],
+      "minimum": -11.5,
+      "maximum": 21.25,
+      "mean": -2.2694122791290283,
+      "std": 2.4666380882263184
+    },
+    "cache": {
+      "sequence_length": 18,
+      "layers": [
+        {
+          "layer_idx": 0,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 1,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 2,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 3,
+          "layer_type": "full_attention",
+          "cache_class": "DynamicLayer",
+          "key_shape": [
+            1,
+            2,
+            18,
+            256
+          ],
+          "value_shape": [
+            1,
+            2,
+            18,
+            256
+          ],
+          "key_dtype": "torch.bfloat16",
+          "value_dtype": "torch.bfloat16",
+          "num_bytes": 36864
+        },
+        {
+          "layer_idx": 4,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 5,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 6,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 7,
+          "layer_type": "full_attention",
+          "cache_class": "DynamicLayer",
+          "key_shape": [
+            1,
+            2,
+            18,
+            256
+          ],
+          "value_shape": [
+            1,
+            2,
+            18,
+            256
+          ],
+          "key_dtype": "torch.bfloat16",
+          "value_dtype": "torch.bfloat16",
+          "num_bytes": 36864
+        },
+        {
+          "layer_idx": 8,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 9,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 10,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 11,
+          "layer_type": "full_attention",
+          "cache_class": "DynamicLayer",
+          "key_shape": [
+            1,
+            2,
+            18,
+            256
+          ],
+          "value_shape": [
+            1,
+            2,
+            18,
+            256
+          ],
+          "key_dtype": "torch.bfloat16",
+          "value_dtype": "torch.bfloat16",
+          "num_bytes": 36864
+        },
+        {
+          "layer_idx": 12,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 13,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 14,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 15,
+          "layer_type": "full_attention",
+          "cache_class": "DynamicLayer",
+          "key_shape": [
+            1,
+            2,
+            18,
+            256
+          ],
+          "value_shape": [
+            1,
+            2,
+            18,
+            256
+          ],
+          "key_dtype": "torch.bfloat16",
+          "value_dtype": "torch.bfloat16",
+          "num_bytes": 36864
+        },
+        {
+          "layer_idx": 16,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 17,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 18,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 19,
+          "layer_type": "full_attention",
+          "cache_class": "DynamicLayer",
+          "key_shape": [
+            1,
+            2,
+            18,
+            256
+          ],
+          "value_shape": [
+            1,
+            2,
+            18,
+            256
+          ],
+          "key_dtype": "torch.bfloat16",
+          "value_dtype": "torch.bfloat16",
+          "num_bytes": 36864
+        },
+        {
+          "layer_idx": 20,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 21,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 22,
+          "layer_type": "linear_attention",
+          "cache_class": "LinearAttentionLayer",
+          "conv_shape": [
+            1,
+            6144,
+            4
+          ],
+          "recurrent_shape": [
+            1,
+            16,
+            128,
+            128
+          ],
+          "conv_dtype": "torch.bfloat16",
+          "recurrent_dtype": "torch.float32",
+          "num_bytes": 1097728
+        },
+        {
+          "layer_idx": 23,
+          "layer_type": "full_attention",
+          "cache_class": "DynamicLayer",
+          "key_shape": [
+            1,
+            2,
+            18,
+            256
+          ],
+          "value_shape": [
+            1,
+            2,
+            18,
+            256
+          ],
+          "key_dtype": "torch.bfloat16",
+          "value_dtype": "torch.bfloat16",
+          "num_bytes": 36864
+        }
+      ],
+      "total_num_bytes": 19980288
+    }
+  }
+}
