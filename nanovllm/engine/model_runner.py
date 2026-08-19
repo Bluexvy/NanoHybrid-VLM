@@ -6,7 +6,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.registry import get_model_class
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -14,21 +14,63 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(    
+        self,
+        config: Config,
+        rank: int,
+        event: Event | list[Event],
+    ):
+        
         self.config = config
-        hf_config = config.hf_config
+        
+        root_config = config.hf_config
+        text_config = config.text_config
+        # 如果 Config 还没有完成初始化，ModelRunner 不允许继续运行。
+        if root_config is None or text_config is None:
+            raise RuntimeError(
+                "Config must initialize hf_config and "
+                "text_config before ModelRunner construction"
+            )
+
+        model_class = get_model_class(root_config)
+
+        model_dtype = getattr(
+            text_config,
+            "dtype",
+            None,
+        )
+
+        if model_dtype is None:
+            raise ValueError(
+                "The text model config does not define dtype"
+            )
+
+        self.root_config = root_config
+        self.text_config = text_config
+
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group(
+            "nccl",
+            "tcp://localhost:2333",
+            world_size=self.world_size,
+            rank=rank,
+        )
+
         torch.cuda.set_device(rank)
+
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
+
+        torch.set_default_dtype(model_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+
+        self.model = model_class(root_config)
+                
+        
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -102,17 +144,18 @@ class ModelRunner:
 
     def allocate_kv_cache(self):
         config = self.config
-        hf_config = config.hf_config
+        text_config = self.text_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        num_kv_heads = text_config.num_key_value_heads // self.world_size
+        head_dim = getattr(text_config, "head_dim", text_config.hidden_size // text_config.num_attention_heads)
+        # 
+        block_bytes = 2 * text_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * text_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(2, text_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -222,7 +265,7 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
-        hf_config = config.hf_config
+        text_config = self.text_config
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
@@ -230,7 +273,7 @@ class ModelRunner:
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        outputs = torch.zeros(max_bs, text_config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None

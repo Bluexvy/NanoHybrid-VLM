@@ -24,6 +24,9 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    
+    
+    
     # Config是dataclass 
     # __post_init__() 是 @dataclass 在自动执行完 __init__() 后调用的初始化hook
     # 但有些初始化工作不能只是赋值 还需要检查参数是否合法 所以不能只用dataclass

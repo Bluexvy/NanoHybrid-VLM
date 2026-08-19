@@ -4,19 +4,30 @@ from importlib import import_module
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
-
+# Registry只负责选择哪一个模型实现
+# frozen 对象创建后不能随便修改
 @dataclass(frozen=True, slots=True)
 class ModelEntry:
     """注册表中一条模型记录。"""
-
+    # 这个模型允许的 checkpoint architecture
     architectures: tuple[str, ...]
+    # 本地实现所在模块
     module: str
+    # 模块里的模型类
     class_name: str
 
 
 class ModelRegistry:
     """根据 Hugging Face 根配置查找 nano-vLLM 模型类。"""
 
+    # 内部维护一个字典 注册后类似：
+    # {
+    #     "qwen3": ModelEntry(
+    #         architectures=("Qwen3ForCausalLM",),
+    #         module="nanovllm.models.qwen3",
+    #         class_name="Qwen3ForCausalLM",
+    #     )
+    # }
     def __init__(self):
         self._entries: dict[str, ModelEntry] = {}
 
@@ -44,10 +55,13 @@ class ModelRegistry:
             class_name=class_name,
         )
 
+    # 输入 Huggingface的根配置 
+    # 输出 nn.Module模型类
     def resolve(
         self,
         root_config: PretrainedConfig,
     ) -> type[nn.Module]:
+        # model_type是模型家族： qwen3 / qwen3_5 / llama / gemma3
         model_type = getattr(
             root_config,
             "model_type",
@@ -66,17 +80,23 @@ class ModelRegistry:
 
         entry = self._entries[model_type]
 
+        # architectures 表示 checkpoint 顶层结构
+        # 例如Qwen3ForCausalLM
+        # Qwen3_5ForConditionalGeneration
+        # Qwen3_5TextModel
         checkpoint_architectures = getattr(
             root_config,
             "architectures",
             None,
         ) or ()
 
+        # 统一转成 tuple
         if isinstance(checkpoint_architectures, str):
             checkpoint_architectures = (
                 checkpoint_architectures,
             )
 
+        # 判断 architecture 是否匹配
         architecture_matches = any(
             architecture in entry.architectures
             for architecture in checkpoint_architectures
