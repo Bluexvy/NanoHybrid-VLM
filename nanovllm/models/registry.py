@@ -1,11 +1,14 @@
 from dataclasses import dataclass
+
+# 根据字符串动态导入模块
 from importlib import import_module
 
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
-# Registry只负责选择哪一个模型实现
-# frozen 对象创建后不能随便修改
+# Registry 只负责选择哪一个模型实现
+# frozen 注册信息属于静态元数据，不应该在程序运行中被意外改变。
+# slots=True 会限制对象只能拥有声明过的字段
 @dataclass(frozen=True, slots=True)
 class ModelEntry:
     """注册表中一条模型记录。"""
@@ -16,10 +19,6 @@ class ModelEntry:
     # 模块里的模型类
     class_name: str
 
-
-class ModelRegistry:
-    """根据 Hugging Face 根配置查找 nano-vLLM 模型类。"""
-
     # 内部维护一个字典 注册后类似：
     # {
     #     "qwen3": ModelEntry(
@@ -28,6 +27,9 @@ class ModelRegistry:
     #         class_name="Qwen3ForCausalLM",
     #     )
     # }
+class ModelRegistry:
+    """根据 Hugging Face 根配置查找 nano-vLLM 模型类。"""
+
     def __init__(self):
         self._entries: dict[str, ModelEntry] = {}
 
@@ -35,20 +37,22 @@ class ModelRegistry:
         self,
         *,
         model_type: str,
+        # 由任意数量字符串组成的 tuple
         architectures: tuple[str, ...],
         module: str,
         class_name: str,
     ) -> None:
+        # 前导下划线 _entries 表示它是 Registry 内部状态，外部不应直接操作
         if model_type in self._entries:
             raise ValueError(
                 f"Model type {model_type!r} is already registered"
             )
-
+        # 拒绝空的 arch
         if not architectures:
             raise ValueError(
                 "At least one architecture must be registered"
             )
-
+        # 保存注册项
         self._entries[model_type] = ModelEntry(
             architectures=tuple(architectures),
             module=module,
@@ -56,7 +60,7 @@ class ModelRegistry:
         )
 
     # 输入 Huggingface的根配置 
-    # 输出 nn.Module模型类
+    # 输出 nn.Module模型类 注意 返回的是类，而不是“实例”
     def resolve(
         self,
         root_config: PretrainedConfig,

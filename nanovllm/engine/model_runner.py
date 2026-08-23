@@ -32,6 +32,7 @@ class ModelRunner:
                 "text_config before ModelRunner construction"
             )
 
+        # 这里返回的是一个类，还没有创建对象
         model_class = get_model_class(root_config)
 
         model_dtype = getattr(
@@ -68,13 +69,18 @@ class ModelRunner:
         torch.set_default_dtype(model_dtype)
         torch.set_default_device("cuda")
 
+        # 根据配置创建模型结构和参数空间
         self.model = model_class(root_config)
-                
-        
+        # 加载权重
         load_model(self.model, config.model)
+        # 创建 Sampler
         self.sampler = Sampler()
+        # 模型预热
+        # 注意需要先预热再分配cache 测量一些需要的额外或者临时显存（先测模型运行峰值） 然后再计算真正可以分配的显存
         self.warmup_model()
+        # 计算并分配KV cache
         self.allocate_kv_cache()
+        # 可选 CUDA Graph 捕获
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -230,6 +236,7 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
+    # 把多个 temperature 拼成 Tensor
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
