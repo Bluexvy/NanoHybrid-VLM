@@ -29,6 +29,10 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        
+        # 只保存整数 slot 编号，
+        # 不保存任何 GPU Tensor。
+        self.state_slot: int | None = None
 
     def __len__(self):
         return self.num_tokens
@@ -70,11 +74,36 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        last_state = (
+            self.last_token
+            if not self.is_prefill
+            else self.token_ids
+        )
 
-    def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+        return (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_scheduled_tokens,
+            self.block_table,
+            self.state_slot,
+            last_state,
+        )
+        
+    def __setstate__(
+        self,
+        state,
+    ):
+        (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_scheduled_tokens,
+            self.block_table,
+            self.state_slot,
+            last_state,
+        ) = state
+
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

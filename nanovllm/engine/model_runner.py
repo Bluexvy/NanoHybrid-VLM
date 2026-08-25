@@ -10,7 +10,10 @@ from nanovllm.models.registry import get_model_class
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
-
+from nanovllm.engine.hybrid_state import (
+    HybridCacheSpec,
+    HybridStateManager,
+)
 
 class ModelRunner:
 
@@ -54,6 +57,41 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+
+        layer_types = tuple(
+            getattr(
+                text_config,
+                "layer_types",
+                (),
+            )
+        )
+
+        # 判断是否是混合模型 去遍历层，只要遍历到一个是"linear_attention" 那就是混合模型
+        self.is_hybrid_model = any(
+            layer_type == "linear_attention"
+            for layer_type in layer_types
+        )
+        
+        if self.is_hybrid_model:
+            self.hybrid_cache_spec = (
+                HybridCacheSpec.from_text_config(
+                    text_config,
+                    tensor_parallel_size=self.world_size,
+                )
+            )
+        else:
+            self.hybrid_cache_spec = None
+
+        self.hybrid_state_manager = None
+        
+        if (
+            self.is_hybrid_model
+            and not self.enforce_eager
+        ):
+            raise NotImplementedError(
+                "Qwen3.5 Hybrid Runtime currently "
+                "requires enforce_eager=True"
+            )
 
         dist.init_process_group(
             "nccl",

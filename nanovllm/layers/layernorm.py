@@ -48,3 +48,48 @@ class RMSNorm(nn.Module):
             return self.rms_forward(x)
         else:
             return self.add_rms_forward(x, residual)
+
+
+class Qwen3_5RMSNorm(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+
+        self.eps = eps
+
+        # Qwen3.5 checkpoint 保存的是相对于 1 的增量，
+        # 所以参数初始化为 0。
+        self.weight = nn.Parameter(
+            torch.zeros(hidden_size)
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        input_dtype = x.dtype
+
+        # 使用 FP32 计算平方、均值和 rsqrt，
+        # 减少 BF16 下的归一化误差。
+        x_fp32 = x.float()
+
+        variance = x_fp32.pow(2).mean(
+            dim=-1,
+            keepdim=True,
+        )
+
+        normalized = x_fp32 * torch.rsqrt(
+            variance + self.eps
+        )
+
+        # Qwen3.5 的关键：
+        # 实际缩放系数不是 weight，而是 1 + weight。
+        output = normalized * (
+            1.0 + self.weight.float()
+        )
+
+        return output.to(input_dtype)

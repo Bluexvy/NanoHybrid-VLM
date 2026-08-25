@@ -24,8 +24,21 @@ class RotaryEmbedding(nn.Module):
         base: float,
     ) -> None:
         super().__init__()
+        # self.head_size = head_size
+        # assert rotary_dim == head_size
         self.head_size = head_size
-        assert rotary_dim == head_size
+        self.rotary_dim = rotary_dim
+
+        if not 0 < rotary_dim <= head_size:
+            raise ValueError(
+                "rotary_dim must satisfy "
+                "0 < rotary_dim <= head_size"
+            )
+
+        if rotary_dim % 2 != 0:
+            raise ValueError(
+                "rotary_dim must be even"
+            )
         inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
@@ -41,10 +54,40 @@ class RotaryEmbedding(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
-        query = apply_rotary_emb(query, cos, sin)
-        key = apply_rotary_emb(key, cos, sin)
+
+        # 只取出需要应用 RoPE 的前 rotary_dim 维。
+        query_rot = query[..., :self.rotary_dim]
+        query_pass = query[..., self.rotary_dim:]
+
+        key_rot = key[..., :self.rotary_dim]
+        key_pass = key[..., self.rotary_dim:]
+
+        query_rot = apply_rotary_emb(
+            query_rot,
+            cos,
+            sin,
+        )
+
+        key_rot = apply_rotary_emb(
+            key_rot,
+            cos,
+            sin,
+        )
+
+        # 把未参与旋转的部分原样拼回来。
+        query = torch.cat(
+            [query_rot, query_pass],
+            dim=-1,
+        )
+
+        key = torch.cat(
+            [key_rot, key_pass],
+            dim=-1,
+        )
+
         return query, key
 
 

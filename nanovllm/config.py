@@ -24,6 +24,15 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    # ModelRunner 根据实际剩余显存计算，
+    # 然后 Scheduler 使用它创建整数 slot 分配器。
+    num_state_slots: int = -1
+
+    # None 表示根据模型类型自动选择：
+    #
+    # 纯 Attention 模型 → 开启
+    # 含 GDN 的混合模型 → 关闭
+    enable_prefix_cache: bool | None = None
     
     # Config是dataclass 
     # __post_init__() 是 @dataclass 在自动执行完 __init__() 后调用的初始化hook
@@ -41,6 +50,33 @@ class Config:
         # 对多模态模型返回内部的 text_config
         text_config = root_config.get_text_config(decoder=True)
 
+        layer_types = getattr(
+            text_config,
+            "layer_types",
+            (),
+        )
+
+        has_gdn_layers = any(
+            layer_type == "linear_attention"
+            for layer_type in layer_types
+        )
+
+        if self.enable_prefix_cache is None:
+            # Qwen3 保持原来的 Prefix Cache。
+            #
+            # Qwen3.5 首版关闭 Prefix Cache。
+            self.enable_prefix_cache = (
+                not has_gdn_layers
+            )
+
+        elif (
+            has_gdn_layers
+            and self.enable_prefix_cache
+        ):
+            raise ValueError(
+                "Prefix Cache is not supported for "
+                "models containing GDN layers"
+            )
         # 纯文本模型通常没有 vision_config
         vision_config = getattr(
             root_config,
