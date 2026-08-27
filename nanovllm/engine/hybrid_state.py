@@ -474,6 +474,51 @@ class HybridStateManager:
                 f"State slot {slot} is outside "
                 f"[0, {self.num_slots})"
             )
+            
+    def _prepare_slot_indices(
+        self,
+        slots: list[int],
+    ) -> tuple[tuple[int, ...], torch.Tensor]:
+
+        if not slots:
+            raise ValueError(
+                "slots must not be empty"
+            )
+
+        normalized_slots = tuple(slots)
+
+        for slot in normalized_slots:
+            if not isinstance(slot, int):
+                raise TypeError(
+                    "Every state slot must be an int"
+                )
+
+            self._validate_slot(slot)
+
+        if (
+            len(set(normalized_slots))
+            != len(normalized_slots)
+        ):
+            raise ValueError(
+                "A batched state operation cannot "
+                "contain duplicate slots"
+            )
+
+        slot_indices = torch.tensor(
+            normalized_slots,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        return normalized_slots, slot_indices
+
+    def is_slot_initialized(
+        self,
+        slot: int,
+    ) -> bool:
+        self._validate_slot(slot)
+
+        return self.initialized_slots[slot]
 
     def reset_slot(
         self,
@@ -547,6 +592,111 @@ class HybridStateManager:
             )
 
         return states
+
+    def read_batched_states(
+        self,
+        slots: list[int],
+    ) -> list[GDNLayerState | None]:
+        """
+        按 slots 给出的顺序 Gather 多条 Sequence
+        的全部 GDN states。
+
+        返回的 GDN state 具有 batch 维：
+            conv      [B, C, K]
+            recurrent [B, H, Dk, Dv]
+        """
+
+        (
+            normalized_slots,
+            slot_indices,
+        ) = self._prepare_slot_indices(slots)
+
+        batch_size = len(normalized_slots)
+
+        states: list[
+            GDNLayerState | None
+        ] = [
+            None
+            for _ in range(
+                self.spec.num_hidden_layers
+            )
+        ]
+
+        initialized = [
+            self.initialized_slots[slot]
+            for slot in normalized_slots
+        ]
+
+        # 只在 batch 中存在新请求时创建 mask。
+        initialized_mask = None
+
+        if not all(initialized):
+            initialized_mask = torch.tensor(
+                initialized,
+                dtype=torch.bool,
+                device=self.device,
+            )
+
+        for (
+            gdn_index,
+            global_layer_idx,
+        ) in enumerate(
+            self.spec.gdn_layer_indices
+        ):
+            batched_conv_state = torch.index_select(
+                self.conv_state_pool[
+                    :,
+                    gdn_index,
+                ],
+                dim=0,
+                index=slot_indices,
+            )
+
+            batched_recurrent_state = (
+                torch.index_select(
+                    self.recurrent_state_pool[
+                        :,
+                        gdn_index,
+                    ],
+                    dim=0,
+                    index=slot_indices,
+                )
+            )
+
+            if initialized_mask is not None:
+                # torch.empty() 中未初始化 slot 的内容不能读取。
+                #
+                # 对新请求，将 Gather 出来的对应行清零。
+                batched_conv_state.masked_fill_(
+                    ~initialized_mask.view(
+                        batch_size,
+                        1,
+                        1,
+                    ),
+                    0,
+                )
+
+                batched_recurrent_state.masked_fill_(
+                    ~initialized_mask.view(
+                        batch_size,
+                        1,
+                        1,
+                        1,
+                    ),
+                    0,
+                )
+
+            states[global_layer_idx] = (
+                GDNLayerState(
+                    conv_state=batched_conv_state,
+                    recurrent_state=(
+                        batched_recurrent_state
+                    ),
+                )
+            )
+
+        return states
+
 
     def write_states(
         self,
@@ -674,6 +824,165 @@ class HybridStateManager:
         # 只有全部 18 个 GDN 层都成功写入后，
         # 才将 slot 标记为可读。
         self.initialized_slots[slot] = True
+
+    def write_batched_states(
+        self,
+        slots: list[int],
+        states: list[
+            GDNLayerState | None
+        ],
+    ) -> None:
+        """
+        把一次 Batched 模型前向得到的最终状态
+        Scatter 回对应的固定 state slots。
+        """
+
+        (
+            normalized_slots,
+            slot_indices,
+        ) = self._prepare_slot_indices(slots)
+
+        batch_size = len(normalized_slots)
+
+        if (
+            len(states)
+            != self.spec.num_hidden_layers
+        ):
+            raise ValueError(
+                "states must contain one entry "
+                "per DecoderLayer"
+            )
+
+        # Full Attention 层不应该返回 GDN 状态。
+        for global_layer_idx in (
+            self.spec.full_attention_layer_indices
+        ):
+            if states[global_layer_idx] is not None:
+                raise ValueError(
+                    "Full Attention layer "
+                    f"{global_layer_idx} returned "
+                    "a GDN state"
+                )
+
+        expected_conv_shape = (
+            batch_size,
+            self.spec.conv_dim,
+            self.spec.conv_kernel_size,
+        )
+
+        expected_recurrent_shape = (
+            batch_size,
+            self.spec.num_gdn_value_heads,
+            self.spec.gdn_key_head_dim,
+            self.spec.gdn_value_head_dim,
+        )
+
+        validated_states = []
+
+        # 第一遍只做验证，暂时不修改状态池。
+        for (
+            gdn_index,
+            global_layer_idx,
+        ) in enumerate(
+            self.spec.gdn_layer_indices
+        ):
+            state = states[global_layer_idx]
+
+            if (
+                state is None
+                or state.conv_state is None
+                or state.recurrent_state is None
+            ):
+                raise ValueError(
+                    "GDN layer "
+                    f"{global_layer_idx} did not "
+                    "return complete batched state"
+                )
+
+            if (
+                tuple(state.conv_state.shape)
+                != expected_conv_shape
+            ):
+                raise ValueError(
+                    "Invalid batched conv_state shape "
+                    f"for layer {global_layer_idx}: "
+                    f"{tuple(state.conv_state.shape)}"
+                )
+
+            if (
+                tuple(state.recurrent_state.shape)
+                != expected_recurrent_shape
+            ):
+                raise ValueError(
+                    "Invalid batched recurrent_state "
+                    f"shape for layer "
+                    f"{global_layer_idx}: "
+                    f"{tuple(state.recurrent_state.shape)}"
+                )
+
+            if state.conv_state.device != self.device:
+                raise ValueError(
+                    "batched conv_state is on the "
+                    "wrong device"
+                )
+
+            if (
+                state.recurrent_state.device
+                != self.device
+            ):
+                raise ValueError(
+                    "batched recurrent_state is on "
+                    "the wrong device"
+                )
+
+            if (
+                state.conv_state.dtype
+                != self.spec.conv_dtype
+            ):
+                raise ValueError(
+                    "batched conv_state has the "
+                    "wrong dtype"
+                )
+
+            if (
+                state.recurrent_state.dtype
+                != self.spec.recurrent_dtype
+            ):
+                raise ValueError(
+                    "batched recurrent_state must "
+                    "use FP32"
+                )
+
+            validated_states.append(
+                (
+                    gdn_index,
+                    state,
+                )
+            )
+
+        # 所有层都验证成功后，才开始真正写入状态池。
+        for gdn_index, state in validated_states:
+            self.conv_state_pool[
+                :,
+                gdn_index,
+            ].index_copy_(
+                0,
+                slot_indices,
+                state.conv_state,
+            )
+
+            self.recurrent_state_pool[
+                :,
+                gdn_index,
+            ].index_copy_(
+                0,
+                slot_indices,
+                state.recurrent_state,
+            )
+
+        # 只有全部层都写回成功后，才允许后续读取。
+        for slot in normalized_slots:
+            self.initialized_slots[slot] = True
 
     @property
     def allocated_bytes(self) -> int:

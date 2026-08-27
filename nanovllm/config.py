@@ -28,6 +28,11 @@ class Config:
     # 然后 Scheduler 使用它创建整数 slot 分配器。
     num_state_slots: int = -1
 
+    # 自动分配时，最多使用多少 Cache 预算保存 GDN state。
+    #
+    # 用户显式指定 num_state_slots 时，该比例不生效。
+    gdn_state_memory_fraction: float = 0.25
+
     # None 表示根据模型类型自动选择：
     #
     # 纯 Attention 模型 → 开启
@@ -42,6 +47,24 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+        
+        if (
+            self.num_state_slots == 0
+            or self.num_state_slots < -1
+        ):
+            raise ValueError(
+                "num_state_slots must be -1 or positive"
+            )
+
+        if not (
+            0.0
+            < self.gdn_state_memory_fraction
+            < 1.0
+        ):
+            raise ValueError(
+                "gdn_state_memory_fraction must be "
+                "between 0 and 1"
+            )
 
         # 读取完整模型的 config.json
         root_config = AutoConfig.from_pretrained(self.model)

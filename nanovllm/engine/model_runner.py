@@ -117,7 +117,7 @@ class ModelRunner:
         # 注意需要先预热再分配cache 测量一些需要的额外或者临时显存（先测模型运行峰值） 然后再计算真正可以分配的显存
         self.warmup_model()
         # 计算并分配KV cache
-        self.allocate_kv_cache()
+        self.allocate_model_caches()
         # 可选 CUDA Graph 捕获
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -177,35 +177,341 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        seq_len = min(max_num_batched_tokens, max_model_len)
-        num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
-        for seq in seqs:
-            seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+
+        if self.is_hybrid_model:
+            self.warmup_hybrid_model()
+        else:
+            self.warmup_attention_model()
+
+        # 等待 warmup 中所有异步 CUDA Kernel 完成，
+        # 确保 peak memory 已经记录完整。
+        torch.cuda.synchronize()
+
+        # 释放 warmup 产生但已经不再使用的缓存块。
+        #
+        # peak memory 统计不会因此消失。
         torch.cuda.empty_cache()
 
-    def allocate_kv_cache(self):
+    def warmup_attention_model(self):
+        max_num_batched_tokens = (
+            self.config.max_num_batched_tokens
+        )
+
+        max_model_len = self.config.max_model_len
+
+        seq_len = min(
+            max_num_batched_tokens,
+            max_model_len,
+        )
+
+        num_seqs = min(
+            max_num_batched_tokens // seq_len,
+            self.config.max_num_seqs,
+        )
+
+        seqs = [
+            Sequence([0] * seq_len)
+            for _ in range(num_seqs)
+        ]
+
+        for seq in seqs:
+            seq.num_scheduled_tokens = seq_len
+
+        self.run(
+            seqs,
+            is_prefill=True,
+        )
+
+
+    @torch.inference_mode()
+    def warmup_hybrid_model(self):
+        seq_len = min(
+            self.config.max_num_batched_tokens,
+            self.config.max_model_len,
+        )
+
+        # 当前 Qwen3.5 正确性路径一次只处理一条
+        # Sequence，因此 warmup 也使用单条最大长度请求。
+        seq = Sequence(
+            [0] * seq_len
+        )
+
+        seq.num_scheduled_tokens = seq_len
+
+        input_ids, positions = (
+            self.prepare_prefill([seq])
+        )
+
+        try:
+            (
+                hidden_states,
+                updated_gdn_states,
+            ) = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                gdn_states=None,
+            )
+
+            logits = self.model.compute_logits(
+                hidden_states
+            )
+
+            # 明确解除 Python 引用，让这些临时 Tensor
+            # 在 empty_cache() 前可以被回收。
+            del logits
+            del hidden_states
+            del updated_gdn_states
+
+        finally:
+            reset_context()
+
+    def allocate_model_caches(self):
         config = self.config
         text_config = self.text_config
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = text_config.num_key_value_heads // self.world_size
-        head_dim = getattr(text_config, "head_dim", text_config.hidden_size // text_config.num_attention_heads)
-        # 
-        block_bytes = 2 * text_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * text_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, text_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
+
+        torch.cuda.synchronize()
+        
+        # 当前 GPU 的驱动级显存情况。
+        free_bytes, total_bytes = (
+            torch.cuda.mem_get_info()
+        )
+
+        used_bytes = total_bytes - free_bytes
+
+        # warmup 期间 PyTorch allocator 观察到的峰值和当前值。
+        memory_stats = torch.cuda.memory_stats()
+
+        peak_bytes = memory_stats[
+            "allocated_bytes.all.peak"
+        ]
+
+        current_bytes = memory_stats[
+            "allocated_bytes.all.current"
+        ]
+
+        # warmup 中临时增加的显存：
+        #
+        # peak = 常驻显存 + 临时激活峰值
+        # current = warmup 后仍然保留的常驻显存
+        activation_headroom_bytes = (
+            peak_bytes - current_bytes
+        )
+
+        # 最多允许本进程使用的显存。
+        memory_limit_bytes = int(
+            total_bytes
+            * config.gpu_memory_utilization
+        )
+
+        # 分配 Cache 后仍然必须给运行时激活留出
+        # warmup 测得的峰值空间。
+        cache_budget_bytes = (
+            memory_limit_bytes
+            - used_bytes
+            - activation_headroom_bytes
+        )
+
+        if cache_budget_bytes <= 0:
+            raise RuntimeError(
+                "No GPU memory remains for model caches"
+            )
+
+        if self.is_hybrid_model:
+            spec = self.hybrid_cache_spec
+
+            if spec is None:
+                raise RuntimeError(
+                    "Hybrid model is missing "
+                    "HybridCacheSpec"
+                )
+
+            state_bytes_per_slot = (
+                spec.state_bytes_per_slot
+            )
+
+            block_bytes = spec.kv_block_bytes(
+                self.block_size
+            )
+
+            # Qwen3.5 只给 Full Attention 层分配 KV。
+            num_cache_layers = (
+                spec.num_full_attention_layers
+            )
+
+            if config.num_state_slots == -1:
+                # 自动模式：
+                # 最多使用规定比例的 Cache 预算保存状态。
+                state_budget_bytes = int(
+                    cache_budget_bytes
+                    * config.gdn_state_memory_fraction
+                )
+
+                num_state_slots = min(
+                    config.max_num_seqs,
+                    state_budget_bytes
+                    // state_bytes_per_slot,
+                )
+            else:
+                # 手动模式：
+                # 用户明确指定所需 slot 数量。
+                num_state_slots = min(
+                    config.num_state_slots,
+                    config.max_num_seqs,
+                )
+
+            if num_state_slots <= 0:
+                raise RuntimeError(
+                    "GPU memory cannot hold even one "
+                    "GDN state slot"
+                )
+
+            state_reserved_bytes = (
+                num_state_slots
+                * state_bytes_per_slot
+            )
+
+            kv_budget_bytes = (
+                cache_budget_bytes
+                - state_reserved_bytes
+            )
+
+            if kv_budget_bytes <= 0:
+                raise RuntimeError(
+                    "GDN state slots consume the entire "
+                    "cache memory budget"
+                )
+
+            num_kvcache_blocks = (
+                kv_budget_bytes // block_bytes
+            )
+
+            if num_kvcache_blocks <= 0:
+                raise RuntimeError(
+                    "GPU memory cannot hold even one "
+                    "KV cache block after reserving "
+                    "GDN states"
+                )
+
+            # 把实际计算结果写回 Config。
+            #
+            # LLMEngine 会在 ModelRunner 构造完成后，
+            # 再使用同一个 Config 创建 Scheduler。
+            config.num_state_slots = num_state_slots
+            config.num_kvcache_blocks = (
+                num_kvcache_blocks
+            )
+
+            # 真正在 GPU 上分配固定大小的状态池。
+            self.hybrid_state_manager = (
+                HybridStateManager(
+                    spec=spec,
+                    num_slots=num_state_slots,
+                    device=f"cuda:{self.rank}",
+                )
+            )
+
+            num_kv_heads = spec.num_kv_heads
+            head_dim = spec.attention_head_dim
+
+        else:
+            # 原 Qwen3 路径：所有 DecoderLayer 都是
+            # Full Attention，所以剩余预算全部用于 KV。
+            num_cache_layers = (
+                text_config.num_hidden_layers
+            )
+
+            num_kv_heads = (
+                text_config.num_key_value_heads
+                // self.world_size
+            )
+
+            head_dim = getattr(
+                text_config,
+                "head_dim",
+                (
+                    text_config.hidden_size
+                    // text_config.num_attention_heads
+                ),
+            )
+
+            dtype_bytes = torch.empty(
+                (),
+                dtype=text_config.dtype,
+            ).element_size()
+
+            block_bytes = (
+                2
+                * num_cache_layers
+                * self.block_size
+                * num_kv_heads
+                * head_dim
+                * dtype_bytes
+            )
+
+            config.num_kvcache_blocks = (
+                cache_budget_bytes // block_bytes
+            )
+
+            if config.num_kvcache_blocks <= 0:
+                raise RuntimeError(
+                    "GPU memory cannot hold even one "
+                    "KV cache block"
+                )
+
+        # 两种模型都会分配 KV Cache。
+        #
+        # Qwen3：
+        # [2, num_hidden_layers, ...]
+        #
+        # Qwen3.5：
+        # [2, num_full_attention_layers, ...]
+        self.kv_cache = torch.empty(
+            (
+                2,
+                num_cache_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                num_kv_heads,
+                head_dim,
+            ),
+            dtype=text_config.dtype,
+            device=f"cuda:{self.rank}",
+        )
+
+        # 按模型中的出现顺序，把每个 Attention 模块
+        # 绑定到紧凑 KV Cache 的对应层。
+        cache_layer_idx = 0
+
         for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+            if (
+                hasattr(module, "k_cache")
+                and hasattr(module, "v_cache")
+            ):
+                if cache_layer_idx >= num_cache_layers:
+                    raise RuntimeError(
+                        "Model contains more Attention "
+                        "modules than allocated cache layers"
+                    )
+
+                module.k_cache = self.kv_cache[
+                    0,
+                    cache_layer_idx,
+                ]
+
+                module.v_cache = self.kv_cache[
+                    1,
+                    cache_layer_idx,
+                ]
+
+                cache_layer_idx += 1
+
+        if cache_layer_idx != num_cache_layers:
+            raise RuntimeError(
+                "Attention module count does not match "
+                "allocated KV cache layers: "
+                f"expected {num_cache_layers}, "
+                f"found {cache_layer_idx}"
+            )
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -280,6 +586,218 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
+
+    @torch.inference_mode()
+    def run_hybrid_model(
+        self,
+        seq: Sequence,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+
+        state_manager = self.hybrid_state_manager
+
+        if state_manager is None:
+            raise RuntimeError(
+                "HybridStateManager has not been "
+                "allocated"
+            )
+
+        if seq.state_slot is None:
+            raise RuntimeError(
+                f"Sequence {seq.seq_id} does not own "
+                "a GDN state slot"
+            )
+
+        state_slot = seq.state_slot
+
+        # num_cached_tokens == 0 表示：
+        #
+        # 1. 这是新请求的第一次 Prefill；
+        # 或者
+        # 2. 请求被抢占后，正在从 token 0 重算。
+        #
+        # slot 可能曾被旧请求使用，所以必须将它
+        # 标记为“未初始化”。
+        if seq.num_cached_tokens == 0:
+            state_manager.reset_slot(state_slot)
+
+        old_gdn_states = state_manager.read_states(
+            state_slot
+        )
+
+        (
+            hidden_states,
+            updated_gdn_states,
+        ) = self.model(
+            input_ids=input_ids,
+            positions=positions,
+            gdn_states=old_gdn_states,
+        )
+
+        # compute_logits() 内部会根据当前 Context：
+        #
+        # Prefill → 只选择该 chunk 最后一个 token
+        # Decode  → 当前输入本身只有一个 token
+        logits = self.model.compute_logits(
+            hidden_states
+        )
+
+        state_manager.write_states(
+            state_slot,
+            updated_gdn_states,
+        )
+
+        return logits
+
+    @torch.inference_mode()
+    def run_hybrid_decode(
+        self,
+        seqs: list[Sequence],
+    ) -> list[int]:
+
+        state_manager = self.hybrid_state_manager
+
+        if state_manager is None:
+            raise RuntimeError(
+                "HybridStateManager has not been "
+                "allocated"
+            )
+
+        state_slots = []
+
+        for seq in seqs:
+            if seq.state_slot is None:
+                raise RuntimeError(
+                    f"Sequence {seq.seq_id} does not "
+                    "own a GDN state slot"
+                )
+
+            if seq.num_cached_tokens <= 0:
+                raise RuntimeError(
+                    f"Sequence {seq.seq_id} entered "
+                    "Decode before Prefill completed"
+                )
+
+            if not state_manager.is_slot_initialized(
+                seq.state_slot
+            ):
+                raise RuntimeError(
+                    f"GDN state slot {seq.state_slot} "
+                    f"for Sequence {seq.seq_id} is "
+                    "not initialized"
+                )
+
+            state_slots.append(seq.state_slot)
+
+        # 一次为所有 Decode 请求构造输入。
+        #
+        # input_ids [B]
+        # positions [B]
+        #
+        # Context 中还会保存：
+        # slot_mapping [B]
+        # context_lens [B]
+        # block_tables [B, max_blocks]
+        input_ids, positions = self.prepare_decode(
+            seqs
+        )
+
+        try:
+            # 将分散的 state slots Gather 成：
+            #
+            # 每个 GDN 层：
+            # conv      [B, C, K]
+            # recurrent [B, H, Dk, Dv]
+            old_gdn_states = (
+                state_manager.read_batched_states(
+                    state_slots
+                )
+            )
+
+            # 一次模型前向处理 B 条请求。
+            (
+                hidden_states,
+                updated_gdn_states,
+            ) = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                gdn_states=old_gdn_states,
+            )
+
+            # Decode 时 hidden_states 为 [B, hidden_size]，
+            # 因此 logits 为 [B, vocab_size]。
+            logits = self.model.compute_logits(
+                hidden_states
+            )
+
+            # 将 Batch 第 i 行的新状态写回
+            # state_slots[i]。
+            state_manager.write_batched_states(
+                state_slots,
+                updated_gdn_states,
+            )
+
+            temperatures = self.prepare_sample(
+                seqs
+            )
+
+            token_ids = self.sampler(
+                logits,
+                temperatures,
+            )
+
+            return token_ids.tolist()
+
+        finally:
+            reset_context()
+
+    def run_hybrid(
+        self,
+        seqs: list[Sequence],
+        is_prefill: bool,
+    ) -> list[int]:
+
+        # Decode 使用真正的 Batch 路径。
+        if not is_prefill:
+            return self.run_hybrid_decode(seqs)
+
+        # Prefill 暂时仍然逐 Sequence 执行。
+        logits_per_sequence = []
+
+        for seq in seqs:
+            input_ids, positions = (
+                self.prepare_prefill([seq])
+            )
+
+            try:
+                logits = self.run_hybrid_model(
+                    seq=seq,
+                    input_ids=input_ids,
+                    positions=positions,
+                )
+            finally:
+                reset_context()
+
+            logits_per_sequence.append(logits)
+
+        if self.rank != 0:
+            return None
+
+        batched_logits = torch.cat(
+            logits_per_sequence,
+            dim=0,
+        )
+
+        temperatures = self.prepare_sample(seqs)
+
+        token_ids = self.sampler(
+            batched_logits,
+            temperatures,
+        )
+
+        return token_ids.tolist()
+
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
@@ -299,12 +817,47 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+    def run(
+        self,
+        seqs: list[Sequence],
+        is_prefill: bool,
+    ) -> list[int]:
+
+        if self.is_hybrid_model:
+            return self.run_hybrid(
+                seqs,
+                is_prefill,
+            )
+
+        input_ids, positions = (
+            self.prepare_prefill(seqs)
+            if is_prefill
+            else self.prepare_decode(seqs)
+        )
+
+        temperatures = (
+            self.prepare_sample(seqs)
+            if self.rank == 0
+            else None
+        )
+
+        logits = self.run_model(
+            input_ids,
+            positions,
+            is_prefill,
+        )
+
+        token_ids = (
+            self.sampler(
+                logits,
+                temperatures,
+            ).tolist()
+            if self.rank == 0
+            else None
+        )
+
         reset_context()
+
         return token_ids
 
     @torch.inference_mode()

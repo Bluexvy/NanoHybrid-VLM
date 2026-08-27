@@ -158,6 +158,16 @@ MODEL_REGISTRY.register(
     class_name="Qwen3ForCausalLM",
 )
 
+MODEL_REGISTRY.register(
+    model_type="qwen3_5",
+    architectures=(
+        "Qwen3_5ForConditionalGeneration",
+    ),
+    module="nanovllm.models.qwen3_5",
+    class_name=(
+        "Qwen3_5ForConditionalGeneration"
+    ),
+)
 
 def get_model_class(
     root_config: PretrainedConfig,

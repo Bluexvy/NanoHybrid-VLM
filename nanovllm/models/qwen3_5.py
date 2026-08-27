@@ -1,4 +1,5 @@
 import torch
+from nanovllm.utils.context import get_context
 from torch import nn
 
 from nanovllm.layers.attention import Attention
@@ -427,18 +428,34 @@ class Qwen3_5DecoderLayer(nn.Module):
         )
 
         if self.block_type == "linear_attention":
+            context = get_context()
 
-            # 当前 GDN 接口为：
-            #
-            # [batch, sequence, hidden_size]
-            #
-            # 当前 DecoderLayer 只处理一条 Sequence，
-            # 所以增加 batch=1 这一维：
-            #
-            # [T,H] -> [1,T,H]
-            gdn_input = normalized_states.unsqueeze(
-                dim=0
-            )
+            if context.is_prefill:
+                # Prefill：
+                #
+                # normalized_states [T, H]
+                #
+                # T 表示一条 Sequence 中的多个 token。
+                #
+                # GDN 输入：
+                # [1, T, H]
+                gdn_input = normalized_states.unsqueeze(
+                    dim=0
+                )
+
+            else:
+                # Batched Decode：
+                #
+                # normalized_states [B, H]
+                #
+                # B 表示多条 Sequence，
+                # 每条 Sequence 本轮只有一个 token。
+                #
+                # GDN 输入：
+                # [B, 1, H]
+                gdn_input = normalized_states.unsqueeze(
+                    dim=1
+                )
 
             (
                 token_mixer_output,
@@ -450,11 +467,16 @@ class Qwen3_5DecoderLayer(nn.Module):
                 recurrent_state=recurrent_state,
             )
 
-            # [1,T,H] -> [T,H]
-            token_mixer_output = (
-                token_mixer_output.squeeze(dim=0)
-            )
-
+            if context.is_prefill:
+                # [1, T, H] -> [T, H]
+                token_mixer_output = (
+                    token_mixer_output.squeeze(dim=0)
+                )
+            else:
+                # [B, 1, H] -> [B, H]
+                token_mixer_output = (
+                    token_mixer_output.squeeze(dim=1)
+                )
         else:
             # Full Attention 层不应该收到 GDN state。
             if (

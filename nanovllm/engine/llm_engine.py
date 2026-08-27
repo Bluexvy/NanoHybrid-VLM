@@ -30,7 +30,23 @@ class LLMEngine:
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.eos = self.tokenizer.eos_token_id
+        model_eos_token_id = getattr(
+            config.text_config,
+            "eos_token_id",
+            None,
+        )
+
+        if model_eos_token_id is None:
+            model_eos_token_id = (
+                self.tokenizer.eos_token_id
+            )
+
+        if not isinstance(model_eos_token_id, int):
+            raise NotImplementedError(
+                "Multiple EOS token IDs are not supported"
+            )
+
+        config.eos = model_eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
