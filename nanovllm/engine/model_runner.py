@@ -524,6 +524,7 @@ class ModelRunner:
         positions = []
         cu_seqlens_q = [0]
         cu_seqlens_k = [0]
+        prefill_seqlens = []
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
@@ -531,6 +532,13 @@ class ModelRunner:
         for seq in seqs:
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
+            if seqlen_q <= 0:
+                raise ValueError(
+                    f"Sequence {seq.seq_id} has no "
+                    "scheduled Prefill tokens"
+                )
+
+            prefill_seqlens.append(seqlen_q)
             end = start + seqlen_q
             seqlen_k = end
             input_ids.extend(seq[start:end])
@@ -554,12 +562,46 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        input_ids = torch.tensor(
+            input_ids,
+            dtype=torch.int64,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+
+        positions = torch.tensor(
+            positions,
+            dtype=torch.int64,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+
+        # FLA GDN使用torch.long边界。
+        # 必须在cu_seqlens_q这个Python列表被覆盖前构造。
+        gdn_cu_seqlens = torch.tensor(
+            cu_seqlens_q,
+            dtype=torch.long,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+
+        # Flash Attention使用torch.int32边界。
+        cu_seqlens_q = torch.tensor(
+            cu_seqlens_q,
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(
+            is_prefill=True,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            slot_mapping=slot_mapping,
+            context_lens=None,
+            block_tables=block_tables,
+            prefill_seqlens=tuple(prefill_seqlens),
+            gdn_cu_seqlens=gdn_cu_seqlens,
+        )
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -577,7 +619,12 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(
+            is_prefill=False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+        )
         return input_ids, positions
 
     # 把多个 temperature 拼成 Tensor
@@ -588,14 +635,23 @@ class ModelRunner:
 
 
     @torch.inference_mode()
-    def run_hybrid_model(
+    def run_hybrid_prefill(
         self,
-        seq: Sequence,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
+        seqs: list[Sequence],
+    ) -> list[int]:
+        """
+        一次模型Forward处理整个Variable-length
+        Prefill microbatch。
+        """
 
-        state_manager = self.hybrid_state_manager
+        if not seqs:
+            raise ValueError(
+                "Prefill batch must not be empty"
+            )
+
+        state_manager = (
+            self.hybrid_state_manager
+        )
 
         if state_manager is None:
             raise RuntimeError(
@@ -603,52 +659,136 @@ class ModelRunner:
                 "allocated"
             )
 
-        if seq.state_slot is None:
-            raise RuntimeError(
-                f"Sequence {seq.seq_id} does not own "
-                "a GDN state slot"
+        state_slots = []
+
+        # =====================================
+        # 第一阶段：收集每条请求的state slot
+        # =====================================
+
+        for seq in seqs:
+            if seq.state_slot is None:
+                raise RuntimeError(
+                    f"Sequence {seq.seq_id} does not "
+                    "own a GDN state slot"
+                )
+
+            state_slot = seq.state_slot
+
+            if seq.num_cached_tokens == 0:
+                # 两种情况：
+                #
+                # 1. 新请求首次Prefill；
+                # 2. 请求被抢占后从token 0重算。
+                #
+                # slot可能以前属于其他请求，
+                # 所以先标记为未初始化。
+                state_manager.reset_slot(
+                    state_slot
+                )
+
+            elif not (
+                state_manager.is_slot_initialized(
+                    state_slot
+                )
+            ):
+                # 如果已经缓存了一部分token，说明这是
+                # Chunked Prefill。此时必须存在上一个
+                # chunk保存的GDN状态。
+                raise RuntimeError(
+                    f"Sequence {seq.seq_id} has "
+                    f"{seq.num_cached_tokens} cached "
+                    "tokens, but GDN state slot "
+                    f"{state_slot} is not initialized"
+                )
+
+            state_slots.append(
+                state_slot
             )
 
-        state_slot = seq.state_slot
+        # =====================================
+        # 第二阶段：构造Packed Prefill输入
+        # =====================================
 
-        # num_cached_tokens == 0 表示：
-        #
-        # 1. 这是新请求的第一次 Prefill；
-        # 或者
-        # 2. 请求被抢占后，正在从 token 0 重算。
-        #
-        # slot 可能曾被旧请求使用，所以必须将它
-        # 标记为“未初始化”。
-        if seq.num_cached_tokens == 0:
-            state_manager.reset_slot(state_slot)
-
-        old_gdn_states = state_manager.read_states(
-            state_slot
+        input_ids, positions = (
+            self.prepare_prefill(seqs)
         )
 
-        (
-            hidden_states,
-            updated_gdn_states,
-        ) = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            gdn_states=old_gdn_states,
-        )
+        try:
+            # =================================
+            # 第三阶段：批量Gather旧GDN状态
+            # =================================
 
-        # compute_logits() 内部会根据当前 Context：
-        #
-        # Prefill → 只选择该 chunk 最后一个 token
-        # Decode  → 当前输入本身只有一个 token
-        logits = self.model.compute_logits(
-            hidden_states
-        )
+            old_gdn_states = (
+                state_manager
+                .read_batched_states(
+                    state_slots
+                )
+            )
 
-        state_manager.write_states(
-            state_slot,
-            updated_gdn_states,
-        )
+            # =================================
+            # 第四阶段：一次模型Forward
+            # =================================
 
-        return logits
+            (
+                hidden_states,
+                updated_gdn_states,
+            ) = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                gdn_states=old_gdn_states,
+            )
+
+            # ParallelLMHead会根据：
+            #
+            # context.cu_seqlens_q[1:] - 1
+            #
+            # 自动选择每条Sequence本轮最后一个token。
+            logits = self.model.compute_logits(
+                hidden_states
+            )
+
+            expected_batch_size = len(seqs)
+
+            if (
+                logits.shape[0]
+                != expected_batch_size
+            ):
+                raise RuntimeError(
+                    "Prefill logits batch size does "
+                    "not match the number of "
+                    "sequences: "
+                    f"expected {expected_batch_size}, "
+                    f"got {logits.shape[0]}"
+                )
+
+            # =================================
+            # 第五阶段：批量Scatter新GDN状态
+            # =================================
+
+            state_manager.write_batched_states(
+                state_slots,
+                updated_gdn_states,
+            )
+
+            # =================================
+            # 第六阶段：一次Batch Sampling
+            # =================================
+
+            temperatures = self.prepare_sample(
+                seqs
+            )
+
+            token_ids = self.sampler(
+                logits,
+                temperatures,
+            )
+
+            return token_ids.tolist()
+
+        finally:
+            # Context是当前模型Forward的临时元数据。
+            # 即使中途报错也必须清空，不能影响下一轮。
+            reset_context()
 
     @torch.inference_mode()
     def run_hybrid_decode(
@@ -758,45 +898,14 @@ class ModelRunner:
         is_prefill: bool,
     ) -> list[int]:
 
-        # Decode 使用真正的 Batch 路径。
-        if not is_prefill:
-            return self.run_hybrid_decode(seqs)
-
-        # Prefill 暂时仍然逐 Sequence 执行。
-        logits_per_sequence = []
-
-        for seq in seqs:
-            input_ids, positions = (
-                self.prepare_prefill([seq])
+        if is_prefill:
+            return self.run_hybrid_prefill(
+                seqs
             )
 
-            try:
-                logits = self.run_hybrid_model(
-                    seq=seq,
-                    input_ids=input_ids,
-                    positions=positions,
-                )
-            finally:
-                reset_context()
-
-            logits_per_sequence.append(logits)
-
-        if self.rank != 0:
-            return None
-
-        batched_logits = torch.cat(
-            logits_per_sequence,
-            dim=0,
+        return self.run_hybrid_decode(
+            seqs
         )
-
-        temperatures = self.prepare_sample(seqs)
-
-        token_ids = self.sampler(
-            batched_logits,
-            temperatures,
-        )
-
-        return token_ids.tolist()
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):

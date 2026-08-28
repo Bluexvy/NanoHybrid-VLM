@@ -10,6 +10,10 @@ from transformers.configuration_utils import PretrainedConfig
 class Config:
     model: str
     max_num_batched_tokens: int = 16384
+    # Prefill 请求允许持续等待的最长时间。
+    # 超过该时间后，Scheduler 会强制为最老的
+    # Prefill 请求保留一个 chunk 的执行机会。
+    max_prefill_wait_ms: float = 50.0
     max_num_seqs: int = 512
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
@@ -48,6 +52,11 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         
+        if self.max_prefill_wait_ms < 0:
+            raise ValueError(
+                "max_prefill_wait_ms must be non-negative"
+        )
+            
         if (
             self.num_state_slots == 0
             or self.num_state_slots < -1

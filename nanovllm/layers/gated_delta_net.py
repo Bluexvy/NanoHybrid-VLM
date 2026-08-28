@@ -449,7 +449,7 @@ class Qwen3_5RMSNormGated(nn.Module):
 
         return gated_output.to(input_dtype)
     
-# 可能存在优化的点 不用clone 直接找到请求原地更新
+    
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -616,6 +616,317 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             bias=False,
         )
     
+    def _run_variable_length_causal_conv1d(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_state: torch.Tensor | None,
+        prefill_seqlens: tuple[int, ...],
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """
+        对Packed Variable-length Prefill执行
+        Depthwise Causal Convolution。
+
+        mixed_qkv:
+            [1, C, total_tokens]
+
+        conv_state:
+            [num_sequences, C, kernel_size]
+
+        prefill_seqlens:
+            每条请求本轮处理的token数量。
+
+        返回：
+            conv_output:
+                [1, C, total_tokens]
+
+            new_conv_state:
+                [num_sequences, C, kernel_size]
+        """
+
+        if mixed_qkv.ndim != 3:
+            raise ValueError(
+                "mixed_qkv must have shape "
+                "[1, channels, total_tokens]"
+            )
+
+        packed_batch_size = mixed_qkv.shape[0]
+        num_channels = mixed_qkv.shape[1]
+        total_tokens = mixed_qkv.shape[2]
+
+        if packed_batch_size != 1:
+            raise ValueError(
+                "Variable-length packed convolution "
+                "requires batch size 1"
+            )
+
+        num_sequences = len(prefill_seqlens)
+
+        if num_sequences <= 1:
+            raise ValueError(
+                "Variable-length convolution requires "
+                "more than one sequence"
+            )
+
+        if any(
+            seqlen <= 0
+            for seqlen in prefill_seqlens
+        ):
+            raise ValueError(
+                "Every Prefill sequence length must "
+                "be positive"
+            )
+
+        if sum(prefill_seqlens) != total_tokens:
+            raise ValueError(
+                "The sum of prefill_seqlens must equal "
+                "the number of packed tokens"
+            )
+
+        kernel_size = self.conv_kernel_size
+
+        expected_state_shape = (
+            num_sequences,
+            num_channels,
+            kernel_size,
+        )
+
+        # 允许直接单独调用该函数进行验证。
+        # 正式Runtime中，HybridStateManager会为新请求
+        # Gather出对应的全零state行。
+        if conv_state is None:
+            conv_state = torch.zeros(
+                expected_state_shape,
+                dtype=mixed_qkv.dtype,
+                device=mixed_qkv.device,
+            )
+
+        elif (
+            tuple(conv_state.shape)
+            != expected_state_shape
+        ):
+            raise ValueError(
+                "Packed conv_state must have shape "
+                f"{expected_state_shape}, got "
+                f"{tuple(conv_state.shape)}"
+            )
+
+        conv_state = conv_state.to(
+            device=mixed_qkv.device,
+            dtype=mixed_qkv.dtype,
+        )
+
+        # Reference路径不追求性能。
+        # 分别执行每条请求，再拼接输出。
+        if self.backend == "torch":
+            outputs = []
+            final_states = []
+
+            token_offset = 0
+
+            for sequence_idx, seqlen in enumerate(
+                prefill_seqlens
+            ):
+                token_end = token_offset + seqlen
+
+                sequence_input = mixed_qkv[
+                    :,
+                    :,
+                    token_offset:token_end,
+                ]
+
+                sequence_state = conv_state[
+                    sequence_idx:
+                    sequence_idx + 1
+                ]
+
+                (
+                    sequence_output,
+                    sequence_final_state,
+                ) = torch_causal_conv1d_reference(
+                    hidden_states=sequence_input,
+                    weight=(
+                        self.conv1d.weight.squeeze(1)
+                    ),
+                    bias=self.conv1d.bias,
+                    initial_state=sequence_state,
+                    activation=self.activation,
+                )
+
+                outputs.append(sequence_output)
+
+                final_states.append(
+                    sequence_final_state[0]
+                )
+
+                token_offset = token_end
+
+            return (
+                torch.cat(outputs, dim=-1),
+                torch.stack(final_states, dim=0),
+            )
+
+        if not mixed_qkv.is_cuda:
+            raise RuntimeError(
+                "The FLA backend requires CUDA tensors"
+            )
+
+        # 每一段扩展为：
+        #
+        #     [旧conv state, 当前token]
+        #
+        # 然后使用seq_idx防止不同请求之间串状态。
+        extended_inputs = []
+        sequence_indices = []
+        new_conv_states = []
+
+        token_offset = 0
+
+        for sequence_idx, seqlen in enumerate(
+            prefill_seqlens
+        ):
+            token_end = token_offset + seqlen
+
+            current_input = mixed_qkv[
+                0,
+                :,
+                token_offset:token_end,
+            ]
+
+            history = conv_state[
+                sequence_idx
+            ]
+
+            extended_input = torch.cat(
+                [
+                    history,
+                    current_input,
+                ],
+                dim=-1,
+            )
+
+            extended_inputs.append(
+                extended_input
+            )
+
+            sequence_indices.append(
+                torch.full(
+                    (
+                        kernel_size
+                        + seqlen,
+                    ),
+                    sequence_idx,
+                    dtype=torch.int32,
+                    device=mixed_qkv.device,
+                )
+            )
+
+            # 保存当前请求最后kernel_size个原始输入。
+            #
+            # 这些数据是下一轮Chunked Prefill或Decode
+            # 的卷积历史。
+            new_conv_states.append(
+                extended_input[
+                    :,
+                    -kernel_size:
+                ].clone()
+            )
+
+            token_offset = token_end
+
+        packed_extended_input = torch.cat(
+            extended_inputs,
+            dim=-1,
+        )
+
+        # causal-conv1d在使用seq_idx时要求：
+        #
+        #     x.shape     = [1, C, T]
+        #     x.stride(1) = 1
+        #
+        # 先转成[T,C]并contiguous，
+        # 再转回[C,T]，使channel维在物理内存中连续。
+        packed_extended_input = (
+            packed_extended_input
+            .transpose(0, 1)
+            .contiguous()
+            .transpose(0, 1)
+            .unsqueeze(dim=0)
+        )
+
+        if (
+            packed_extended_input.stride(1)
+            != 1
+        ):
+            raise RuntimeError(
+                "Packed causal convolution input "
+                "must use channel-last memory layout"
+            )
+        seq_idx = torch.cat(
+            sequence_indices,
+            dim=0,
+        ).unsqueeze(dim=0)
+
+        packed_extended_output = (
+            causal_conv1d_cuda(
+                x=packed_extended_input,
+                weight=(
+                    self.conv1d.weight.squeeze(1)
+                ),
+                bias=self.conv1d.bias,
+                seq_idx=seq_idx,
+                activation=self.activation,
+            )
+        )
+
+        # 删除每条请求前面历史state位置对应的输出，
+        # 只恢复当前Prefill token的输出。
+        current_outputs = []
+
+        extended_offset = 0
+
+        for seqlen in prefill_seqlens:
+            current_start = (
+                extended_offset
+                + kernel_size
+            )
+
+            current_end = (
+                current_start
+                + seqlen
+            )
+
+            current_outputs.append(
+                packed_extended_output[
+                    :,
+                    :,
+                    current_start:current_end,
+                ]
+            )
+
+            extended_offset += (
+                kernel_size + seqlen
+            )
+
+        conv_output = torch.cat(
+            current_outputs,
+            dim=-1,
+        )
+
+        final_conv_state = torch.stack(
+            new_conv_states,
+            dim=0,
+        )
+
+        return (
+            conv_output,
+            final_conv_state,
+        )
+    
+    
+    
     """
     输入：mixed_qkv [B,C,L]
     conv_state [B,C,K] 或 None
@@ -627,10 +938,29 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self,
         mixed_qkv: torch.Tensor,
         conv_state: torch.Tensor | None,
+        prefill_seqlens: (
+            tuple[int, ...] | None
+        ) = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
     ]:
+        is_variable_length_prefill = (
+            prefill_seqlens is not None
+            and len(prefill_seqlens) > 1
+        )
+
+        if is_variable_length_prefill:
+            return (
+                self
+                ._run_variable_length_causal_conv1d(
+                    mixed_qkv=mixed_qkv,
+                    conv_state=conv_state,
+                    prefill_seqlens=(
+                        prefill_seqlens
+                    ),
+                )
+            )
         # 如果是 torch 就回到普通版本的因果卷积 否则使用FLA加速
         if self.backend == "torch":
             return torch_causal_conv1d_reference(
@@ -765,6 +1095,220 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             new_conv_state.clone(),
         )
     
+    def _run_variable_length_gated_delta_rule(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        recurrent_state: torch.Tensor | None,
+        prefill_seqlens: tuple[int, ...],
+        gdn_cu_seqlens: torch.Tensor | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """
+        对Packed Variable-length Prefill执行
+        Gated Delta Rule。
+
+        query/key:
+            [1, total_tokens, heads, key_dim]
+
+        value:
+            [1, total_tokens, heads, value_dim]
+
+        recurrent_state:
+            [num_sequences, heads, key_dim, value_dim]
+
+        输出：
+            output:
+                [1, total_tokens, heads, value_dim]
+
+            final_state:
+                [num_sequences, heads, key_dim, value_dim]
+        """
+
+        if query.ndim != 4:
+            raise ValueError(
+                "Packed query must have shape "
+                "[1, total_tokens, heads, key_dim]"
+            )
+
+        packed_batch_size = query.shape[0]
+        total_tokens = query.shape[1]
+        num_sequences = len(prefill_seqlens)
+
+        if packed_batch_size != 1:
+            raise ValueError(
+                "Variable-length GDN requires packed "
+                "batch size 1"
+            )
+
+        if num_sequences <= 1:
+            raise ValueError(
+                "Variable-length GDN requires more "
+                "than one sequence"
+            )
+
+        if any(
+            seqlen <= 0
+            for seqlen in prefill_seqlens
+        ):
+            raise ValueError(
+                "Every Prefill sequence length must "
+                "be positive"
+            )
+
+        if sum(prefill_seqlens) != total_tokens:
+            raise ValueError(
+                "The sum of prefill_seqlens must equal "
+                "the number of packed GDN tokens"
+            )
+
+        expected_state_shape = (
+            num_sequences,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+        )
+
+        if (
+            recurrent_state is not None
+            and tuple(recurrent_state.shape)
+            != expected_state_shape
+        ):
+            raise ValueError(
+                "Packed recurrent_state must have "
+                f"shape {expected_state_shape}, got "
+                f"{tuple(recurrent_state.shape)}"
+            )
+
+        # Reference路径逐Sequence运行，
+        # 主要用于数值验证。
+        if self.backend == "torch":
+            outputs = []
+            final_states = []
+
+            token_offset = 0
+
+            for sequence_idx, seqlen in enumerate(
+                prefill_seqlens
+            ):
+                token_end = token_offset + seqlen
+
+                sequence_state = (
+                    None
+                    if recurrent_state is None
+                    else recurrent_state[
+                        sequence_idx:
+                        sequence_idx + 1
+                    ]
+                )
+
+                (
+                    sequence_output,
+                    sequence_final_state,
+                ) = (
+                    torch_recurrent_gated_delta_rule(
+                        query=query[
+                            :,
+                            token_offset:token_end,
+                        ],
+                        key=key[
+                            :,
+                            token_offset:token_end,
+                        ],
+                        value=value[
+                            :,
+                            token_offset:token_end,
+                        ],
+                        g=g[
+                            :,
+                            token_offset:token_end,
+                        ],
+                        beta=beta[
+                            :,
+                            token_offset:token_end,
+                        ],
+                        initial_state=sequence_state,
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
+
+                outputs.append(
+                    sequence_output
+                )
+
+                final_states.append(
+                    sequence_final_state
+                )
+
+                token_offset = token_end
+
+            return (
+                torch.cat(
+                    outputs,
+                    dim=1,
+                ),
+                torch.cat(
+                    final_states,
+                    dim=0,
+                ),
+            )
+
+        if not query.is_cuda:
+            raise RuntimeError(
+                "The FLA backend requires CUDA tensors"
+            )
+
+        if gdn_cu_seqlens is None:
+            raise ValueError(
+                "gdn_cu_seqlens is required for "
+                "Variable-length GDN Prefill"
+            )
+
+        if not gdn_cu_seqlens.is_cuda:
+            raise ValueError(
+                "gdn_cu_seqlens must be on CUDA"
+            )
+
+        if gdn_cu_seqlens.dtype != torch.long:
+            raise TypeError(
+                "gdn_cu_seqlens must use torch.long"
+            )
+
+        if (
+            gdn_cu_seqlens.numel()
+            != num_sequences + 1
+        ):
+            raise ValueError(
+                "gdn_cu_seqlens must contain one more "
+                "entry than the number of sequences"
+            )
+
+        output, final_state = (
+            chunk_gated_delta_rule(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                scale=self.head_k_dim ** -0.5,
+                initial_state=recurrent_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=gdn_cu_seqlens,
+            )
+        )
+
+        return (
+            output,
+            final_state,
+        )
+    
     # 卷积以后已经得到了QKV g 和 beta 下面需要执行长期状态递推
     def _run_gated_delta_rule(
         self,
@@ -774,10 +1318,41 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         g: torch.Tensor,
         beta: torch.Tensor,
         recurrent_state: torch.Tensor | None,
+        prefill_seqlens: (
+            tuple[int, ...] | None
+        ) = None,
+        gdn_cu_seqlens: (
+            torch.Tensor | None
+        ) = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
     ]:
+        is_variable_length_prefill = (
+            prefill_seqlens is not None
+            and len(prefill_seqlens) > 1
+        )
+
+        if is_variable_length_prefill:
+            return (
+                self
+                ._run_variable_length_gated_delta_rule(
+                    query=query,
+                    key=key,
+                    value=value,
+                    g=g,
+                    beta=beta,
+                    recurrent_state=(
+                        recurrent_state
+                    ),
+                    prefill_seqlens=(
+                        prefill_seqlens
+                    ),
+                    gdn_cu_seqlens=(
+                        gdn_cu_seqlens
+                    ),
+                )
+            )
         # 同上 如果检测到是torch普通实现 就传回之前的reference版本 否则继续往下走 通过高性能Kernel实现
         if self.backend == "torch":
             output, final_state = (
@@ -833,6 +1408,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         conv_state: torch.Tensor | None = None,
         recurrent_state: torch.Tensor | None = None,
+        prefill_seqlens: (tuple[int, ...] | None) = None,
+        gdn_cu_seqlens: torch.Tensor | None = None
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -872,6 +1449,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         ) = self._run_causal_conv1d(
             mixed_qkv=mixed_qkv,
             conv_state=conv_state,
+            prefill_seqlens=prefill_seqlens,
         )
 
         mixed_qkv = (
@@ -960,8 +1538,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             g=g,
             beta=beta,
             recurrent_state=recurrent_state,
+            prefill_seqlens=prefill_seqlens,
+            gdn_cu_seqlens=gdn_cu_seqlens,
         )
-
+        
         core_output = core_output.reshape(
             -1,
             self.head_v_dim,

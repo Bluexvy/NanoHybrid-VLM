@@ -1,5 +1,5 @@
 import atexit
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -11,7 +11,43 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
+@dataclass(slots=True)
+class StepStats:
+    """
+    一轮逻辑 step 中两个 microbatch 的统计。
+    """
 
+    num_decode_tokens: int = 0
+    num_prefill_tokens: int = 0
+
+    decode_elapsed: float = 0.0
+    prefill_elapsed: float = 0.0
+
+    @property
+    def decode_throughput(self) -> float:
+        if (
+            self.num_decode_tokens == 0
+            or self.decode_elapsed == 0
+        ):
+            return 0.0
+
+        return (
+            self.num_decode_tokens
+            / self.decode_elapsed
+        )
+
+    @property
+    def prefill_throughput(self) -> float:
+        if (
+            self.num_prefill_tokens == 0
+            or self.prefill_elapsed == 0
+        ):
+            return 0.0
+
+        return (
+            self.num_prefill_tokens
+            / self.prefill_elapsed
+        )
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
@@ -62,13 +98,96 @@ class LLMEngine:
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
-    def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens
+    def step(
+        self,
+    ) -> tuple[
+        list[tuple[int, list[int]]],
+        StepStats,
+    ]:
+        plan = self.scheduler.schedule()
+
+        stats = StepStats(
+            num_decode_tokens=(
+                plan.num_decode_tokens
+            ),
+            num_prefill_tokens=(
+                plan.num_prefill_tokens
+            ),
+        )
+
+        outputs: list[
+            tuple[int, list[int]]
+        ] = []
+
+        # =====================================
+        # 第一阶段：Decode microbatch
+        # =====================================
+
+        if plan.decode_seqs:
+            start = perf_counter()
+
+            decode_token_ids = (
+                self.model_runner.call(
+                    "run",
+                    plan.decode_seqs,
+                    False,
+                )
+            )
+
+            self.scheduler.postprocess(
+                plan.decode_seqs,
+                decode_token_ids,
+                False,
+            )
+
+            stats.decode_elapsed = (
+                perf_counter() - start
+            )
+
+            outputs.extend(
+                (
+                    seq.seq_id,
+                    seq.completion_token_ids,
+                )
+                for seq in plan.decode_seqs
+                if seq.is_finished
+            )
+
+        # =====================================
+        # 第二阶段：Prefill microbatch
+        # =====================================
+
+        if plan.prefill_seqs:
+            start = perf_counter()
+
+            prefill_token_ids = (
+                self.model_runner.call(
+                    "run",
+                    plan.prefill_seqs,
+                    True,
+                )
+            )
+
+            self.scheduler.postprocess(
+                plan.prefill_seqs,
+                prefill_token_ids,
+                True,
+            )
+
+            stats.prefill_elapsed = (
+                perf_counter() - start
+            )
+
+            outputs.extend(
+                (
+                    seq.seq_id,
+                    seq.completion_token_ids,
+                )
+                for seq in plan.prefill_seqs
+                if seq.is_finished
+            )
+
+        return outputs, stats
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -87,15 +206,25 @@ class LLMEngine:
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
-            t = perf_counter()
-            output, num_tokens = self.step()
-            if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
-            else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
+            output, stats = self.step()
+
+            if stats.num_prefill_tokens > 0:
+                prefill_throughput = (
+                    stats.prefill_throughput
+                )
+
+            if stats.num_decode_tokens > 0:
+                decode_throughput = (
+                    stats.decode_throughput
+                )
+
             pbar.set_postfix({
-                "Prefill": f"{int(prefill_throughput)}tok/s",
-                "Decode": f"{int(decode_throughput)}tok/s",
+                "Prefill": (
+                    f"{int(prefill_throughput)}tok/s"
+                ),
+                "Decode": (
+                    f"{int(decode_throughput)}tok/s"
+                ),
             })
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids

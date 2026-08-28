@@ -429,7 +429,18 @@ class Qwen3_5DecoderLayer(nn.Module):
 
         if self.block_type == "linear_attention":
             context = get_context()
-
+            
+            prefill_seqlens = (
+                context.prefill_seqlens
+                if context.is_prefill
+                else None
+            )
+            gdn_cu_seqlens = (
+                context.gdn_cu_seqlens
+                if context.is_prefill
+                else None
+            )
+            
             if context.is_prefill:
                 # Prefill：
                 #
@@ -465,8 +476,10 @@ class Qwen3_5DecoderLayer(nn.Module):
                 hidden_states=gdn_input,
                 conv_state=conv_state,
                 recurrent_state=recurrent_state,
+                prefill_seqlens=prefill_seqlens,
+                gdn_cu_seqlens=gdn_cu_seqlens,
             )
-
+            
             if context.is_prefill:
                 # [1, T, H] -> [T, H]
                 token_mixer_output = (

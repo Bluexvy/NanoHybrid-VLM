@@ -4,12 +4,8 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = (
-        "/workspace/.cache/huggingface/hub/"
-        "models--Qwen--Qwen3.5-0.8B/"
-        "snapshots/"
-        "2fc06364715b967f1860aea9cf38778875588b17"
-    )
+    
+    path = "/workspace/models/Qwen3.5-9B"
     
     tokenizer = AutoTokenizer.from_pretrained(path)
     
@@ -17,17 +13,19 @@ def main():
         path,
         enforce_eager=True,
         tensor_parallel_size=1,
-        max_model_len=512,
-        max_num_batched_tokens=512,
-        max_num_seqs=4,
-        num_state_slots=4,
+        max_model_len=1024,
+        max_num_batched_tokens=1024,
+        max_num_seqs=3,
+        num_state_slots=3,
+        gpu_memory_utilization=0.9,
     )
     
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=2048)
+    sampling_params = SamplingParams(temperature=0.7, max_tokens=512)
+    
     prompts = [
-        "你是什么模型？",
-        "写出100以内所有的素数，只要结果。",
-        "你是什么模型？",
+        "你好。",
+        "请列出三个质数，只要结果。",
+        "请用一句话简单解释什么是线性注意力。",
     ]
     prompts = [
         tokenizer.apply_chat_template(
