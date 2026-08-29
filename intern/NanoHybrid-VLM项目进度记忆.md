@@ -2,9 +2,10 @@
 
 > 更新时间：2026-08-29  
 > 当前分支：`main`  
-> 最近提交：`9943b4b 完成了text model部分`  
+> 最近提交：`aa76678 benchmark`
 > 用途：记录实际完成、已经验证、当前断点和下一步。  
-> 总体完成度：约 65%～70%；文本 Hybrid Runtime 约 90%，Vision 组件已完成，图文端到端尚未接通。
+> V1 完成度：约 90%～95%；文本/单图 Hybrid Runtime 已接通。
+> 扩展后总体完成度：约 65%～70%；V2 Decode CUDA Graph 与 V3 GDN-aware Prefix State Cache 已纳入正式方案，但尚未实现。
 
 ## 1. 项目目标与边界
 
@@ -26,7 +27,17 @@ text token embeddings ───────────────────�
 /workspace/models/Qwen3.5-9B
 ```
 
-首版范围：RTX 5090、BF16、TP=1、Eager；每个请求最多一张本地 PIL 图片。首版不支持网络 URL、多图、视频、Qwen3.5 Prefix Cache、MTP、MoE、CUDA Graph 和 TP>1。
+V1 范围：RTX 5090、BF16、TP=1、Eager；每个请求最多一张本地 PIL 图片。V1 不支持网络 URL、多图、视频、Qwen3.5 Prefix Cache、MTP、MoE、CUDA Graph 和 TP>1。
+
+扩展后的正式范围：
+
+```text
+V1：Qwen3.5-9B 文本/单图 Hybrid Runtime（当前主要功能已完成）
+V2：Qwen3.5 Hybrid Decode-only CUDA Graph（已规划，未实现）
+V3：纯文本 GDN-aware Prefix State Cache（已规划，未实现）
+```
+
+MTP、MoE、TP>1、多图、视频和图文 Prefix Cache 仍不在当前正式范围内。
 
 ## 2. 已实现的核心技术
 
@@ -221,9 +232,175 @@ token 84 → [14,14,14]
 token 95 → [25,25,25]
 ```
 
-## 3. 当前准确执行链路
+### 2.11 mRoPE 接入 Sequence 与模型执行
 
-纯文本链路已经可运行：
+旧文档中记录的 Vision Part 9B 断点已完成：
+
+- `Sequence` 已保存 `mrope_position_ids` 和 `mrope_position_delta`。
+- `LLMEngine.add_request()` 已将 `ProcessedPrompt` 的 mRoPE 字段传入 `Sequence`。
+- Decode 追加 token 时，使用 `old_num_tokens + mrope_position_delta` 追加三轴相同的文本位置。
+- `prepare_prefill()` 已构造 packed `[3,total_tokens]` mRoPE positions。
+- `prepare_decode()` 已根据每个 Sequence 的 token 索引和 delta 构造 `[3,B]` positions。
+- `RotaryEmbedding`/Qwen3.5 Full Attention 已支持 interleaved multimodal RoPE。
+- 抢占后从 token 0 重算时，token/type/position 元数据保持对齐。
+
+### 2.12 Vision 执行、Embedding 替换和视觉缓存
+
+`ModelRunner` 已接通完整图文 Prefill：
+
+```text
+pixel_values + image_grid_thw
+        ↓
+Qwen3.5 Vision Tower + Patch Merger
+        ↓
+visual_embeddings [num_visual_tokens, text_hidden_size]
+        ↓ index_copy_
+替换文本 embedding 中 image placeholder 的位置
+        ↓
+Qwen3.5 Hybrid Decoder
+```
+
+已实现：
+
+- 纯文本请求使用 `input_ids`，图文 Prefill 使用替换后的 `inputs_embeds`。
+- Variable-length Batched Prefill 中，每个图文 Sequence 只替换当前 chunk 覆盖的 image token 位置。
+- visual embedding cache 以 `seq_id` 管理，避免 Chunked Prefill 重复执行 Vision Tower。
+- 缓存统计包含 `visual_cache_bytes`/peak、forwards、hits 和 misses。
+- 请求完成时释放视觉缓存。
+- 请求被抢占时释放视觉缓存；恢复时重新执行 Vision Tower 和 Prefill。
+- 文本、长文本和单图请求可以进入同一个 Variable-length Prefill microbatch。
+
+### 2.13 图文正确性验证
+
+已完成的端到端验证：
+
+1. **9B 单图生成**
+   - 自制红色正方形/蓝色圆形图片可正确生成描述。
+   - 视觉缓存最终 `current bytes=0`，无泄漏。
+
+2. **Chunked Prefill 视觉缓存**
+   - 一次 Vision forward，后续 chunk 命中 cache。
+   - 实测过 `vision forwards=1, cache misses=1, cache hits=1`。
+
+3. **文本/图文混合批处理**
+   - 3 条请求进入同一 Prefill microbatch。
+   - `prefill microbatches=1, max prefill batch size=3, mixed prefill microbatches=1`。
+
+4. **Full Prefill 与 Chunked Prefill 一致**
+   - 两条路径的 greedy 生成 token 一致。
+
+5. **Hugging Face 图文对齐**
+   - Prompt 长度 124 tokens，Nano 与 HF prompt token IDs 完全一致。
+   - 比较 64 个 greedy 生成 token，64/64 一致。
+
+6. **抢占与确定性重算**
+   - `preemptions=1`。
+   - `recomputed tokens=124`。
+   - 抢占前后生成 64 个图文 token 一致。
+   - Vision Tower 执行 2 次：首次 Prefill 一次，抢占恢复重算一次。
+   - 最终 KV blocks、GDN state slot 和 visual cache 全部释放。
+
+### 2.14 请求级指标和 Benchmark 基础设施
+
+`LLMEngine` 已实现 `RequestMetrics` 和 `StepStats`：
+
+- preprocessing time。
+- queue time。
+- TTFT。
+- 每个生成 token 的 `token_timestamps`。
+- request-level TPOT。
+- E2E latency。
+- 每轮 Prefill/Decode token 数和执行时间。
+
+已实现的 Benchmark 脚本：
+
+```text
+tests/benchmark_hybrid.py             固定工作负载 Benchmark
+tests/run_benchmark_matrix.py         工作负载矩阵
+tests/dynamic_scheduler_benchmark.py  长 Prefill 动态插入实验
+tests/saturation_benchmark.py         持续闭环饱和压测
+```
+
+### 2.15 Decode-first 与 Prefill-first 实测
+
+`Config.scheduler_policy` 已支持：
+
+```text
+decode_first
+prefill_first
+```
+
+`prefill_first` 是严格对照基线：只要 waiting 中存在 Prefill，当轮就不执行 Decode。
+
+#### 单次动态干扰实验
+
+Token budget=2048 时：
+
+```text
+Prefill-first TPOT p95: 794.92 ms
+Decode-first  TPOT p95: 403.76 ms
+特定干扰窗口下降低约 49.2%
+
+Prefill-first late TTFT p95: 721.74 ms
+Decode-first  late TTFT p95: 762.44 ms
+TTFT 退化约 5.6%
+```
+
+这是小样本、刻意构造的长 Prefill 干扰场景，**不能将 49.2% 表述为通用 p95 提升**。
+
+#### 持续饱和压测：C8
+
+96 条请求，并发 8，64 条 Decode-heavy + 16 条长文本 + 16 条图片：
+
+```text
+Decode-first output throughput: 332.59 tok/s
+Prefill-first output throughput: 334.65 tok/s
+吞吐变化: -0.62%
+
+request TPOT p95: 25.21 → 23.60 ms，降低约 6.38%
+TTFT p95:         570.31 → 626.42 ms，增加约 9.84%
+max token stall:  607.43 → 308.17 ms，降低约 49.27%
+```
+
+#### 持续饱和压测：C12
+
+96 条请求，并发 12，工作负载与 C8 相同：
+
+```text
+Decode-first output throughput: 425.47 tok/s
+Prefill-first output throughput: 424.21 tok/s
+吞吐变化: +0.30%
+
+request TPOT p95: 26.49 → 26.32 ms，降低约 0.63%
+TTFT p95:         871.13 → 842.58 ms，降低约 3.28%
+max token stall:  1115.67 → 316.58 ms，降低约 71.62%
+E2E p95:          6805.82 → 6777.22 ms，降低约 0.42%
+```
+
+C12 Decode-first 硬件状态：
+
+```text
+GPU utilization mean/p95: 90% / 100%
+power mean/max/limit:      401 W / 514 W / 575 W
+NVML memory used:          27.21 GiB
+Torch peak allocated:      25.28 GiB
+running/outstanding p50:   12 / 12
+```
+
+C12 属于软件工作队列持续饱和，但不是持续满 TDP。
+
+需要同时记录的现象：
+
+- Decode-first 将少数超大停顿拆成更多中等停顿。
+- 因此 max stall 显著下降，但 C12 token-interval p99 从 24.51 ms 增加到 199.44 ms。
+- 不能只用单个 p95/p99/max 描述调度效果，后续报告应同时说明整个延迟分布。
+- C8/C12、两种调度策略的 96 条请求、17408 个生成 token 全部一致。
+- 两种饱和实验均 `preemptions=0, recomputed_tokens=0, final visual cache bytes=0`。
+- 上述性能数字是单次实验结果，未完成多次重复统计，暂不作为最终简历数字。
+
+## 3. 当前完整执行链路
+
+纯文本：
 
 ```text
 prompt → tokenize → Sequence → Decode-first Scheduler
@@ -231,70 +408,188 @@ prompt → tokenize → Sequence → Decode-first Scheduler
 → Batched Decode → Sampling → decode text
 ```
 
-图文链路当前到达：
+图文：
 
 ```text
 PIL Image + prompt
 → AutoProcessor
 → token_ids/pixel_values/grid/mm types
-→ 自实现 mRoPE positions/delta
+→ mRoPE positions/delta
 → ProcessedPrompt
-→ LLMEngine/Sequence  ← 当前断点：mRoPE 字段尚未传入
-→ Scheduler
-→ ModelRunner          ← 后续接入 Vision/mRoPE 执行
+→ LLMEngine/Sequence
+→ Decode-first Scheduler
+→ Variable-length Chunked Prefill
+→ Vision Tower/Patch Merger
+→ visual embedding cache
+→ 替换 image placeholder embeddings
+→ Qwen3.5 Hybrid Decoder
+→ Full Attention Paged KV + GDN conv/recurrent state
+→ Batched Decode + mRoPE delta
+→ greedy/sampling
+→ decode text
 ```
 
-当前 `Sequence` 已经接收基础图像字段，但尚未接收 `mrope_position_ids/delta`。ModelRunner 也尚未运行 Vision Tower、替换 image token embedding，或把三轴 mRoPE 送入 Full Attention。因此目前不能声称已完成端到端图文生成。
+## 4. V2：Hybrid Decode CUDA Graph（已纳入，未实现）
 
-## 4. 当前开发断点：Vision Part 9B
+### 4.1 当前已有基础
 
-Part 9A 已完成：mRoPE positions/delta 已实现并与 HF 对齐。
+- 原 nano-vLLM 在 `ModelRunner.capture_cudagraph()` 中有普通 Attention 模型的 CUDA Graph 骨架。
+- 当前 Qwen3.5 Hybrid Runtime 已有稳定的 Batched Decode、紧凑 Paged KV、GDN state-slot Gather/Scatter 和三轴 mRoPE。
+- 当前 Qwen3.5 Hybrid 路径仍要求 `enforce_eager=True`；旧 Graph 骨架不能直接证明 Hybrid Decode 可 capture。
 
-下一步 Part 9B：
+### 4.2 技术目标
 
-1. `Sequence.__init__()` 增加 `mrope_position_ids`、`mrope_position_delta`。
-2. `LLMEngine.add_request()` 从 `ProcessedPrompt` 传入两字段。
-3. `Sequence.append_token()` 为 Decode token 追加三轴相同的位置：
+只 capture 高频、shape 相对稳定的 Decode 路径：
 
 ```text
-new_position = old_num_tokens + mrope_position_delta
+Vision + Prefill：继续 Eager
+Decode：
+真实请求数据 → 静态输入 buffer → CUDA Graph replay
+                           ↓ 不支持/失败
+                       Eager fallback
 ```
 
-4. Prefill 序列化传完整 positions；Decode 至少传 delta。
-5. 保证 `token_ids/mm_token_type_ids/mrope_position_ids` 在生成和抢占重算后仍对齐。
+必须纳入静态输入的主要数据：
 
-## 5. 剩余 Part
+```text
+input_ids[B]
+positions[3,B]
+slot_mapping
+context_lens
+block_tables
+state_slot_ids
+```
 
-核心项目从当前状态起约剩 10 个 Part：
+Full Attention 通过 `block_tables/slot_mapping` 读写正确 KV block；GDN 通过 `state_slot_ids` 读写正确 conv/recurrent state。Graph 不能把这些地址或请求映射固化成上一轮的数据。
 
-1. mRoPE 接入 Sequence、Decode 追加和抢占重算。
-2. `RotaryEmbedding` 实现 Qwen3.5 interleaved mRoPE。
-3. `prepare_prefill/decode` 构造 packed 三轴 positions。
-4. ModelRunner 执行 Vision Tower并替换 image token embeddings。
-5. visual embedding cache 的创建、Chunked Prefill 复用、抢占失效和完成释放。
-6. 跑通第一个 9B 单图端到端 greedy 生成。
-7. 图文 Variable-length Batched Prefill 和文本/图文混合调度。
-8. 图文 Chunked Prefill、跨 KV block、Decode、抢占重算一致性。
-9. 与 HF 对齐 Vision、单层、logits 误差和 greedy token。
-10. 9B Benchmark、显存统计、Profiler、回归、架构图、实验报告和简历描述。
+### 4.3 待实现 Part
 
-跑通第一个正确单图请求预计还需前 5～6 个 Part。
+1. Graph-safe 审计：定位动态分配、CPU 同步和数据相关分支。
+2. 静态 Decode buffer：覆盖 token、三轴位置、KV 元数据和 GDN slot。
+3. batch bucket：首版计划 `1/2/4/8/12`，其余形状回退 Eager。
+4. Hybrid capture/replay：验证 FLA recurrent、causal-conv1d 和 Full Attention。
+5. 正确性：Eager/Graph greedy token、padding、重复 replay 和状态串槽测试。
+6. Benchmark：TPOT、Decode tokens/s、CPU launch overhead 和额外显存。
 
-## 6. 当前可以和不能在面试中声称的内容
+### 4.4 完成判定
+
+只有满足以下条件才可以声称“实现 Qwen3.5 Hybrid CUDA Graph”：
+
+- 至少一个真实 Qwen3.5 Hybrid Decode bucket 完成 capture 和稳定 replay。
+- Eager/Graph greedy token 完全一致。
+- 多请求、多轮 replay 后 KV block 与 GDN state slot 无串写。
+- 不支持的 shape 能自动、安全回退 Eager。
+- 有原始 Benchmark 和 Graph 额外显存数据。
+
+## 5. V3：GDN-aware Prefix State Cache（已纳入，未实现）
+
+### 5.1 为什么不能直接打开原 Prefix Cache
+
+Qwen3.5 的历史状态由两部分组成：
+
+```text
+Full Attention 历史 → Paged KV blocks
+Gated DeltaNet 历史 → conv_state + recurrent_state
+```
+
+如果请求 B 只命中请求 A 的 Attention KV，却没有恢复同一前缀边界的 GDN state，后续 Decode 会从错误历史继续，生成结果不可信。因此一次命中必须是联合、原子的：
+
+```text
+Prefix Hit
+   ├── Full Attention KV 有效
+   └── 所有 GDN state snapshot 有效
+两者同时满足 → restore
+任一缺失     → 整体 miss，重新 Prefill
+```
+
+### 5.2 首版范围
+
+- 只支持纯文本共享前缀。
+- 只在完整 token block 边界创建 Prefix Entry。
+- 保存 KV block 引用以及对应的全部 GDN `conv_state/recurrent_state` snapshot。
+- 使用显存预算、checkpoint interval、引用计数和 LRU 控制开销。
+- Prefix 命中后从该边界继续执行剩余 suffix Prefill。
+
+图文 Prefix Cache 暂缓，因为缓存身份还必须包含图片内容、processor 结果、image grid、mRoPE layout 和视觉模型版本；只按 image placeholder token IDs 做 hash 会错误共享不同图片。
+
+### 5.3 待实现 Part
+
+1. Prefix Key：模型/配置身份、完整 block token hash 和前驱链。
+2. Prefix Entry：联合持有 KV blocks 与 GDN snapshot。
+3. snapshot commit：只在完整 block 边界原子提交。
+4. lookup/restore：KV/GDN 同时命中才恢复到活跃 state slot。
+5. 显存预算：`prefix_state_cache_max_bytes` 与 checkpoint interval。
+6. 生命周期：引用计数、LRU、请求完成、抢占、失效和异常回滚。
+7. 正确性：Cache on/off、Chunked Prefill、batch、抢占和淘汰后重算。
+8. Benchmark：TTFT、跳过的 Prefill tokens、hit rate、snapshot 拷贝耗时和显存。
+
+### 5.4 关键资源风险
+
+9B 的单请求 GDN active state 约为 49.5 MiB。若每 256 tokens 保存一次 8K 前缀，粗略需要 32 份 checkpoint，单条前缀的 GDN snapshot 就可能约为：
+
+```text
+49.5 MiB × 32 ≈ 1.55 GiB
+```
+
+因此不能无界保存每个 block 的状态。V3 必须使用显存上限、稀疏 checkpoint 和 LRU，并把 snapshot 显存作为一等指标。
+
+### 5.5 完成判定
+
+- Cache on/off 的 greedy token 完全一致。
+- 命中恢复后的 KV 和全部 GDN state 与完整重算一致。
+- 实际 scheduled Prefill tokens 按命中长度减少。
+- 引用、淘汰、抢占和请求完成后无 KV/state snapshot 泄漏。
+- 报告 TTFT 收益，同时报告 snapshot 保存/恢复成本与显存代价。
+
+## 6. 当前开发断点：V1 基线冻结，准备进入 V2
+
+V1 Runtime 的主要功能代码已接通。先把当前 Eager/Cache-off 行为冻结为后续优化的正确性基线：
+
+1. 整理最终技术复习文档。
+2. 整理 README：架构、安装、文本/单图用法、边界。
+3. 整理实验报告，区分正确性结果、单次性能结果和未验证结论。
+4. 编写简历描述和面试高频追问。
+5. 检查 Git 工作区，排除模型权重、大型 profiler 文件和不需要的临时产物后提交。
+
+随后进入 V2 第 1 个 Part：审计 Qwen3.5 Decode 路径的 Graph-safe 条件。第一步不是直接调用 capture，而是逐项检查 Full Attention、FLA recurrent GDN、causal-conv1d、Sampler 和 Context 中是否存在动态分配、CPU 同步或依赖实际 batch size 的控制流。
+
+## 7. 剩余 Part
+
+V1 收尾剩余 4 个 Part：
+
+1. 最终技术复习文档。
+2. README 和可复现使用说明。
+3. 实验报告、简历要点和面试问答。
+4. Git 工作区清点、提交和推送。
+
+V2 CUDA Graph 共 6 个 Part，V3 Prefix State Cache 共 8 个 Part；连同 V1 收尾，总计还剩 18 个 Part。
+
+当前正式扩展只包含 CUDA Graph 和纯文本 Prefix State Cache。MTP、MoE、TP>1、多图、视频和图文 Prefix Cache 不计入这 18 个 Part。
+
+## 8. 当前可以和不能在面试中声称的内容
 
 可以准确表述：
 
-> 基于 nano-vLLM 接入 Qwen3.5 Gated DeltaNet/Full Attention 混合模型，根据 layer types 为 Full Attention 分配紧凑 Paged KV Cache，并为 GDN 设计 state-slot 状态池，管理 depthwise causal convolution state 和 FP32 recurrent state；实现 Variable-length Batched Prefill、Batched Decode、GDN state Gather/Scatter、Decode-first 双 microbatch 调度、Prefill 饥饿保护与抢占重算。另已实现 Qwen3.5 Vision Transformer/Patch Merger、单图 AutoProcessor 输入和三轴 mRoPE 位置构造，Vision 权重/形状检查通过，mRoPE positions 与 Transformers 官方结果一致。
+> 基于 nano-vLLM 实现 Qwen3.5-9B 文本/单图 Hybrid Runtime：根据 `layer_types` 为 Full Attention 分配紧凑 Paged KV Cache，为 Gated DeltaNet 设计 state-slot 池管理 depthwise causal-convolution state 和 FP32 recurrent state；实现 FLA GDN Prefill/Decode、Variable-length Batched Prefill、Batched Decode、Chunked Prefill、Decode-first 双 microbatch 调度、Prefill 饥饿保护及 KV/GDN/视觉状态联合抢占重算。接入 Qwen3.5 Vision Transformer/Patch Merger、图像 embedding 替换、三轴 mRoPE 和请求级 visual embedding cache，并完成 HF 64-token greedy 对齐、文本/图文混合批处理、Chunked Prefill 和抢占重算一致性验证。
 
 目前不能声称：
 
-- 已完成端到端图文生成或 visual embedding cache 生命周期。
-- 已完成图文 Chunked Prefill/抢占一致性。
-- 已实现 Qwen3.5 Prefix Cache、MTP、MoE 或 CUDA Graph。
+- 已实现 Qwen3.5 Prefix Cache 或 Hybrid CUDA Graph；两者目前只是已完成设计并纳入正式路线。
+- 已实现 MTP 或 MoE；两者仍不在当前正式范围内。
+- 已支持多图、视频或 TP>1。
 - 已达到生产级 vLLM 完整性或超过官方 vLLM 性能。
-- 已获得固定百分比性能提升；必须等待 Benchmark 实测。
+- 已获得可泛化的固定百分比性能提升；当前 Benchmark 是特定工作负载的单次实验。
+- 所有 token interval 分位数都改善；实测表明 Decode-first 减少最大停顿的同时，可能增加中等停顿的次数。
 
-## 7. 关键文件地图
+完成 V2 后可以增加的表述：
+
+> 为 Qwen3.5 Hybrid Decode 构建 batch-bucket CUDA Graph，通过静态三轴位置、Paged KV 元数据和 GDN state-slot buffer 完成 capture/replay，并为动态形状保留 Eager fallback；性能数字只填写实测结果。
+
+完成 V3 后可以增加的表述：
+
+> 实现 GDN-aware Prefix State Cache，在完整 block 边界原子复用 Full Attention KV 与 GDN conv/recurrent snapshot，通过显存预算、checkpoint interval、引用计数和 LRU 管理缓存生命周期；性能数字只填写实测结果。
+
+## 9. 关键文件地图
 
 ```text
 config.py                 根/文本/视觉配置与资源参数
@@ -303,7 +598,7 @@ models/qwen3_5.py         Hybrid Decoder 和 Vision 顶层接口
 models/qwen3_5_vision.py  Vision Transformer/Patch Merger
 models/qwen3_5_mrope.py   LLM 三轴位置 IDs 和 delta
 layers/gated_delta_net.py GDN、短卷积、delta rule、FLA
-layers/rotary_embedding.py 当前 Partial RoPE；待扩展 mRoPE
+layers/rotary_embedding.py Partial RoPE 和 interleaved mRoPE
 inputs.py                 AutoProcessor 和图文输入元数据
 engine/sequence.py        token、block table、state slot、CPU 图像负载
 engine/hybrid_state.py    Hybrid CacheSpec 和 GPU GDN state pool
@@ -311,22 +606,57 @@ engine/block_manager.py   Paged KV blocks
 engine/scheduler.py       Decode-first、Chunked Prefill、抢占
 engine/model_runner.py    Packed Tensor、GPU 前向和 Cache 读写
 engine/llm_engine.py      输入接入、双 microbatch、采样和 decode
+tests/compare_hf_vision.py       HF 图文 greedy 对齐
+tests/compare_vision_prefill.py  Full/Chunked Prefill 一致性
+tests/vision_preemption.py       图文抢占重算一致性
+tests/benchmark_hybrid.py        固定工作负载 Benchmark
+tests/dynamic_scheduler_benchmark.py 动态调度对照
+tests/saturation_benchmark.py    持续闭环饱和压测
 ```
 
-## 8. Git 工作区与恢复入口
-
-当前未全部提交：
+V2 预计主要修改：
 
 ```text
-M  example.py
-M  nanovllm/engine/llm_engine.py
-M  nanovllm/engine/sequence.py
-M  nanovllm/models/qwen3_5.py
-M  pyproject.toml
-?? nanovllm/inputs.py
-?? nanovllm/models/qwen3_5_mrope.py
-?? nanovllm/models/qwen3_5_vision.py
+config.py                 Graph bucket、fallback 和开关配置
+engine/model_runner.py    静态 Decode buffer、capture/replay 和统计
+utils/context.py          Graph replay 所需静态 Context 元数据
+tests/                    Eager/Graph 对齐、bucket 和 Benchmark
 ```
+
+V3 预计主要修改：
+
+```text
+config.py                 Prefix snapshot 预算与 checkpoint interval
+engine/block_manager.py   KV block 引用与 Prefix Entry 联动
+engine/hybrid_state.py    GDN snapshot 保存、恢复与显存统计
+engine/scheduler.py       Prefix lookup、admission 和 scheduled-token 扣减
+engine/sequence.py        命中边界和恢复元数据
+tests/                    Cache on/off、淘汰、抢占和 Benchmark
+```
+
+## 10. Git 工作区与恢复入口
+
+2026-08-29 本次核对时 `git status --short` 显示：
+
+```text
+D  bench.py
+D  hf_cache_probe.py
+D  hf_gdn_layer_probe.py
+D  hf_text_baseline.py
+M  intern/NanoHybrid-VLM项目实施方案.md
+M  intern/NanoHybrid-VLM项目进度记忆.md
+M  nanovllm/config.py
+M  nanovllm/engine/llm_engine.py
+M  nanovllm/engine/scheduler.py
+?? artifacts/bench/
+?? tests/benchmark_hybrid.py
+?? tests/dynamic_scheduler_benchmark.py
+?? tests/run_benchmark_matrix.py
+?? tests/saturation_benchmark.py
+?? tests/vision_preemption.py
+```
+
+这些删除、修改和未跟踪文件尚未在本次文档更新中处理。Git 收尾时必须逐项确认，不能直接删除或全部提交。
 
 恢复命令：
 
@@ -336,4 +666,4 @@ source .venv/bin/activate
 git status
 ```
 
-然后从本文第 4 节的 Vision Part 9B 继续。
+然后先按本文第 6 节冻结 V1 基线并提交可恢复节点，再进入第 4 节 V2 的第 1 个 Part：Hybrid Decode Graph-safe 审计。

@@ -1,0 +1,77 @@
+{
+  "config": {
+    "model": "/workspace/models/Qwen3.5-9B",
+    "workload": "text",
+    "prompt_tokens": 128,
+    "image_size": 512,
+    "output_tokens": 64,
+    "concurrency": 1,
+    "token_budget": 2048
+  },
+  "throughput": {
+    "requests_per_second": 0.6561189900399522,
+    "prefill_tokens_per_second": 383.89584169546174,
+    "decode_tokens_per_second": 52.94206198437134,
+    "benchmark_elapsed_seconds": 1.5241137890843675,
+    "executed_prefill_tokens": 128,
+    "executed_decode_tokens": 63
+  },
+  "latency_ms": {
+    "preprocessing": {
+      "p50": 0.021359999664127827,
+      "p95": 0.021359999664127827,
+      "p99": 0.021359999664127827
+    },
+    "queue": {
+      "p50": 0.028130016289651394,
+      "p95": 0.028130016289651394,
+      "p99": 0.028130016289651394
+    },
+    "ttft": {
+      "p50": 333.4723630687222,
+      "p95": 333.4723630687222,
+      "p99": 333.4723630687222
+    },
+    "tpot": {
+      "p50": 18.898674381142925,
+      "p95": 18.898674381142925,
+      "p99": 18.898674381142925
+    },
+    "e2e": {
+      "p50": 1524.0888490807265,
+      "p95": 1524.0888490807265,
+      "p99": 1524.0888490807265
+    }
+  },
+  "scheduler": {
+    "num_preemptions": 0,
+    "num_recomputed_tokens": 0
+  },
+  "vision": {
+    "num_vision_forwards": 0,
+    "cache_hits": 0,
+    "cache_misses": 0
+  },
+  "memory_bytes": {
+    "model_parameter_bytes": 18819635168,
+    "kv_cache_bytes": 6903824384,
+    "gdn_state_bytes": 51904512,
+    "visual_cache_current_bytes": 0,
+    "visual_cache_peak_bytes": 0,
+    "cuda_current_allocated_bytes": 25862459904,
+    "cuda_peak_allocated_bytes": 25983666688,
+    "cuda_reserved_bytes": 26019364864,
+    "runtime_peak_extra_bytes": 121206784
+  },
+  "memory_gib": {
+    "model_parameter_gib": 17.527151077985764,
+    "kv_cache_gib": 6.4296875,
+    "gdn_state_gib": 0.04833984375,
+    "visual_cache_current_gib": 0.0,
+    "visual_cache_peak_gib": 0.0,
+    "cuda_current_allocated_gib": 24.08629274368286,
+    "cuda_peak_allocated_gib": 24.199175357818604,
+    "cuda_reserved_gib": 24.232421875,
+    "runtime_peak_extra_gib": 0.11288261413574219
+  }
+}

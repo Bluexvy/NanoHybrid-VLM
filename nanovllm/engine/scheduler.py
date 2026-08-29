@@ -44,6 +44,9 @@ class SchedulePlan:
 class Scheduler:
 
     def __init__(self, config: Config):
+        self.scheduler_policy = (
+            config.scheduler_policy
+        )
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.max_prefill_wait_ms = (config.max_prefill_wait_ms)
@@ -221,20 +224,14 @@ class Scheduler:
 
     def schedule(self) -> SchedulePlan:
         """
-        构造一轮 Decode-first 执行计划。
+        根据 scheduler_policy 构造一轮执行计划。
 
-        调度顺序：
+        decode_first：
+            优先调度 Decode，再用剩余预算调度 Prefill。
 
-            1. 判断 Prefill 是否等待超时。
-            2. 优先选择 Decode 请求。
-            3. 如果 Prefill 超时，为它保留预算。
-            4. 使用剩余 token 和 sequence budget
-            调度 Prefill/Chunked Prefill。
-
-        当 Prefill 等待超时时，Scheduler 会同时
-        预留计算预算，并从未进入本轮 Decode 的
-        running 请求中选择重算成本最低的 victim，
-        释放其 KV blocks 和 GDN state slot。
+        prefill_first：
+            只要 waiting 中存在请求，本轮就暂停 Decode，
+            使用完整预算调度 Prefill。
         """
 
         decode_seqs: list[Sequence] = []
@@ -249,37 +246,77 @@ class Scheduler:
         # 保证本轮所有等待时间判断基于同一时刻。
         now = monotonic()
 
-        reserve_prefill = (
-            self._should_reserve_prefill(now)
+        # 当前是否进入“严格 Prefill-first”状态。
+        #
+        # 必须同时满足：
+        # 1. 用户配置了 prefill_first；
+        # 2. waiting 队列中确实有 Prefill 请求。
+        strict_prefill_first = (
+            self.scheduler_policy
+            == "prefill_first"
+            and bool(self.waiting)
         )
 
+        # reserve_prefill 表示：
+        # 本轮必须保证 Prefill 得到执行机会。
+        #
+        # Decode-first：
+        #   只有最老 Prefill 等待超时才为它保留资源。
+        #
+        # Prefill-first：
+        #   只要 waiting 不为空，就立即保留资源。
+        reserve_prefill = (
+            strict_prefill_first
+            or self._should_reserve_prefill(
+                now
+            )
+        )
+
+        # Decode-first 下，如果 Prefill 等待超时，
+        # 至少给 Prefill 留出一个 Sequence 位置。
         reserved_seq_slots = (
             1
             if reserve_prefill
             else 0
         )
 
+        # Decode-first 下，如果 Prefill 等待超时，
+        # 至少给 Prefill 留出一个 token 的计算预算。
         reserved_prefill_tokens = (
             1
             if reserve_prefill
             else 0
         )
 
-        # Prefill 超时后，Decode 最多只能使用
-        # max_num_seqs - 1 个请求位置。
-        decode_seq_limit = max(
-            0,
-            self.max_num_seqs
-            - reserved_seq_slots,
-        )
+        if strict_prefill_first:
+            # 严格 Prefill-first：
+            #
+            # waiting 中还有请求时，本轮完全不调度 Decode。
+            #
+            # 后面的 Decode while 会因为两个 limit 都是0
+            # 而直接跳过。
+            decode_seq_limit = 0
+            decode_token_limit = 0
 
-        # Prefill 超时后，Decode 最多只能消耗
-        # max_num_batched_tokens - 1 个 token。
-        decode_token_limit = max(
-            0,
-            self.max_num_batched_tokens
-            - reserved_prefill_tokens,
-        )
+        else:
+            # Decode-first：
+            #
+            # 正常情况下 Decode 可以使用全部资源。
+            #
+            # 如果 Prefill 已经等待超时，则分别保留：
+            # 1个 Sequence 位置
+            # 1个 token 预算。
+            decode_seq_limit = max(
+                0,
+                self.max_num_seqs
+                - reserved_seq_slots,
+            )
+
+            decode_token_limit = max(
+                0,
+                self.max_num_batched_tokens
+                - reserved_prefill_tokens,
+            )
 
         # =====================================
         # 第一阶段：Decode-first

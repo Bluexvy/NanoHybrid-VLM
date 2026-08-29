@@ -1,5 +1,9 @@
 import atexit
-from dataclasses import dataclass, fields
+from dataclasses import (
+    dataclass,
+    field,
+    fields,
+)
 from time import perf_counter
 from tqdm.auto import tqdm
 import torch.multiprocessing as mp
@@ -78,6 +82,17 @@ class RequestMetrics:
     ) = None
 
     num_completion_tokens: int = 0
+    
+    # 每一个生成 token 被 Engine 观察到的时间。
+    #
+    # token_timestamps[0]：
+    #     第一个输出 token 的时间。
+    #
+    # token_timestamps[1]：
+    #     第二个输出 token 的时间。
+    token_timestamps: list[float] = (
+        field(default_factory=list)
+    )
 
     @property
     def preprocessing_ms(
@@ -328,6 +343,31 @@ class LLMEngine:
             completion_tokens = (
                 seq.num_completion_tokens
             )
+
+            # 当前 Sequence 已经有多少输出 token，
+            # 与目前保存了多少个时间戳之间的差值，
+            # 就是本轮新产生的 token 数量。
+            num_new_timestamps = (
+                completion_tokens
+                - len(metrics.token_timestamps)
+            )
+
+            if num_new_timestamps < 0:
+                raise RuntimeError(
+                    f"Sequence {seq.seq_id} completion "
+                    "token count moved backwards"
+                )
+
+            # 当前引擎每条请求每轮最多产生一个 token。
+            #
+            # 这里仍然用 range，是为了让统计逻辑能够处理
+            # 将来一次返回多个 token 的情况。
+            for _ in range(
+                num_new_timestamps
+            ):
+                metrics.token_timestamps.append(
+                    progress_time
+                )
 
             # Prefill 完成后会产生第一个 token。
             if (
