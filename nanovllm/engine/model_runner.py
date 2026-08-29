@@ -191,6 +191,116 @@ class ModelRunner:
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
 
+    def get_memory_stats(
+        self,
+    ) -> dict[str, int]:
+        """
+        返回当前 ModelRunner 的主要显存组成。
+        """
+
+        torch.cuda.synchronize()
+
+        # 共享权重可能被多个 Parameter 引用。
+        # 例如 Embedding 和 LM Head tied weights。
+        #
+        # 使用 storage.data_ptr() 去重，
+        # 避免重复统计同一块显存。
+        seen_storages: set[int] = set()
+
+        model_parameter_bytes = 0
+
+        for parameter in self.model.parameters():
+            storage = (
+                parameter.untyped_storage()
+            )
+
+            storage_ptr = storage.data_ptr()
+
+            if storage_ptr in seen_storages:
+                continue
+
+            seen_storages.add(
+                storage_ptr
+            )
+
+            model_parameter_bytes += (
+                storage.nbytes()
+            )
+
+        kv_cache_bytes = (
+            self.kv_cache.numel()
+            * self.kv_cache.element_size()
+        )
+
+        if (
+            self.hybrid_cache_spec is not None
+        ):
+            gdn_state_bytes = (
+                self.hybrid_cache_spec
+                .state_bytes_per_slot
+                * self.config.num_state_slots
+            )
+        else:
+            gdn_state_bytes = 0
+
+        cuda_current_allocated = (
+            torch.cuda.memory_allocated(
+                self.rank
+            )
+        )
+
+        cuda_peak_allocated = (
+            torch.cuda.max_memory_allocated(
+                self.rank
+            )
+        )
+
+        cuda_reserved = (
+            torch.cuda.memory_reserved(
+                self.rank
+            )
+        )
+
+        # 从 Benchmark 开始到峰值期间，
+        # 相对最终常驻内存额外出现的显存。
+        runtime_peak_extra_bytes = max(
+            0,
+            (
+                cuda_peak_allocated
+                - cuda_current_allocated
+            ),
+        )
+
+        return {
+            "model_parameter_bytes": (
+                model_parameter_bytes
+            ),
+            "kv_cache_bytes": (
+                kv_cache_bytes
+            ),
+            "gdn_state_bytes": (
+                gdn_state_bytes
+            ),
+            "visual_cache_current_bytes": (
+                self.visual_cache_bytes
+            ),
+            "visual_cache_peak_bytes": (
+                self.peak_visual_cache_bytes
+            ),
+            "cuda_current_allocated_bytes": (
+                cuda_current_allocated
+            ),
+            "cuda_peak_allocated_bytes": (
+                cuda_peak_allocated
+            ),
+            "cuda_reserved_bytes": (
+                cuda_reserved
+            ),
+            "runtime_peak_extra_bytes": (
+                runtime_peak_extra_bytes
+            ),
+        }
+
     def exit(self):
         self.release_visual_embedding_cache(
             list(

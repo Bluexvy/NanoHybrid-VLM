@@ -165,6 +165,43 @@ def main() -> None:
         "cache hits:",
         runner.num_visual_cache_hits,
     )
+    
+    print("\n请求级延迟：")
+
+    for metrics in (
+        llm.get_completed_request_metrics()
+    ):
+        print(
+            {
+                "seq_id": metrics.seq_id,
+                "prompt_tokens": (
+                    metrics.num_prompt_tokens
+                ),
+                "completion_tokens": (
+                    metrics.num_completion_tokens
+                ),
+                "preprocessing_ms": round(
+                    metrics.preprocessing_ms,
+                    3,
+                ),
+                "queue_ms": round(
+                    metrics.queue_ms,
+                    3,
+                ),
+                "ttft_ms": round(
+                    metrics.ttft_ms,
+                    3,
+                ),
+                "tpot_ms": round(
+                    metrics.tpot_ms,
+                    3,
+                ),
+                "e2e_ms": round(
+                    metrics.e2e_ms,
+                    3,
+                ),
+            }
+        )
 
 
 if __name__ == "__main__":

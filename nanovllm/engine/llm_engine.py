@@ -52,6 +52,106 @@ class StepStats:
             / self.prefill_elapsed
         )
         
+
+@dataclass(slots=True)
+class RequestMetrics:
+    """
+    一条请求从进入 Engine 到完成的生命周期指标。
+    """
+
+    seq_id: int
+    num_prompt_tokens: int
+
+    arrival_time: float
+    enqueue_time: float
+
+    first_scheduled_time: (
+        float | None
+    ) = None
+
+    first_token_time: (
+        float | None
+    ) = None
+
+    finish_time: (
+        float | None
+    ) = None
+
+    num_completion_tokens: int = 0
+
+    @property
+    def preprocessing_ms(
+        self,
+    ) -> float:
+        return (
+            self.enqueue_time
+            - self.arrival_time
+        ) * 1000.0
+
+    @property
+    def queue_ms(
+        self,
+    ) -> float | None:
+        if (
+            self.first_scheduled_time
+            is None
+        ):
+            return None
+
+        return (
+            self.first_scheduled_time
+            - self.enqueue_time
+        ) * 1000.0
+
+    @property
+    def ttft_ms(
+        self,
+    ) -> float | None:
+        if self.first_token_time is None:
+            return None
+
+        return (
+            self.first_token_time
+            - self.arrival_time
+        ) * 1000.0
+
+    @property
+    def tpot_ms(
+        self,
+    ) -> float | None:
+        if (
+            self.first_token_time is None
+            or self.finish_time is None
+        ):
+            return None
+
+        if self.num_completion_tokens <= 1:
+            return 0.0
+
+        return (
+            (
+                self.finish_time
+                - self.first_token_time
+            )
+            * 1000.0
+            / (
+                self.num_completion_tokens
+                - 1
+            )
+        )
+
+    @property
+    def e2e_ms(
+        self,
+    ) -> float | None:
+        if self.finish_time is None:
+            return None
+
+        return (
+            self.finish_time
+            - self.arrival_time
+        ) * 1000.0
+        
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
@@ -101,6 +201,11 @@ class LLMEngine:
 
         config.eos = model_eos_token_id
         self.scheduler = Scheduler(config)
+        # seq_id -> 请求生命周期指标
+        self.request_metrics: dict[
+            int,
+            RequestMetrics,
+        ] = {}
         atexit.register(self.exit)
 
     def exit(self):
@@ -114,6 +219,8 @@ class LLMEngine:
         prompt: PromptInput,
         sampling_params: SamplingParams,
     ):
+        arrival_time = perf_counter()
+        
         processed_prompt = (
             self.input_processor.process(
                 prompt
@@ -145,7 +252,104 @@ class LLMEngine:
             ),
         )
 
+        enqueue_time = perf_counter()
+
         self.scheduler.add(seq)
+
+        if seq.seq_id in self.request_metrics:
+            raise RuntimeError(
+                f"Duplicate request metrics for "
+                f"Sequence {seq.seq_id}"
+            )
+
+        self.request_metrics[
+            seq.seq_id
+        ] = RequestMetrics(
+            seq_id=seq.seq_id,
+            num_prompt_tokens=(
+                seq.num_prompt_tokens
+            ),
+            arrival_time=arrival_time,
+            enqueue_time=enqueue_time,
+        )
+
+        return seq.seq_id
+
+    def _record_first_scheduled(
+        self,
+        seqs: list[Sequence],
+    ) -> None:
+        if not seqs:
+            return
+
+        scheduled_time = perf_counter()
+
+        for seq in seqs:
+            metrics = self.request_metrics.get(
+                seq.seq_id
+            )
+
+            if metrics is None:
+                raise RuntimeError(
+                    f"Sequence {seq.seq_id} has "
+                    "no request metrics"
+                )
+
+            # Chunked Prefill 会多次调度，
+            # 这里只记录第一次。
+            if (
+                metrics.first_scheduled_time
+                is None
+            ):
+                metrics.first_scheduled_time = (
+                    scheduled_time
+                )
+
+    def _record_request_progress(
+        self,
+        seqs: list[Sequence],
+    ) -> None:
+        if not seqs:
+            return
+
+        progress_time = perf_counter()
+
+        for seq in seqs:
+            metrics = self.request_metrics.get(
+                seq.seq_id
+            )
+
+            if metrics is None:
+                raise RuntimeError(
+                    f"Sequence {seq.seq_id} has "
+                    "no request metrics"
+                )
+
+            completion_tokens = (
+                seq.num_completion_tokens
+            )
+
+            # Prefill 完成后会产生第一个 token。
+            if (
+                completion_tokens >= 1
+                and metrics.first_token_time
+                is None
+            ):
+                metrics.first_token_time = (
+                    progress_time
+                )
+
+            metrics.num_completion_tokens = (
+                completion_tokens
+            )
+
+            if (
+                seq.is_finished
+                and metrics.finish_time is None
+            ):
+                metrics.finish_time = (
+                    progress_time
+                )
 
     def step(
         self,
@@ -159,6 +363,10 @@ class LLMEngine:
                 "release_visual_embedding_cache",
                 plan.preempted_seq_ids,
             ) 
+            
+        self._record_first_scheduled(
+            plan.prefill_seqs
+        )
         stats = StepStats(
             num_decode_tokens=(
                 plan.num_decode_tokens
@@ -191,6 +399,9 @@ class LLMEngine:
                 plan.decode_seqs,
                 decode_token_ids,
                 False,
+            )
+            self._record_request_progress(
+                plan.decode_seqs
             )
             
             finished_decode_seq_ids = [
@@ -238,6 +449,9 @@ class LLMEngine:
                 prefill_token_ids,
                 True,
             )
+            self._record_request_progress(
+                plan.prefill_seqs
+            )
 
             finished_prefill_seq_ids = [
                 seq.seq_id
@@ -265,6 +479,27 @@ class LLMEngine:
             )
 
         return outputs, stats
+
+    def get_completed_request_metrics(
+        self,
+    ) -> list[RequestMetrics]:
+        """
+        按 seq_id 返回所有已完成请求的指标。
+        """
+
+        completed = [
+            metrics
+            for metrics
+            in self.request_metrics.values()
+            if metrics.finish_time is not None
+        ]
+
+        return sorted(
+            completed,
+            key=lambda metrics: (
+                metrics.seq_id
+            ),
+        )
 
     def is_finished(self):
         return self.scheduler.is_finished()
