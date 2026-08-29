@@ -85,6 +85,24 @@ class ModelRunner:
 
         # ModelRunner 生命周期内的峰值视觉缓存字节数。
         self.peak_visual_cache_bytes = 0
+        
+        # Vision Tower 实际成功执行了多少次。
+        self.num_vision_forwards = 0
+
+        # 查询视觉缓存时命中的次数。
+        self.num_visual_cache_hits = 0
+
+        # 查询视觉缓存时未命中的次数。
+        self.num_visual_cache_misses = 0
+        
+        # 实际执行了多少个 Prefill microbatch。
+        self.num_prefill_microbatches = 0
+
+        # 单个 Prefill microbatch 中最多包含多少条请求。
+        self.max_observed_prefill_batch_size = 0
+
+        # 同时包含纯文本和图文请求的 Prefill 数量。
+        self.num_mixed_prefill_microbatches = 0
 
         if (
             self.uses_multimodal_rope
@@ -808,14 +826,16 @@ class ModelRunner:
         缓存未命中：
             运行 Vision Tower，保存后返回。
         """
-
         cached = self.visual_embedding_cache.get(
             seq.seq_id
         )
 
         if cached is not None:
+            self.num_visual_cache_hits += 1
             return cached
 
+        self.num_visual_cache_misses += 1
+        
         if (
             seq.pixel_values is None
             or seq.image_grid_thw is None
@@ -852,6 +872,7 @@ class ModelRunner:
                 image_grid_thw=image_grid_thw,
             )
         )
+        self.num_vision_forwards += 1
 
         expected_visual_tokens = sum(
             token_type == self.IMAGE_TOKEN_TYPE
@@ -1207,6 +1228,29 @@ class ModelRunner:
             raise ValueError(
                 "Prefill batch must not be empty"
             )
+            
+        self.num_prefill_microbatches += 1
+
+        self.max_observed_prefill_batch_size = max(
+            self.max_observed_prefill_batch_size,
+            len(seqs),
+        )
+
+        has_multimodal_request = any(
+            seq.is_multimodal
+            for seq in seqs
+        )
+
+        has_text_only_request = any(
+            not seq.is_multimodal
+            for seq in seqs
+        )
+
+        if (
+            has_multimodal_request
+            and has_text_only_request
+        ):
+            self.num_mixed_prefill_microbatches += 1
 
         state_manager = (
             self.hybrid_state_manager
