@@ -16,6 +16,8 @@ from nanovllm.engine.hybrid_state import (
 )
 
 class ModelRunner:
+    
+    IMAGE_TOKEN_TYPE = 1
 
     def __init__(    
         self,
@@ -51,12 +53,50 @@ class ModelRunner:
 
         self.root_config = root_config
         self.text_config = text_config
+        self.model_dtype = model_dtype
 
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        
+        # 当前 Qwen3.5 多模态模型使用
+        # temporal/height/width 三轴 RoPE。
+        #
+        # 普通 Qwen3 没有 vision_config，
+        # 继续使用一维 positions。
+        self.uses_multimodal_rope = (
+            config.vision_config is not None
+        )
+        self.image_token_id = getattr(
+            root_config,
+            "image_token_id",
+            None,
+        )
+        # seq_id -> 完整视觉 token embeddings
+        self.visual_embedding_cache: dict[
+            int,
+            torch.Tensor,
+        ] = {}
+
+        # 当前视觉缓存实际持有的字节数。
+        self.visual_cache_bytes = 0
+
+        # ModelRunner 生命周期内的峰值视觉缓存字节数。
+        self.peak_visual_cache_bytes = 0
+
+        if (
+            self.uses_multimodal_rope
+            and not isinstance(
+                self.image_token_id,
+                int,
+            )
+        ):
+            raise ValueError(
+                "A multimodal model must provide "
+                "image_token_id"
+            )
 
         layer_types = tuple(
             getattr(
@@ -134,6 +174,11 @@ class ModelRunner:
                 self.loop()
 
     def exit(self):
+        self.release_visual_embedding_cache(
+            list(
+                self.visual_embedding_cache.keys()
+            )
+        )
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -521,7 +566,16 @@ class ModelRunner:
 
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
-        positions = []
+        if self.uses_multimodal_rope:
+            # 三行分别保存 T/H/W。
+            positions = [
+                [],
+                [],
+                [],
+            ]
+        else:
+            # 原 Qwen3 保持一维位置。
+            positions = []
         cu_seqlens_q = [0]
         cu_seqlens_k = [0]
         prefill_seqlens = []
@@ -542,7 +596,71 @@ class ModelRunner:
             end = start + seqlen_q
             seqlen_k = end
             input_ids.extend(seq[start:end])
-            positions.extend(range(start, end))
+            if self.uses_multimodal_rope:
+                if (
+                    seq.mrope_position_ids
+                    is None
+                ):
+                    # Qwen3.5 纯文本请求。
+                    #
+                    # 三个轴使用完全相同的一维位置。
+                    text_positions = list(
+                        range(start, end)
+                    )
+
+                    for axis in range(3):
+                        positions[axis].extend(
+                            text_positions
+                        )
+
+                else:
+                    # Qwen3.5 图文请求。
+                    #
+                    # Sequence 保存的是整条请求：
+                    # [3, total_sequence_length]
+                    #
+                    # 本轮只取当前 Prefill chunk。
+                    if (
+                        end
+                        > seq.mrope_position_ids
+                        .shape[1]
+                    ):
+                        raise RuntimeError(
+                            f"Sequence {seq.seq_id} "
+                            "does not have enough "
+                            "mRoPE positions for its "
+                            "scheduled Prefill chunk"
+                        )
+
+                    chunk_positions = (
+                        seq.mrope_position_ids[
+                            :,
+                            start:end,
+                        ]
+                    )
+
+                    if chunk_positions.shape != (
+                        3,
+                        seqlen_q,
+                    ):
+                        raise RuntimeError(
+                            "Chunked mRoPE position "
+                            "shape mismatch: "
+                            f"{tuple(chunk_positions.shape)}"
+                        )
+
+                    for axis in range(3):
+                        positions[axis].extend(
+                            chunk_positions[
+                                axis
+                            ].tolist()
+                        )
+
+            else:
+                # 原 Qwen3 一维 RoPE。
+                positions.extend(
+                    range(start, end)
+                )
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
@@ -606,13 +724,56 @@ class ModelRunner:
 
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
-        positions = []
+        if self.uses_multimodal_rope:
+            positions = [
+                [],
+                [],
+                [],
+            ]
+        else:
+            positions = []
         slot_mapping = []
         context_lens = []
         for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
+            input_ids.append(
+                seq.last_token
+            )
+
+            token_index = len(seq) - 1
+
+            if self.uses_multimodal_rope:
+                if (
+                    seq.mrope_position_delta
+                    is None
+                ):
+                    # Qwen3.5 纯文本请求。
+                    token_position = (
+                        token_index
+                    )
+
+                else:
+                    # Qwen3.5 图文请求。
+                    token_position = (
+                        token_index
+                        + seq.mrope_position_delta
+                    )
+
+                # Decode 生成的是文本 token，
+                # 所以 T/H/W 三轴位置相同。
+                for axis in range(3):
+                    positions[axis].append(
+                        token_position
+                    )
+
+            else:
+                # 原 Qwen3。
+                positions.append(
+                    token_index
+                )
+
+            context_lens.append(
+                len(seq)
+            )
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -632,6 +793,404 @@ class ModelRunner:
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
+
+    @torch.inference_mode()
+    def get_or_create_visual_embeddings(
+        self,
+        seq: Sequence,
+    ) -> torch.Tensor:
+        """
+        返回一条请求完整的视觉 embeddings。
+
+        缓存命中：
+            直接返回 GPU Tensor。
+
+        缓存未命中：
+            运行 Vision Tower，保存后返回。
+        """
+
+        cached = self.visual_embedding_cache.get(
+            seq.seq_id
+        )
+
+        if cached is not None:
+            return cached
+
+        if (
+            seq.pixel_values is None
+            or seq.image_grid_thw is None
+            or seq.mm_token_type_ids is None
+        ):
+            raise RuntimeError(
+                f"Sequence {seq.seq_id} does not "
+                "contain complete image inputs"
+            )
+
+        pixel_values = seq.pixel_values.to(
+            device=torch.device(
+                "cuda",
+                self.rank,
+            ),
+            dtype=self.model_dtype,
+            non_blocking=True,
+        )
+
+        image_grid_thw = (
+            seq.image_grid_thw.to(
+                device=torch.device(
+                    "cuda",
+                    self.rank,
+                ),
+                dtype=torch.long,
+                non_blocking=True,
+            )
+        )
+
+        visual_embeddings = (
+            self.model.get_visual_embeddings(
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+            )
+        )
+
+        expected_visual_tokens = sum(
+            token_type == self.IMAGE_TOKEN_TYPE
+            for token_type
+            in seq.mm_token_type_ids
+        )
+
+        if (
+            visual_embeddings.ndim != 2
+            or visual_embeddings.shape[0]
+            != expected_visual_tokens
+        ):
+            raise RuntimeError(
+                "Vision Tower output token count "
+                "mismatch: "
+                f"expected {expected_visual_tokens}, "
+                f"got "
+                f"{tuple(visual_embeddings.shape)}"
+            )
+
+        # 推理阶段不需要 autograd graph。
+        visual_embeddings = (
+            visual_embeddings.detach()
+        )
+
+        self.visual_embedding_cache[
+            seq.seq_id
+        ] = visual_embeddings
+
+        tensor_bytes = (
+            visual_embeddings.numel()
+            * visual_embeddings.element_size()
+        )
+
+        self.visual_cache_bytes += tensor_bytes
+
+        self.peak_visual_cache_bytes = max(
+            self.peak_visual_cache_bytes,
+            self.visual_cache_bytes,
+        )
+
+        return visual_embeddings
+
+    def release_visual_embedding_cache(
+        self,
+        seq_ids: list[int],
+    ) -> None:
+        """
+        释放指定请求持有的视觉 embeddings。
+        """
+
+        for seq_id in seq_ids:
+            visual_embeddings = (
+                self.visual_embedding_cache.pop(
+                    seq_id,
+                    None,
+                )
+            )
+
+            # 纯文本请求或尚未建立缓存的请求，
+            # 释放时什么也不做。
+            if visual_embeddings is None:
+                continue
+
+            tensor_bytes = (
+                visual_embeddings.numel()
+                * visual_embeddings.element_size()
+            )
+
+            self.visual_cache_bytes -= tensor_bytes
+
+        if self.visual_cache_bytes < 0:
+            raise RuntimeError(
+                "Visual cache byte counter "
+                "became negative"
+            )
+
+    @torch.inference_mode()
+    def prepare_multimodal_embeddings(
+        self,
+        seqs: list[Sequence],
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """
+        为 Packed Prefill 构造图文 embeddings。
+
+        如果当前 microbatch 没有任何图像 token，
+        返回 None，调用方继续走 input_ids 路径。
+
+        如果有图像 token：
+            1. 为全部 packed tokens 查询文本 embedding；
+            2. 运行对应请求的 Vision Tower；
+            3. 用 visual embedding 替换图像位置。
+        """
+
+        replacement_plans = []
+
+        packed_start = 0
+
+        # =====================================
+        # 第一阶段：定位所有需要替换的位置
+        # =====================================
+
+        for seq in seqs:
+            start = seq.num_cached_tokens
+
+            end = (
+                start
+                + seq.num_scheduled_tokens
+            )
+
+            chunk_length = (
+                seq.num_scheduled_tokens
+            )
+
+            if chunk_length <= 0:
+                raise ValueError(
+                    f"Sequence {seq.seq_id} has no "
+                    "scheduled Prefill tokens"
+                )
+
+            if (
+                seq.mm_token_type_ids
+                is None
+            ):
+                # 纯文本请求。
+                packed_start += chunk_length
+                continue
+
+            if (
+                len(seq.mm_token_type_ids)
+                < end
+            ):
+                raise RuntimeError(
+                    f"Sequence {seq.seq_id} does "
+                    "not have enough multimodal "
+                    "token types"
+                )
+
+            chunk_token_types = (
+                seq.mm_token_type_ids[
+                    start:end
+                ]
+            )
+
+            # 当前 chunk 内部，哪些位置是图像 token。
+            local_image_positions = [
+                local_index
+                for local_index, token_type
+                in enumerate(
+                    chunk_token_types
+                )
+                if token_type
+                == self.IMAGE_TOKEN_TYPE
+            ]
+
+            # 当前 chunk 不包含图像 token。
+            #
+            # 例如图片已经在前一个 chunk 处理完，
+            # 这一轮只处理图片后的文本。
+            if not local_image_positions:
+                packed_start += chunk_length
+                continue
+
+            if self.image_token_id is None:
+                raise RuntimeError(
+                    "image_token_id has not been "
+                    "initialized"
+                )
+
+            chunk_token_ids = seq[
+                start:end
+            ]
+
+            # 再次确认 mm type=1 的位置确实是
+            # <|image_pad|> token。
+            for local_index in (
+                local_image_positions
+            ):
+                if (
+                    chunk_token_ids[local_index]
+                    != self.image_token_id
+                ):
+                    raise RuntimeError(
+                        "Image token type does not "
+                        "point to image_token_id"
+                    )
+
+            if (
+                seq.pixel_values is None
+                or seq.image_grid_thw is None
+            ):
+                raise RuntimeError(
+                    f"Sequence {seq.seq_id} contains "
+                    "image tokens but does not carry "
+                    "image tensors"
+                )
+
+            # 当前 chunk 之前已经跳过多少个
+            # image token。
+            #
+            # 它决定应该从 visual_embeddings
+            # 的哪一行开始读取。
+            visual_start = sum(
+                token_type
+                == self.IMAGE_TOKEN_TYPE
+                for token_type
+                in seq.mm_token_type_ids[
+                    :start
+                ]
+            )
+
+            visual_end = (
+                visual_start
+                + len(local_image_positions)
+            )
+
+            # 将 chunk 内部下标转换成 packed batch
+            # 中的全局行号。
+            packed_image_positions = [
+                packed_start + local_index
+                for local_index
+                in local_image_positions
+            ]
+
+            replacement_plans.append(
+                (
+                    seq,
+                    packed_image_positions,
+                    visual_start,
+                    visual_end,
+                )
+            )
+
+            packed_start += chunk_length
+
+        if packed_start != input_ids.numel():
+            raise RuntimeError(
+                "Packed token count does not match "
+                "input_ids: "
+                f"{packed_start} != "
+                f"{input_ids.numel()}"
+            )
+
+        # 当前 batch 没有图像 token。
+        #
+        # 返回 None 后，模型继续使用 input_ids，
+        # 保持原纯文本路径完全不变。
+        if not replacement_plans:
+            return None
+
+        # =====================================
+        # 第二阶段：查询全部文本 embeddings
+        # =====================================
+
+        inputs_embeds = (
+            self.model.embed_input_ids(
+                input_ids
+            )
+        )
+
+        if inputs_embeds.ndim != 2:
+            raise RuntimeError(
+                "Text embeddings must have shape "
+                "[num_tokens, hidden_size]"
+            )
+
+        if (
+            inputs_embeds.shape[0]
+            != input_ids.numel()
+        ):
+            raise RuntimeError(
+                "Text embedding token count "
+                "does not match input_ids"
+            )
+
+        # =====================================
+        # 第三阶段：运行 Vision Tower 并替换
+        # =====================================
+
+        for (
+            seq,
+            packed_image_positions,
+            visual_start,
+            visual_end,
+        ) in replacement_plans:
+            visual_embeddings = (
+                self.get_or_create_visual_embeddings(
+                    seq
+                )
+            )
+
+            if (
+                visual_embeddings.shape[1]
+                != inputs_embeds.shape[1]
+            ):
+                raise RuntimeError(
+                    "Vision output hidden size "
+                    "does not match text hidden size"
+                )
+
+            selected_visual_embeddings = (
+                visual_embeddings[
+                    visual_start:visual_end
+                ]
+            )
+
+            if (
+                selected_visual_embeddings
+                .shape[0]
+                != len(
+                    packed_image_positions
+                )
+            ):
+                raise RuntimeError(
+                    "Selected visual embedding "
+                    "count does not match packed "
+                    "image positions"
+                )
+
+            destination_indices = (
+                torch.tensor(
+                    packed_image_positions,
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
+            )
+
+            # 把图像位置的普通 token embedding
+            # 替换成真实 visual embedding。
+            inputs_embeds.index_copy_(
+                0,
+                destination_indices,
+                selected_visual_embeddings.to(
+                    dtype=inputs_embeds.dtype,
+                ),
+            )
+
+        return inputs_embeds
 
 
     @torch.inference_mode()
@@ -712,6 +1271,12 @@ class ModelRunner:
         input_ids, positions = (
             self.prepare_prefill(seqs)
         )
+        inputs_embeds = (
+            self.prepare_multimodal_embeddings(
+                seqs,
+                input_ids,
+            )
+        )
 
         try:
             # =================================
@@ -733,9 +1298,16 @@ class ModelRunner:
                 hidden_states,
                 updated_gdn_states,
             ) = self.model(
-                input_ids=input_ids,
+                input_ids=(
+                    input_ids
+                    if inputs_embeds is None
+                    else None
+                ),
                 positions=positions,
                 gdn_states=old_gdn_states,
+                inputs_embeds=(
+                    inputs_embeds
+                ),
             )
 
             # ParallelLMHead会根据：

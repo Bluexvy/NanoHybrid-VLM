@@ -139,14 +139,48 @@ class Qwen3_5Attention(nn.Module):
             "rope_theta",
             getattr(config, "rope_theta", 10000.0),
         )
+        
+        mrope_interleaved = (
+            rope_parameters.get(
+                "mrope_interleaved",
+                False,
+            )
+        )
+
+        if not mrope_interleaved:
+            raise NotImplementedError(
+                "Qwen3.5 currently requires "
+                "interleaved mRoPE"
+            )
+
+        raw_mrope_section = (
+            rope_parameters.get(
+                "mrope_section",
+                None,
+            )
+        )
+
+        if raw_mrope_section is None:
+            raise ValueError(
+                "Qwen3.5 config does not provide "
+                "mrope_section"
+            )
+
+        mrope_section = tuple(
+            int(section)
+            for section in raw_mrope_section
+        )
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.rotary_dim,
-            max_position=config.max_position_embeddings,
+            max_position=(
+                config.max_position_embeddings
+            ),
             base=rope_theta,
+            mrope_section=mrope_section,
         )
-
+        
         # 复用 nano-vLLM 已有的：
         # FlashAttention
         # Paged KV Cache
@@ -406,13 +440,26 @@ class Qwen3_5DecoderLayer(nn.Module):
                 f"{hidden_size}"
             )
 
-        if (
-            positions.ndim != 1
-            or positions.numel() != num_tokens
+        has_text_positions = (
+            positions.ndim == 1
+            and positions.shape
+            == (num_tokens,)
+        )
+
+        has_mrope_positions = (
+            positions.ndim == 2
+            and positions.shape
+            == (3, num_tokens)
+        )
+
+        if not (
+            has_text_positions
+            or has_mrope_positions
         ):
             raise ValueError(
                 "positions must have shape "
-                "[num_tokens]"
+                "[num_tokens] or "
+                "[3, num_tokens]"
             )
 
         # =====================================
@@ -647,15 +694,28 @@ class Qwen3_5TextModel(nn.Module):
 
         num_tokens = hidden_states.shape[0]
 
-        if (
-            positions.ndim != 1
-            or positions.numel() != num_tokens
+        has_text_positions = (
+            positions.ndim == 1
+            and positions.shape
+            == (num_tokens,)
+        )
+
+        has_mrope_positions = (
+            positions.ndim == 2
+            and positions.shape
+            == (3, num_tokens)
+        )
+
+        if not (
+            has_text_positions
+            or has_mrope_positions
         ):
             raise ValueError(
                 "positions must have shape "
-                "[num_tokens]"
+                "[num_tokens] or "
+                "[3, num_tokens]"
             )
-
+            
         # 首次 Prefill 时调用方还没有任何 GDN state。
         if gdn_states is None:
             gdn_states = [
@@ -924,6 +984,31 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
                 .embed_tokens
                 .weight
             )
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        把文本 token ID 转换成文本 embedding。
+
+        input_ids:
+            [num_tokens]
+
+        return:
+            [num_tokens, hidden_size]
+        """
+
+        if input_ids.ndim != 1:
+            raise ValueError(
+                "input_ids must have shape [num_tokens]"
+            )
+
+        return (
+            self.model
+            .language_model
+            .embed_tokens(input_ids)
+        )
 
     def get_visual_embeddings(
         self,

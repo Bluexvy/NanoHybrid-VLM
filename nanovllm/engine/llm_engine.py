@@ -51,6 +51,7 @@ class StepStats:
             self.num_prefill_tokens
             / self.prefill_elapsed
         )
+        
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
@@ -134,6 +135,14 @@ class LLMEngine:
                 processed_prompt
                 .image_grid_thw
             ),
+            mrope_position_ids=(
+                processed_prompt
+                .mrope_position_ids
+            ),
+            mrope_position_delta=(
+                processed_prompt
+                .mrope_position_delta
+            ),
         )
 
         self.scheduler.add(seq)
@@ -145,7 +154,11 @@ class LLMEngine:
         StepStats,
     ]:
         plan = self.scheduler.schedule()
-
+        if plan.preempted_seq_ids:
+            self.model_runner.call(
+                "release_visual_embedding_cache",
+                plan.preempted_seq_ids,
+            ) 
         stats = StepStats(
             num_decode_tokens=(
                 plan.num_decode_tokens
@@ -179,6 +192,18 @@ class LLMEngine:
                 decode_token_ids,
                 False,
             )
+            
+            finished_decode_seq_ids = [
+                seq.seq_id
+                for seq in plan.decode_seqs
+                if seq.is_finished
+            ]
+
+            if finished_decode_seq_ids:
+                self.model_runner.call(
+                    "release_visual_embedding_cache",
+                    finished_decode_seq_ids,
+                )
 
             stats.decode_elapsed = (
                 perf_counter() - start
@@ -213,6 +238,18 @@ class LLMEngine:
                 prefill_token_ids,
                 True,
             )
+
+            finished_prefill_seq_ids = [
+                seq.seq_id
+                for seq in plan.prefill_seqs
+                if seq.is_finished
+            ]
+
+            if finished_prefill_seq_ids:
+                self.model_runner.call(
+                    "release_visual_embedding_cache",
+                    finished_prefill_seq_ids,
+                )
 
             stats.prefill_elapsed = (
                 perf_counter() - start

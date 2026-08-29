@@ -24,6 +24,8 @@ class SchedulePlan:
 
     num_decode_tokens: int
     num_prefill_tokens: int
+    
+    preempted_seq_ids: list[int]
 
     @property
     def total_num_tokens(self) -> int:
@@ -241,6 +243,8 @@ class Scheduler:
         num_decode_tokens = 0
         num_prefill_tokens = 0
 
+        preempted_seq_ids: list[int] = []
+        
         # 一轮调度只读取一次当前时间，
         # 保证本轮所有等待时间判断基于同一时刻。
         now = monotonic()
@@ -299,12 +303,18 @@ class Scheduler:
                 if victim is None:
                     # 没有其他未调度请求可以释放资源，
                     # 只能抢占当前请求自己。
+                    preempted_seq_ids.append(
+                        seq.seq_id
+                    )
                     self.preempt(seq)
                     seq = None
                     break
 
                 # preempt() 假设调用者已经把 victim
                 # 从 running 队列移除。
+                preempted_seq_ids.append(
+                    victim.seq_id
+                )
                 self.running.remove(victim)
                 self.preempt(victim)
 
@@ -430,6 +440,9 @@ class Scheduler:
                     if victim is None:
                         break
 
+                    preempted_seq_ids.append(
+                        victim.seq_id
+                    )
                     # victim 还在 running 中，
                     # 必须先将其移出。
                     self.running.remove(victim)
@@ -551,6 +564,7 @@ class Scheduler:
             prefill_seqs=prefill_seqs,
             num_decode_tokens=num_decode_tokens,
             num_prefill_tokens=num_prefill_tokens,
+            preempted_seq_ids=preempted_seq_ids,
         )
 
         if plan.is_empty:

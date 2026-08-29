@@ -1,6 +1,7 @@
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+import torch
 from torch import Tensor
 
 from nanovllm.sampling_params import SamplingParams
@@ -26,6 +27,12 @@ class Sequence:
         ) = None,
         pixel_values: Tensor | None = None,
         image_grid_thw: Tensor | None = None,
+        mrope_position_ids: (
+            Tensor | None
+        ) = None,
+        mrope_position_delta: (
+            int | None
+        ) = None,
     ):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
@@ -49,6 +56,8 @@ class Sequence:
             mm_token_type_ids is not None,
             pixel_values is not None,
             image_grid_thw is not None,
+            mrope_position_ids is not None,
+            mrope_position_delta is not None,
         )
 
         if (
@@ -70,6 +79,46 @@ class Sequence:
                 "with token_ids"
             )
 
+        if (
+            mrope_position_ids is not None
+            and mrope_position_ids.shape
+            != (3, len(token_ids))
+        ):
+            raise ValueError(
+                "mrope_position_ids must have "
+                "shape [3, num_tokens]"
+            )
+
+        if (
+            mrope_position_ids is not None
+            and mrope_position_ids.dtype
+            != torch.long
+        ):
+            raise TypeError(
+                "mrope_position_ids must use "
+                "torch.long"
+            )
+
+        if (
+            mrope_position_ids is not None
+            and mrope_position_ids.is_cuda
+        ):
+            raise ValueError(
+                "mrope_position_ids must remain "
+                "on CPU while waiting"
+            )
+
+        if (
+            mrope_position_delta is not None
+            and not isinstance(
+                mrope_position_delta,
+                int,
+            )
+        ):
+            raise TypeError(
+                "mrope_position_delta must be int"
+            )
+
         self.mm_token_type_ids = (
             copy(mm_token_type_ids)
             if mm_token_type_ids is not None
@@ -80,6 +129,16 @@ class Sequence:
 
         self.image_grid_thw = (
             image_grid_thw
+        )
+        
+        self.mrope_position_ids = (
+            mrope_position_ids.clone()
+            if mrope_position_ids is not None
+            else None
+        )
+
+        self.mrope_position_delta = (
+            mrope_position_delta
         )
 
     def __len__(self):
@@ -127,10 +186,49 @@ class Sequence:
     ):
         self.token_ids.append(token_id)
 
-        # 新生成的 token 一定是文本，
-        # 所以对应的 multimodal type 是 0。
         if self.mm_token_type_ids is not None:
+            # 模型生成的 token 一定属于文本。
             self.mm_token_type_ids.append(0)
+
+        if self.mrope_position_ids is not None:
+            if self.mrope_position_delta is None:
+                raise RuntimeError(
+                    "A multimodal Sequence is "
+                    "missing mRoPE position delta"
+                )
+
+            # 此时 self.num_tokens 还是追加前的长度。
+            #
+            # 例如：
+            # prompt length = 96
+            # delta = -70
+            #
+            # 第一个生成 token 的位置：
+            # 96 - 70 = 26
+            new_position = (
+                self.num_tokens
+                + self.mrope_position_delta
+            )
+
+            # 新生成的是文本 token，
+            # 所以 T/H/W 三个位置完全相同。
+            new_position_column = (
+                self.mrope_position_ids
+                .new_full(
+                    (3, 1),
+                    new_position,
+                )
+            )
+
+            self.mrope_position_ids = (
+                torch.cat(
+                    [
+                        self.mrope_position_ids,
+                        new_position_column,
+                    ],
+                    dim=1,
+                )
+            )
 
         self.last_token = token_id
         self.num_tokens += 1
@@ -146,19 +244,31 @@ class Sequence:
             self.is_prefill
             and self.is_multimodal
         ):
+            # Prefill 需要完整图像和完整位置。
             multimodal_state = (
                 self.mm_token_type_ids,
                 self.pixel_values,
                 self.image_grid_thw,
+                self.mrope_position_ids,
+                self.mrope_position_delta,
             )
+
         else:
+            # Decode 不再运行 Vision Tower，
+            # 也不需要完整三轴位置数组。
+            #
+            # 但它仍然需要 delta 来计算
+            # 当前 Decode token 的位置。
             multimodal_state = (
                 None,
                 None,
                 None,
+                None,
+                self.mrope_position_delta,
             )
 
         return (
+            self.seq_id,
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
@@ -168,12 +278,13 @@ class Sequence:
             last_state,
             *multimodal_state,
         )
-        
+                
     def __setstate__(
         self,
         state,
     ):
         (
+            self.seq_id,
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
@@ -184,6 +295,8 @@ class Sequence:
             self.mm_token_type_ids,
             self.pixel_values,
             self.image_grid_thw,
+            self.mrope_position_ids,
+            self.mrope_position_delta,
         ) = state
 
         self.is_prefill = isinstance(
