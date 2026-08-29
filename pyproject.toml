@@ -17,6 +17,7 @@ dependencies = [
     "transformers>=4.51.0",
     "flash-attn",
     "xxhash",
+    "pillow>=10.0.0",
 ]
 
 [project.urls]

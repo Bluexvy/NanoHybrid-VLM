@@ -20,6 +20,9 @@ from nanovllm.layers.embed_head import (
     VocabParallelEmbedding,
     ParallelLMHead,
 )
+from nanovllm.models.qwen3_5_vision import (
+    Qwen3_5VisionModel,
+)
 
     # Qwen3_5ForConditionalGeneration.forward()
     #              ↓
@@ -774,8 +777,40 @@ class Qwen3_5Model(nn.Module):
             decoder=True
         )
 
-        # 模块名字必须叫 language_model，
-        # 才能对应 checkpoint：
+        vision_config = getattr(
+            config,
+            "vision_config",
+            None,
+        )
+
+        if vision_config is None:
+            raise ValueError(
+                "Qwen3.5 multimodal model must "
+                "define vision_config"
+            )
+
+        # Patch Merger 最终输出必须能够直接
+        # 替换文本 token embedding。
+        if (
+            vision_config.out_hidden_size
+            != text_config.hidden_size
+        ):
+            raise ValueError(
+                "Vision out_hidden_size must equal "
+                "text hidden_size: "
+                f"{vision_config.out_hidden_size} "
+                f"!= {text_config.hidden_size}"
+            )
+
+        # 模块名必须叫 visual，才能对应：
+        #
+        # model.visual.*
+        self.visual = Qwen3_5VisionModel(
+            vision_config
+        )
+
+        # 模块名必须叫 language_model，
+        # 才能对应：
         #
         # model.language_model.*
         self.language_model = (
@@ -785,13 +820,30 @@ class Qwen3_5Model(nn.Module):
             )
         )
 
-        # 当前还没有实现 Vision Tower。
-        #
-        # 后续将在这里增加：
-        # self.visual = Qwen3_5VisionModel(...)
-        #
-        # 当前 checkpoint 中的 model.visual.*
-        # 由 ignored_weight_prefixes 暂时忽略。
+    def get_visual_embeddings(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        执行 Vision Tower。
+
+        输入：
+            pixel_values
+            [total_patches, patch_dim]
+
+            image_grid_thw
+            [num_images, 3]
+
+        输出：
+            visual_embeddings
+            [num_visual_tokens, text_hidden_size]
+        """
+
+        return self.visual(
+            pixel_values=pixel_values,
+            grid_thw=image_grid_thw,
+        )        
 
     def forward(
         self,
@@ -830,11 +882,11 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         ),
     }
 
-    # 当前文本 Runtime 尚未实现 Vision Tower。
+    # MTP 暂不属于首版范围。
     #
-    # MTP 不属于首版范围，明确长期忽略。
+    # Vision Tower 已实现，因此 model.visual.*
+    # 必须接受严格的权重加载和完整性检查。
     ignored_weight_prefixes = (
-        "model.visual.",
         "mtp.",
     )
 
@@ -872,6 +924,17 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
                 .embed_tokens
                 .weight
             )
+
+    def get_visual_embeddings(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+
+        return self.model.get_visual_embeddings(
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
 
     def forward(
         self,

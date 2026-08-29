@@ -20,7 +20,7 @@ def main():
         gpu_memory_utilization=0.9,
     )
     
-    sampling_params = SamplingParams(temperature=0.7, max_tokens=512)
+    sampling_params = SamplingParams(temperature=0.62, max_tokens=512)
     
     prompts = [
         "你好。",

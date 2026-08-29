@@ -2,10 +2,13 @@ import atexit
 from dataclasses import dataclass, fields
 from time import perf_counter
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
+from nanovllm.inputs import (
+    InputProcessor,
+    PromptInput,
+)
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
@@ -64,8 +67,21 @@ class LLMEngine:
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        self.model_runner = ModelRunner(
+            config,
+            0,
+            self.events,
+        )
+
+        self.input_processor = (
+            InputProcessor(config)
+        )
+
+        # 保持 generate() 最后的 decode 逻辑不变。
+        self.tokenizer = (
+            self.input_processor.tokenizer
+        )
+        
         model_eos_token_id = getattr(
             config.text_config,
             "eos_token_id",
@@ -92,10 +108,34 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
+    def add_request(
+        self,
+        prompt: PromptInput,
+        sampling_params: SamplingParams,
+    ):
+        processed_prompt = (
+            self.input_processor.process(
+                prompt
+            )
+        )
+
+        seq = Sequence(
+            processed_prompt.token_ids,
+            sampling_params,
+            mm_token_type_ids=(
+                processed_prompt
+                .mm_token_type_ids
+            ),
+            pixel_values=(
+                processed_prompt
+                .pixel_values
+            ),
+            image_grid_thw=(
+                processed_prompt
+                .image_grid_thw
+            ),
+        )
+
         self.scheduler.add(seq)
 
     def step(
@@ -194,7 +234,7 @@ class LLMEngine:
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]],
+        prompts: list[PromptInput],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
