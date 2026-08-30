@@ -2,9 +2,9 @@
 
 > 文档性质：项目设计与实施路线，不代表当前仓库已经实现这些功能。
 >
-> 建议周期：V1 Hybrid VLM Runtime 为 8～10 周；V2 CUDA Graph 与 V3 Prefix State Cache 另增加约 6 周。
+> 建议周期：V1 Hybrid VLM Runtime 为 8～10 周；V2 Prefix State Cache 与 V3 CUDA Graph 另增加约 6 周；V4 状态感知 GDN Decode 算子另增加约 4～5 周。
 >
-> 开发设备：单张 RTX 5090 32GB，BF16，TP=1；V1 使用 Eager，V2 为 Decode 引入 CUDA Graph。
+> 开发设备：单张 RTX 5090 32GB，BF16，TP=1；V1 使用 Eager，V2 先实现联合 Prefix State Cache，V3 为 Decode 引入 CUDA Graph，V4 根据真实 Profile 开发状态感知 CUDA 算子。
 
 ## 1. 项目定位
 
@@ -39,16 +39,18 @@ Paged KV + GDN State 生命周期
     ↓
 Chunked Prefill + Decode-first 调度
     ↓
+KV/GDN 联合 Prefix State Cache
+    ↓
 Decode-only CUDA Graph
     ↓
-KV/GDN 联合 Prefix State Cache
+状态感知 GDN Decode 融合算子
     ↓
 生成文本与性能数据
 ```
 
 项目对外应描述为：
 
-> 基于轻量级推理引擎实现 Qwen3.5 Hybrid Runtime，完成异构状态管理、图文 Prefill/Decode、并发调度，并进一步研究 Hybrid Decode CUDA Graph 与 KV/GDN 联合 Prefix State Cache。
+> 基于轻量级推理引擎实现 Qwen3.5 Hybrid Runtime，完成异构状态管理、图文 Prefill/Decode、并发调度，并依次研究 KV/GDN 联合 Prefix State Cache、Hybrid Decode CUDA Graph 与状态感知 GDN Decode 融合算子。
 
 不要描述成“实现了生产级 vLLM”或“重写了 vLLM”。
 
@@ -60,7 +62,8 @@ KV/GDN 联合 Prefix State Cache
 2. 推理状态：KV Cache、递归状态、Chunked Prefill、Decode、抢占与重算。
 3. 推理系统：Continuous Batching、token budget、显存准入和长短请求公平性。
 4. 性能工程：GPU Kernel 接入、Profiler、TTFT/TPOT、吞吐和显存分析。
-5. 执行与缓存优化：CUDA Graph 静态执行、Prefix Cache、一致性、显存预算和淘汰策略。
+5. 执行与缓存优化：Prefix Cache、CUDA Graph 静态执行、一致性、显存预算和淘汰策略。
+6. 算子优化：Profiler 驱动的瓶颈定位、动态 state-slot 访问、状态原地更新、Kernel 融合与端到端验证。
 
 面试中的项目故事可以形成完整闭环：
 
@@ -75,9 +78,11 @@ KV/GDN 联合 Prefix State Cache
     ↓
 用混合负载验证调度优化
     ↓
+原子复用 Full Attention KV 与 GDN prefix state
+    ↓
 用 CUDA Graph 降低 Hybrid Decode 的 Kernel Launch 开销
     ↓
-原子复用 Full Attention KV 与 GDN prefix state
+针对真实 Decode 热点实现状态感知 GDN 融合算子
     ↓
 总结收益、退化场景与限制
 ```
@@ -128,18 +133,27 @@ KV/GDN 联合 Prefix State Cache
 - 网络 URL 图片下载。
 - TP 大于 1。
 - Sequence Parallel。
-- CUDA Graph；转入 V2 单独实现。
+- CUDA Graph；转入 V3 单独实现。
 - MTP 投机解码。
 - FP8/INT8 KV Cache。
-- Qwen3.5 Prefix Cache；转入 V3 单独实现。
+- Qwen3.5 Prefix Cache；转入 V2 单独实现。
 - CPU Swap。
-- 自己重写 Gated DeltaNet 底层 Kernel。
+- 自己重写 Gated DeltaNet 底层 Kernel；转入 V4，且必须先通过真实 Profile 证明瓶颈。
 
 这些限制不是缺点，而是为了保证 8～10 周能够完成一个正确、可测、能讲清楚的项目。
 
-### 3.4 V2/V3 新增范围
+### 3.4 V2/V3/V4 新增范围
 
-V2：Hybrid Decode CUDA Graph。
+V2：GDN-aware Prefix State Cache。
+
+- 首版只支持纯文本和完整 token block 边界。
+- Prefix 命中必须同时具备 Full Attention KV blocks 和同一边界的 GDN conv/recurrent state snapshot。
+- 使用独立显存预算和 LRU 淘汰 Prefix State。
+- KV 与 GDN snapshot 必须联合命中、联合失效。
+- Cache 命中后恢复到活跃 state slot，并从第一个未命中的 token 继续 Prefill。
+- 图文 Prefix Cache、部分 block snapshot、CPU swap 和跨进程共享不属于 V2 首版。
+
+V3：Hybrid Decode CUDA Graph。
 
 - Prefill、Vision Tower 和图片预处理保持 Eager。
 - 只捕获 Qwen3.5 Hybrid Decode。
@@ -148,14 +162,15 @@ V2：Hybrid Decode CUDA Graph。
 - Sampler 首版放在 Graph 外。
 - 对比 Eager/Graph 的 token、KV、GDN state、TPOT、吞吐、Graph 显存和 Nsight 时间线。
 
-V3：GDN-aware Prefix State Cache。
+V4：状态感知 GDN Decode 融合算子。
 
-- 首版只支持纯文本和完整 token block 边界。
-- Prefix 命中必须同时具备 Full Attention KV blocks 和同一边界的 GDN conv/recurrent state snapshot。
-- 使用独立显存预算和 LRU 淘汰 Prefix State。
-- KV 与 GDN snapshot 必须联合命中、联合失效。
-- Cache 命中后恢复到活跃 state slot，并从第一个未命中的 token 继续 Prefill。
-- 图文 Prefix Cache、部分 block snapshot、CPU swap 和跨进程共享不属于 V3 首版。
+- 先用 Nsight Systems/PyTorch Profiler 证明 GDN Decode 的状态 Gather/Scatter、Depthwise causal-conv1d update、recurrent update 或 Kernel Launch 是真实热点。
+- 首版只优化 `L=1` Decode，不重新实现完整 Chunk Gated Delta Rule，也不实现训练反向传播。
+- 支持动态 batch 和任意、不连续的 `state_slot_ids`，直接访问 `conv_state_pool/recurrent_state_pool`。
+- 第一子算子负责 state-aware Depthwise causal-conv1d update；第二子算子融合衰减、`k^T S`、Delta Rule 写入和 `q^T S` 读取。
+- Q/K/V 使用 BF16，`recurrent_state` 保持 FP32，状态在池中原地更新。
+- 保留 `torch`、`fla`、`custom` 三条 backend，对比组件误差、Kernel latency、HBM 流量和端到端 TPOT/吞吐。
+- 自研算子必须满足 CUDA Graph-safe 条件，并在 V3 Graph 路径中重新 capture 和验证。
 
 继续明确不做：
 
@@ -163,7 +178,8 @@ V3：GDN-aware Prefix State Cache。
 - MoE/Expert Parallel。
 - TP>1。
 - 多图和视频。
-- 自研底层 GDN/CUDA Kernel。
+- 完整 Prefill/Chunk Gated Delta Rule 自研 Kernel。
+- 通用 GEMM、训练反向传播和脱离 Runtime 的教学型算子项目。
 
 ## 4. 开工前的仓库策略
 
@@ -188,9 +204,11 @@ feature/qwen35-hybrid-vlm
 6. vision tower and multimodal input
 7. state-aware scheduler
 8. benchmark, profiler and documentation
-9. hybrid decode CUDA Graph
-10. GDN-aware prefix state cache
-11. extension benchmark and documentation
+9. GDN-aware prefix state cache
+10. hybrid decode CUDA Graph
+11. GDN decode profiling and naive custom kernel
+12. state-aware fused GDN decode kernel and runtime integration
+13. extension benchmark and documentation
 ```
 
 每次提交只解决一个问题，保证出现数值错误时可以快速定位或回退。
@@ -861,11 +879,11 @@ longest wait
 scheduler CPU time
 ```
 
-## 16. 第十一部分：Hybrid Decode CUDA Graph
+## 16. 扩展技术设计：Hybrid Decode CUDA Graph（V3）
 
 ### 16.1 实现边界
 
-V2 只捕获重复执行、形状相对稳定的 Decode：
+V3 只捕获重复执行、形状相对稳定的 Decode：
 
 ```text
 Tokenizer / AutoProcessor：CPU / Eager
@@ -1029,7 +1047,7 @@ Capture 区域内禁止：
 
 最后只报告实测收益；如果高并发下无收益，要区分 CPU launch overhead、模型计算、state copy 和 Graph private pool 的影响。
 
-## 17. 第十二部分：GDN-aware Prefix State Cache
+## 17. 扩展技术设计：GDN-aware Prefix State Cache（V2）
 
 ### 17.1 为什么必须联合缓存
 
@@ -1046,7 +1064,7 @@ Gated DeltaNet layers
 
 只命中 Full Attention KV、却从零初始化 GDN state，会让两类层从不同历史位置继续执行，生成结果错误。
 
-因此 V3 的命中条件是：
+因此 V2 的命中条件是：
 
 ```text
 KV prefix blocks 有效
@@ -1117,7 +1135,7 @@ seq.num_cached_tokens = entry.num_cached_tokens
 32 boundaries × 49.5 MiB ≈ 1.55 GiB
 ```
 
-因此不能无界缓存。V3 必须提供：
+因此不能无界缓存。V2 必须提供：
 
 ```text
 prefix_state_cache_max_bytes
@@ -1168,7 +1186,7 @@ KV-only rejected hits
 
 ### 17.6 首版多模态边界
 
-V3 首版只支持纯文本 Prefix State Cache。
+V2 首版只支持纯文本 Prefix State Cache。
 
 图文前缀还需要把以下内容纳入缓存身份：
 
@@ -1210,9 +1228,168 @@ Benchmark：
 - 最大并发。
 - 不同共享前缀长度和并发下的收益。
 
-## 18. 正确性测试矩阵
+## 18. 第十三部分：状态感知 GDN Decode 融合算子（V4）
 
-### 18.1 组件级
+### 18.1 为什么不能先写 Kernel
+
+V4 不是为了简历孤立复现一个教学算子，而是解决 NanoHybrid Runtime 中已经由 Profile 证明的真实 Decode 热点。正式实现前必须使用 Nsight Systems、Nsight Compute 和 PyTorch Profiler 分解：
+
+```text
+GDN state Gather/Scatter 时间
+causal-conv1d 单 token update 时间
+FLA fused recurrent 时间
+每层/每 token 的 Kernel Launch 数量
+recurrent state HBM 读写字节
+端到端 Decode step 中各部分占比
+```
+
+只有状态整理、Depthwise causal-conv1d、recurrent update 或它们之间的 Launch/内存流量构成显著瓶颈时，才进入自研 Kernel。若真实热点不在这里，应依据 Profile 调整融合边界，而不是强行制造一个没有端到端价值的算子。
+
+### 18.2 第一子算子：State-aware Causal Conv1d Update
+
+首版只处理 Decode 的 `L=1`：
+
+```text
+mixed_qkv       [B, conv_dim]                         BF16
+state_slot_ids  [B]                                   int32/int64
+conv_state_pool [num_slots, num_gdn_layers,
+                 conv_dim, kernel_size]               BF16
+conv_weight     [conv_dim, kernel_size]                BF16
+```
+
+动态 batch 的 `state_slot_ids` 可能是 `[7,2,15,4]`，Kernel 不能把 batch row 当成状态槽编号，而要通过 `state_slot_ids[row]` 找到该请求、该 GDN 层的 `conv_state`。
+
+逻辑操作：
+
+```text
+读取请求对应的最近 kernel_size-1 个 mixed_qkv 历史
+    ↓
+写入当前 token 的 mixed_qkv
+    ↓
+每个 channel 独立执行 Depthwise causal convolution
+    ↓
+原地保留下一 token 所需的 conv_state
+```
+
+不能真的每轮执行整段 `state[..., :-1] = state[..., 1:]`。优化设计使用 `conv_cursor` 环形缓冲区或等价的固定窗口布局，减少状态搬移。需要验证 channel 独立性、权重布局、边界补零、slot 回收复用和任意 batch 顺序。
+
+### 18.3 第二子算子：State-aware Gated Delta Recurrent Update
+
+核心输入和状态：
+
+```text
+q/k             [B, H, K]                             BF16
+v               [B, H, V]                             BF16
+beta/g          [B, H] 或配置对应的可广播形状          BF16/FP32
+state_slot_ids  [B]                                   int32/int64
+state_pool      [num_slots, num_gdn_layers, H, K, V]  FP32
+output          [B, H, V]                             BF16
+```
+
+每个 token 的数学过程：
+
+```text
+S = exp(g) · S
+prediction = k^T S
+delta = beta · (v - prediction)
+S = S + k ⊗ delta
+o = q^T S
+```
+
+自研 Kernel 使用 `state_slot_ids` 直接定位 `state_pool`，按 `[K,V]` tile 加载状态，在一次融合路径中完成状态衰减、旧值预测、Delta Rule 修正、Query 读取和 FP32 状态写回。目标是消除或减少：
+
+```text
+Gather state
+多个逐算子临时 Tensor
+recurrent state 的重复 HBM 往返
+Scatter state
+多次 Kernel Launch
+```
+
+第一版不把 Linear Projection GEMM 融进来，因为 GEMM 应继续交给 cuBLAS/现有 Linear 层；融合边界集中在状态更新这种通用 GEMM 库无法表达的部分。
+
+### 18.4 Backend 与 Runtime 接口
+
+`gated_delta_net.py` 保留三条可切换路径：
+
+```text
+backend="torch"   公式 reference 和小张量排障
+backend="fla"     当前生产基线
+backend="custom"  V4 自研状态感知 Decode Kernel
+```
+
+`custom` 路径从 `HybridStateManager` 接收：
+
+```text
+state_slot_ids
+gdn_layer_idx
+conv_state_pool
+recurrent_state_pool
+```
+
+不能先把整个 FP32 state Gather 到连续临时 Tensor、计算后再 Scatter，否则会丢失状态感知融合的主要价值。请求结束、抢占、Prefix restore 和 state slot 复用仍由现有 Runtime 管理，Kernel 只负责本轮合法 slot 的读取和原地更新。
+
+V4 完成后还必须重新捕获 V3 CUDA Graph：Graph 内 `state_slot_ids`、状态池地址和 custom backend 输出地址必须稳定；custom 不满足 Graph-safe 条件时自动回退 `fla` 或 Eager。
+
+### 18.5 分阶段优化路线
+
+```text
+V0：PyTorch reference
+    ↓ 正确性基线
+V1：当前 FLA/causal-conv1d baseline
+    ↓ 真实 Profile
+V2：Naive state-aware custom Kernel
+    ↓ 保证任意 slot 和 FP32 state 正确
+V3：Tiled/vectorized/fused Kernel
+    ↓ 减少 HBM 往返和 Launch
+V4：接入 Scheduler/ModelRunner/CUDA Graph
+    ↓ 端到端 Benchmark
+```
+
+每一版都保留可复现实现与数据，不能只留下最终 Kernel，否则无法解释每个优化为什么有效。
+
+### 18.6 正确性验收
+
+- batch size `1/2/4/8/12/16/32`。
+- 连续与不连续、乱序的 `state_slot_ids`。
+- 同一请求连续 Decode `1/16/64/256` tokens。
+- state slot 释放、清零和复用。
+- Prefix Cache restore 后首次 Decode。
+- 抢占重算后进入 custom backend。
+- `torch/fla/custom` 的 conv output、最终 conv state、recurrent output 和最终 recurrent state 对齐。
+- Eager custom 与 CUDA Graph custom greedy token 完全一致。
+- 无越界访问、状态串槽、NaN/Inf 和显存泄漏。
+
+### 18.7 性能验收
+
+微基准必须比较：
+
+```text
+PyTorch reference
+FLA + causal-conv1d
+Naive custom
+Optimized custom
+```
+
+记录：
+
+- Kernel latency 和 launch 数量。
+- DRAM throughput、L2 hit rate、occupancy、active warps 和 register 使用量。
+- 估算/实测 state bytes 与中间 Tensor bytes。
+- batch size、slot 连续性和连续 Decode 长度的影响。
+
+端到端必须比较：
+
+- Decode tokens/s、requests/s。
+- TPOT/ITL p50/p95/p99/max。
+- Eager 和 CUDA Graph 下的收益。
+- Kernel 加速占整步 Decode 的比例。
+
+不预先填写提升百分比；如果 custom 不能超过 FLA，必须报告失败原因、适用 shape 和端到端边界，不能只挑有利 case。
+
+## 19. 正确性测试矩阵
+
+### 19.1 组件级
 
 - Processor 与 visual token 数。
 - Vision Patch Embedding。
@@ -1224,7 +1401,7 @@ Benchmark：
 - Decoder block。
 - LM Head。
 
-### 18.2 模型级
+### 19.2 模型级
 
 - 0.8B 纯文本完整前向。
 - 0.8B 单图完整前向。
@@ -1232,7 +1409,7 @@ Benchmark：
 - 4B 单图 smoke test。
 - greedy token 序列。
 
-### 18.3 Runtime 级
+### 19.3 Runtime 级
 
 - 整段 Prefill vs Chunked Prefill。
 - Prefill vs 逐 token Decode。
@@ -1263,20 +1440,21 @@ Prefix State Cache：
 - KV-only 命中、state 缺失、hash 冲突或 Entry 失效时拒绝复用并重新计算。
 - 引用计数、LRU 淘汰、请求完成和抢占后无 KV/state snapshot 泄漏。
 
-### 18.4 回归要求
+### 19.4 回归要求
 
 Qwen3.5 的重构不能破坏原 Qwen3：
 
 - Qwen3 原有生成仍能运行。
 - Qwen3 Prefix Cache 行为不变。
 - Qwen3 eager 路径结果不变。
-- V2 完成前不宣称 Qwen3.5 支持 CUDA Graph；V3 完成前不宣称 Qwen3.5 支持 Prefix Cache。
+- V2 完成前不宣称 Qwen3.5 支持 Prefix Cache；V3 完成前不宣称 Qwen3.5 支持 CUDA Graph；V4 完成前不宣称自研 GDN Decode Kernel。
 - CUDA Graph 和 Prefix State Cache 的改动都必须保留 Eager/Cache-off 回退路径。
+- 自研算子必须保留 FLA fallback，且不能破坏 Prefix restore 或 CUDA Graph replay。
 - 不宣称支持 TP>1。
 
-## 19. Benchmark 设计
+## 20. Benchmark 设计
 
-### 19.1 工作负载
+### 20.1 工作负载
 
 纯文本：
 
@@ -1307,7 +1485,7 @@ output: 64 / 256 tokens
 高 visual-token 单图
 ```
 
-### 19.2 对比组
+### 20.2 对比组
 
 1. Hugging Face Transformers + FLA。
 2. nano-vLLM Qwen3.5 单请求、无 Chunked Prefill。
@@ -1315,11 +1493,12 @@ output: 64 / 256 tokens
 4. Hybrid Cache + Decode-first Scheduler。
 5. Hybrid Runtime Eager Decode vs CUDA Graph Decode。
 6. Prefix State Cache 关闭 vs 开启，并按 prefix hit length/hit rate 分组。
-7. 官方 vLLM 作为外部参考。
+7. GDN Decode `torch/fla/custom` 微基准与端到端对照。
+8. 官方 vLLM 作为外部参考。
 
 不要求超过官方 vLLM；官方框架的意义是帮助判断实现距离成熟系统还有多远。
 
-### 19.3 指标
+### 20.3 指标
 
 延迟：
 
@@ -1373,7 +1552,14 @@ Prefix State Cache：
 - KV bytes、活跃 GDN state bytes 与 Prefix snapshot bytes。
 - Entry 数量、LRU eviction 次数和 restore failure 次数。
 
-### 19.4 测量规范
+GDN Decode 算子：
+
+- 各 backend 的 Kernel latency、launch 数量和端到端 Decode 占比。
+- DRAM throughput、L2 hit rate、occupancy、active warps 和 register 使用量。
+- Gather/Scatter 与中间 Tensor 是否消除及对应 bytes。
+- 连续/离散 `state_slot_ids`、batch size 和 Graph/Eager 对性能的影响。
+
+### 20.4 测量规范
 
 - 固定依赖版本和 GPU。
 - 固定 prompt/output 分布。
@@ -1385,8 +1571,9 @@ Prefix State Cache：
 - Nsight trace 只保存关键截图和结论，不提交巨大 trace。
 - CUDA Graph 必须分别报告 warm-up/capture 成本和稳定 replay 性能。
 - Prefix Cache 必须分别报告冷启动、首次写入、稳定命中和淘汰后重算。
+- 算子必须报告真实 Qwen3.5-9B shape，并同时给出微基准和端到端结果。
 
-### 19.5 调度优化目标
+### 20.5 调度优化目标
 
 目标是在混合长短请求下：
 
@@ -1397,13 +1584,15 @@ p95 TTFT 退化控制在 10% 内
 
 这只是实验目标，不是简历中预先写好的结论。最后必须填写实测数据；如果没有达到，要解释瓶颈和退化场景。
 
-### 19.6 CUDA Graph 与 Prefix Cache 优化目标
+### 20.6 Prefix Cache、CUDA Graph 与 GDN 算子优化目标
 
 CUDA Graph 的目标不是改变模型数学结果，而是降低 Decode 阶段重复 Kernel launch 和 Python 调度开销。重点观察小 batch/短 Decode step；若算子内部仍有动态分配或同步，必须记录 fallback 原因，不能只报告成功场景。
 
 Prefix State Cache 的目标是减少共享长前缀请求的实际 Prefill token 数和 TTFT。收益必须和 snapshot 显存、保存/恢复拷贝开销一起报告；不把高命中率等同于必然加速。
 
-## 20. V1 10 周与 V2/V3 扩展实施路线
+GDN 自研算子的目标是减少动态 state-slot Gather/Scatter、FP32 recurrent state 的重复 HBM 往返和 Kernel Launch。必须以 FLA 为强基线，并同时报告组件加速与端到端收益；不能把 Kernel 微基准加速直接写成模型吞吐提升。
+
+## 21. V1 10 周与 V2/V3/V4 扩展实施路线
 
 ### 第 1 周：环境与基线
 
@@ -1516,7 +1705,34 @@ Prefix State Cache 的目标是减少共享长前缀请求的实际 Prefill toke
 - Demo。
 - 简历描述和面试问答。
 
-### 第 11 周：Decode Graph-safe 审计与静态接口
+### 第 11 周：Prefix Entry 与联合状态快照
+
+- 定义 Prefix Key、Prefix Entry 和完整 block 边界。
+- 保存 Full Attention KV block 引用以及全部 GDN conv/recurrent state snapshot。
+- 实现原子 lookup/restore：只有 KV 与 GDN state 同时有效才算命中。
+- 首版限制为纯文本请求。
+
+硬门槛：共享前缀命中后的 state 与完整 Prefill 重算在容差内一致。
+
+### 第 12 周：Prefix 生命周期与显存预算
+
+- 实现 `prefix_state_cache_max_bytes` 和 checkpoint interval。
+- 实现引用计数、LRU 淘汰、Entry 失效和 KV/state 联动回收。
+- 接入请求完成、抢占、重算和异常退出生命周期。
+- 增加 lookup/hit/miss、snapshot bytes、save/restore 和 eviction 指标。
+
+交付物：生命周期测试、显存公式和无泄漏证明。
+
+### 第 13 周：Prefix 正确性、Benchmark 与收尾
+
+- 验证 Cache on/off greedy token、Chunked Prefill、batch、抢占和跨 block。
+- 测试不同共享前缀长度、并发、命中率和显存预算。
+- 报告 TTFT、实际执行 Prefill tokens、snapshot 拷贝成本与显存代价。
+- 更新 README、架构图、复习文档、实验报告和简历描述。
+
+交付物：可复现 Prefix Cache 实验和 V1/V2 完整项目材料。
+
+### 第 14 周：Decode Graph-safe 审计与静态接口
 
 - 枚举 Qwen3.5 Decode 路径中的动态分配、CPU 同步和数据相关分支。
 - 为 `input_ids`、三轴 `positions`、`slot_mapping`、`context_lens`、`block_tables` 和 `state_slot_ids` 建立静态 buffer。
@@ -1525,7 +1741,7 @@ Prefix State Cache 的目标是减少共享长前缀请求的实际 Prefill toke
 
 交付物：Graph-safety 清单、静态 Decode 输入接口和最小 capture probe。
 
-### 第 12 周：Decode-only CUDA Graph
+### 第 15 周：Decode-only CUDA Graph
 
 - 按 `1/2/4/8/12` batch bucket warm-up 和 capture。
 - replay 前把真实请求数据拷入静态 buffer。
@@ -1535,7 +1751,7 @@ Prefix State Cache 的目标是减少共享长前缀请求的实际 Prefill toke
 
 硬门槛：各 bucket 的 Eager/Graph greedy token 完全一致，重复 replay 无 KV/GDN state 串槽。
 
-### 第 13 周：CUDA Graph Benchmark 与 Profile
+### 第 16 周：CUDA Graph Benchmark 与 Profile
 
 - 对比 Eager Decode 和 Graph Decode 的 TPOT、Decode tokens/s 与 CPU launch overhead。
 - 分析 batch size、输出长度和并发对 Graph 收益的影响。
@@ -1544,34 +1760,44 @@ Prefix State Cache 的目标是减少共享长前缀请求的实际 Prefill toke
 
 交付物：正确性报告、原始 Benchmark 数据、Profiler 时间线和收益边界。
 
-### 第 14 周：Prefix Entry 与联合状态快照
+### 第 17 周：GDN Decode 瓶颈画像与算子规格冻结
 
-- 定义 Prefix Key、Prefix Entry 和完整 block 边界。
-- 保存 Full Attention KV block 引用以及全部 GDN conv/recurrent state snapshot。
-- 实现原子 lookup/restore：只有 KV 与 GDN state 同时有效才算命中。
-- 首版限制为纯文本请求。
+- 在 Eager 和 CUDA Graph 两条路径中分别采集 Decode 时间线。
+- 分解 state Gather/Scatter、causal-conv1d update、FLA recurrent 与其他层的占比。
+- 固定 Qwen3.5-9B 的真实 shape、dtype、动态 batch 和 `state_slot_ids` 输入契约。
+- 根据 Profile 选择最终融合边界，建立 `torch/fla/custom` benchmark harness。
 
-硬门槛：共享前缀命中后的 state 与完整 Prefill 重算在容差内一致。
+硬门槛：必须有数据证明选定部分是可优化热点；没有证据则暂停自研 Kernel 或调整目标。
 
-### 第 15 周：Prefix 生命周期与显存预算
+### 第 18 周：Naive State-aware CUDA Kernel
 
-- 实现 `prefix_state_cache_max_bytes` 和 checkpoint interval。
-- 实现引用计数、LRU 淘汰、Entry 失效和 KV/state 联动回收。
-- 接入请求完成、抢占、重算和异常退出生命周期。
-- 增加 lookup/hit/miss、snapshot bytes、save/restore 和 eviction 指标。
+- 实现 `L=1` state-aware causal-conv1d update。
+- 实现直接按 `state_slot_ids` 访问 FP32 recurrent state pool 的基础版本。
+- 覆盖连续、离散、乱序 slot，以及释放后复用。
+- 与 torch/FLA 比较 output、conv state 和 recurrent state。
 
-交付物：生命周期测试、显存公式和无泄漏证明。
+交付物：正确但不预设高性能的 custom baseline、数值报告和非法访存检查。
 
-### 第 16 周：Prefix 正确性、Benchmark 与收尾
+### 第 19 周：Tiling、向量化与融合优化
 
-- 验证 Cache on/off greedy token、Chunked Prefill、batch、抢占和跨 block。
-- 测试不同共享前缀长度、并发、命中率和显存预算。
-- 报告 TTFT、实际执行 Prefill tokens、snapshot 拷贝成本与显存代价。
-- 更新 README、架构图、复习文档、实验报告和简历描述。
+- 按 `[K,V]` 状态矩阵设计 program/block tile。
+- 融合 decay、`k^T S`、Delta Rule 更新与 `q^T S`。
+- 优化向量化加载、访存合并、寄存器占用和中间 Tensor。
+- 使用 Nsight Compute 分析 DRAM/L2、occupancy、active warps 和 register pressure。
 
-交付物：可复现 Prefix Cache 实验和 V1/V2/V3 完整项目材料。
+交付物：Naive/Optimized/FLA 微基准及逐步优化证据。
 
-## 21. 止损规则
+### 第 20 周：Runtime、CUDA Graph 与端到端验证
+
+- 在 `gated_delta_net.py` 接入 `custom` backend 和 FLA fallback。
+- 直接连接 HybridStateManager 的 state pools，避免整状态 Gather/Scatter。
+- 重新 capture V3 CUDA Graph，并验证 Prefix restore 后首次 Decode。
+- 测量 TPOT、Decode tokens/s、requests/s 和不同 batch/slot 布局。
+- 更新架构图、实验报告、复习文档和简历描述。
+
+交付物：可复现的状态感知 GDN Decode 算子及 V1/V2/V3/V4 完整项目材料。
+
+## 22. 止损规则
 
 ### 门槛 1：第 3 天
 
@@ -1621,9 +1847,19 @@ FLA 或 causal-conv1d 无法在 SM120 正确运行：
 - 整个候选命中作废并重新 Prefill。
 - 不允许只复用 KV 或只恢复部分 GDN 层。
 - 若 snapshot 显存压垮并发，增大 checkpoint interval 或降低缓存预算，而不是降低 FP32 recurrent state 精度。
-- 图文 Prefix 身份未验证前，V3 只发布纯文本 Prefix Cache。
+- 图文 Prefix 身份未验证前，V2 只发布纯文本 Prefix Cache。
 
-## 22. 最终交付物清单
+### 门槛 7：GDN Decode 算子阶段
+
+如果 Profile 证明状态整理和 GDN recurrent/conv 不是主要 Decode 热点，或者 custom 在真实 shape 下持续显著慢于 FLA：
+
+- 不为了简历强行宣称算子优化成功。
+- 保留 Profile、Naive 实现和失败分析，重新评估融合边界。
+- 不通过降低 FP32 recurrent state 精度换取未经验证的性能数字。
+- 不把只在极小人工 shape 上的加速写成 Qwen3.5-9B 端到端收益。
+- custom 不满足 Graph-safe 时保留 FLA/Graph 或 custom/Eager 的安全 fallback。
+
+## 23. 最终交付物清单
 
 源码：
 
@@ -1634,6 +1870,8 @@ FLA 或 causal-conv1d 无法在 SM120 正确运行：
 - 调度器。
 - Decode-only CUDA Graph 管理、静态 buffer 和 Eager fallback。
 - GDN-aware Prefix Entry、状态快照、恢复和 LRU 管理。
+- 状态感知 causal-conv1d update 与 GDN recurrent Decode Kernel。
+- `torch/fla/custom` backend 选择和安全 fallback。
 - 严格 Loader。
 - Benchmark 工具。
 
@@ -1645,6 +1883,8 @@ FLA 或 causal-conv1d 无法在 SM120 正确运行：
 - 抢占与泄漏测试。
 - Eager/Graph Decode 一致性与 bucket 回退测试。
 - Prefix Cache on/off、联合恢复、淘汰和泄漏测试。
+- torch/FLA/custom 的输出、conv state、recurrent state 与 greedy token 对齐测试。
+- 动态 `state_slot_ids`、slot 复用、Prefix restore 和 Graph replay 测试。
 - Qwen3 回归测试。
 
 文档：
@@ -1665,8 +1905,9 @@ FLA 或 causal-conv1d 无法在 SM120 正确运行：
 - 调度时间线或关键指标面板。
 - Eager/Graph Decode 对照。
 - 两个共享长文本前缀请求的 Cache miss/hit 对照。
+- FLA/custom GDN Decode 微基准与端到端对照。
 
-## 23. 简历描述模板
+## 24. 简历描述模板
 
 最终数字必须替换成实测结果。
 
@@ -1681,10 +1922,11 @@ FLA 或 causal-conv1d 无法在 SM120 正确运行：
 - 实现 Decode-first 双 microbatch 调度和 state-aware admission，在混合长短文本/单图负载下测量 TTFT、TPOT、吞吐、抢占与显存占用；最终填入真实 p95 改善数据。
 - 接入 FLA 与 causal-conv1d GPU Kernel，使用 PyTorch reference、Profiler 和逐层误差分析验证 Kernel 正确性与性能边界。
 
-以下两条只能在对应功能完成且有原始实验数据后使用：
+以下三条只能在对应功能完成且有原始实验数据后使用，并按实际实施顺序排列：
 
-- 为 Qwen3.5 Hybrid Decode 构建 batch-bucket CUDA Graph，使用静态三轴位置、Paged KV 元数据和 GDN state-slot buffer 完成 replay，并通过 Eager fallback 覆盖动态形状；填入实测 TPOT、Decode 吞吐和 launch overhead 变化。
 - 实现 GDN-aware Prefix State Cache，在完整 token-block 边界原子复用 Full Attention KV 与 GDN conv/recurrent snapshot，通过显存预算、checkpoint interval、引用计数和 LRU 控制状态开销；填入实测 TTFT、跳过 Prefill token 数和缓存显存。
+- 为 Qwen3.5 Hybrid Decode 构建 batch-bucket CUDA Graph，使用静态三轴位置、Paged KV 元数据和 GDN state-slot buffer 完成 replay，并通过 Eager fallback 覆盖动态形状；填入实测 TPOT、Decode 吞吐和 launch overhead 变化。
+- 基于 Nsight 定位 Qwen3.5 Decode 的 GDN 状态访问热点，设计支持离散 `state_slot_ids` 的状态感知融合 Kernel，原地完成 causal-conv state 更新及 FP32 recurrent state 的衰减、Delta Rule 写入和 Query 读取；与 FLA 对齐并填入实测 Kernel latency、HBM 流量、TPOT 和 Decode 吞吐。
 
 不要写：
 
@@ -1692,8 +1934,9 @@ FLA 或 causal-conv1d 无法在 SM120 正确运行：
 - “支持所有 Qwen3.5 模型”。
 - “吞吐提升 XX%”但没有脚本和原始数据。
 - “自研 Gated DeltaNet Kernel”但实际调用了 FLA。
+- “端到端提升 XX%”但只有孤立 Kernel 微基准。
 
-## 24. 面试时必须能回答的问题
+## 25. 面试时必须能回答的问题
 
 1. Qwen3.5 为什么不能直接复用 Qwen3 的 KV Cache 分配？
 2. GDN recurrent state 的 shape 和显存公式是什么？
@@ -1722,10 +1965,18 @@ FLA 或 causal-conv1d 无法在 SM120 正确运行：
 25. Prefix snapshot 的显存如何估算？checkpoint interval 和命中长度如何权衡？
 26. KV 命中但 GDN snapshot 缺失时为什么必须整体 miss？
 27. Prefix Entry 的引用计数、LRU 淘汰、抢占和请求完成如何协同？
-28. 为什么 V3 先支持纯文本 Prefix Cache，而不立即缓存图文前缀？
+28. 为什么 V2 先支持纯文本 Prefix Cache，而不立即缓存图文前缀？
 29. 为什么项目暂不同时做 MTP、KV 量化、MoE 和 TP>1？
+30. 为什么先做 Prefix Cache，再做 CUDA Graph，最后才做自研算子？
+31. `state_slot_ids` 为什么不能直接用 Decode batch row 代替？
+32. 自研算子为什么只从 `L=1` Decode 开始，而不先重写 Chunk Gated Delta Rule？
+33. 如何证明 Gather/Scatter、HBM 往返或 Kernel Launch 是真实瓶颈？
+34. 为什么 recurrent state 保持 FP32，而 Q/K/V 可以是 BF16？
+35. 融合 `exp(g)`、`k^T S`、Delta 更新和 `q^T S` 后如何控制寄存器与状态 Tile？
+36. 为什么 Kernel 微基准加速不等于 TPOT 或吞吐等比例提升？
+37. custom backend 如何与 Prefix restore、state slot 回收和 CUDA Graph replay 协同？
 
-## 25. 推荐的实际开工顺序
+## 26. 推荐的实际开工顺序
 
 第一次真正开始写功能代码时，不要直接写 Vision Tower。严格按下面顺序：
 
@@ -1744,17 +1995,21 @@ FLA 或 causal-conv1d 无法在 SM120 正确运行：
 → Scheduler
 → 4B/Benchmark
 → V1 正确性与性能基线冻结
-→ Decode Graph-safe 审计
-→ Decode-only CUDA Graph
-→ Eager/Graph 对齐与 Benchmark
 → Prefix Entry/联合状态快照
 → LRU/预算/生命周期
 → Prefix 正确性与 Benchmark
+→ Decode Graph-safe 审计
+→ Decode-only CUDA Graph
+→ Eager/Graph 对齐与 Benchmark
+→ GDN Decode 真实瓶颈 Profile
+→ Naive state-aware custom Kernel
+→ Tiled/fused custom Kernel
+→ Runtime/Graph 接入与端到端 Benchmark
 ```
 
-原因很简单：Vision、Scheduler 和 Hybrid Cache 最终都依赖文本骨干及 GDN state 是正确的；CUDA Graph 又依赖 Decode 路径的地址、shape 和状态更新已经稳定；Prefix Cache 则依赖 KV/GDN 两套状态边界严格一致。按这个顺序可以让每一层优化都有可比较的 Eager/Cache-off 基线。
+原因很简单：Vision、Scheduler 和 Hybrid Cache 最终都依赖文本骨干及 GDN state 是正确的；Prefix Cache 先把 KV/GDN 的联合边界、restore 和生命周期固定下来；CUDA Graph 再围绕稳定的 Decode/恢复接口建立静态执行；自研算子最后依据真实 Eager/Graph Profile 选择融合边界，并同时验证 Cache restore 与 Graph replay。按这个顺序可以避免 Kernel 接口反复推倒，也让每一层优化都有可比较基线。
 
-## 26. 项目成功标准
+## 27. 项目成功标准
 
 这个项目成功不取决于代码行数，也不取决于是否超过官方 vLLM。
 
@@ -1771,3 +2026,6 @@ FLA 或 causal-conv1d 无法在 SM120 正确运行：
 9. 能在固定 batch bucket 下正确 capture/replay Hybrid Decode，并在不支持的形状上安全回退 Eager。
 10. 能证明 Prefix 命中原子恢复 Full Attention KV 与全部 GDN state，且结果等价于完整重算。
 11. 能量化 CUDA Graph 的 launch-overhead/显存代价，以及 Prefix Cache 的 TTFT/snapshot 显存权衡。
+12. 能用 Profile 证明自研 GDN Decode 算子针对真实热点，而不是孤立教学练习。
+13. 能让 custom backend 正确处理动态 `state_slot_ids`、FP32 recurrent state、Prefix restore 和 CUDA Graph replay。
+14. 能同时报告 Kernel 微基准与端到端收益，并解释两者不一致的原因。

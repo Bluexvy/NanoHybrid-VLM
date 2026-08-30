@@ -5,7 +5,7 @@
 > 最近提交：`aa76678 benchmark`
 > 用途：记录实际完成、已经验证、当前断点和下一步。  
 > V1 完成度：约 90%～95%；文本/单图 Hybrid Runtime 已接通。
-> 扩展后总体完成度：约 65%～70%；V2 Decode CUDA Graph 与 V3 GDN-aware Prefix State Cache 已纳入正式方案，但尚未实现。
+> 扩展后总体完成度：约 50%～55%；V2 GDN-aware Prefix State Cache、V3 Decode CUDA Graph 与 V4 状态感知 GDN Decode 算子已纳入正式方案，但均尚未实现。
 
 ## 1. 项目目标与边界
 
@@ -27,17 +27,18 @@ text token embeddings ───────────────────�
 /workspace/models/Qwen3.5-9B
 ```
 
-V1 范围：RTX 5090、BF16、TP=1、Eager；每个请求最多一张本地 PIL 图片。V1 不支持网络 URL、多图、视频、Qwen3.5 Prefix Cache、MTP、MoE、CUDA Graph 和 TP>1。
+V1 范围：RTX 5090、BF16、TP=1、Eager；每个请求最多一张本地 PIL 图片。V1 不支持网络 URL、多图、视频、Qwen3.5 Prefix Cache、MTP、MoE、CUDA Graph、自研 GDN Kernel 和 TP>1。
 
 扩展后的正式范围：
 
 ```text
 V1：Qwen3.5-9B 文本/单图 Hybrid Runtime（当前主要功能已完成）
-V2：Qwen3.5 Hybrid Decode-only CUDA Graph（已规划，未实现）
-V3：纯文本 GDN-aware Prefix State Cache（已规划，未实现）
+V2：纯文本 GDN-aware Prefix State Cache（已规划，未实现；当前首先实施）
+V3：Qwen3.5 Hybrid Decode-only CUDA Graph（已规划，未实现）
+V4：状态感知 GDN Decode 融合算子（已规划，未实现；必须先完成真实 Profile）
 ```
 
-MTP、MoE、TP>1、多图、视频和图文 Prefix Cache 仍不在当前正式范围内。
+MTP、MoE、TP>1、多图、视频、图文 Prefix Cache 和完整 Chunk Gated Delta Rule 自研 Kernel 仍不在当前正式范围内。
 
 ## 2. 已实现的核心技术
 
@@ -429,15 +430,75 @@ PIL Image + prompt
 → decode text
 ```
 
-## 4. V2：Hybrid Decode CUDA Graph（已纳入，未实现）
+## 4. V2：GDN-aware Prefix State Cache（已纳入，未实现；当前首先实施）
 
-### 4.1 当前已有基础
+### 4.1 为什么不能直接打开原 Prefix Cache
+
+Qwen3.5 的历史状态由两部分组成：
+
+```text
+Full Attention 历史 → Paged KV blocks
+Gated DeltaNet 历史 → conv_state + recurrent_state
+```
+
+如果请求 B 只命中请求 A 的 Attention KV，却没有恢复同一前缀边界的 GDN state，后续 Decode 会从错误历史继续，生成结果不可信。因此一次命中必须是联合、原子的：
+
+```text
+Prefix Hit
+   ├── Full Attention KV 有效
+   └── 所有 GDN state snapshot 有效
+两者同时满足 → restore
+任一缺失     → 整体 miss，重新 Prefill
+```
+
+### 4.2 首版范围
+
+- 只支持纯文本共享前缀。
+- 只在完整 token block 边界创建 Prefix Entry。
+- 保存 KV block 引用以及对应的全部 GDN `conv_state/recurrent_state` snapshot。
+- 使用显存预算、checkpoint interval、引用计数和 LRU 控制开销。
+- Prefix 命中后从该边界继续执行剩余 suffix Prefill。
+
+图文 Prefix Cache 暂缓，因为缓存身份还必须包含图片内容、processor 结果、image grid、mRoPE layout 和视觉模型版本；只按 image placeholder token IDs 做 hash 会错误共享不同图片。
+
+### 4.3 待实现 Part
+
+1. Prefix Key：模型/配置身份、完整 block token hash 和前驱链。
+2. Prefix Entry：联合持有 KV blocks 与 GDN snapshot。
+3. snapshot commit：只在完整 block 边界原子提交。
+4. lookup/restore：KV/GDN 同时命中才恢复到活跃 state slot。
+5. 显存预算：`prefix_state_cache_max_bytes` 与 checkpoint interval。
+6. 生命周期：引用计数、LRU、请求完成、抢占、失效和异常回滚。
+7. 正确性：Cache on/off、Chunked Prefill、batch、抢占和淘汰后重算。
+8. Benchmark：TTFT、跳过的 Prefill tokens、hit rate、snapshot 拷贝耗时和显存。
+
+### 4.4 关键资源风险
+
+9B 的单请求 GDN active state 约为 49.5 MiB。若每 256 tokens 保存一次 8K 前缀，粗略需要 32 份 checkpoint，单条前缀的 GDN snapshot 就可能约为：
+
+```text
+49.5 MiB × 32 ≈ 1.55 GiB
+```
+
+因此不能无界保存每个 block 的状态。V2 必须使用显存上限、稀疏 checkpoint 和 LRU，并把 snapshot 显存作为一等指标。
+
+### 4.5 完成判定
+
+- Cache on/off 的 greedy token 完全一致。
+- 命中恢复后的 KV 和全部 GDN state 与完整重算一致。
+- 实际 scheduled Prefill tokens 按命中长度减少。
+- 引用、淘汰、抢占和请求完成后无 KV/state snapshot 泄漏。
+- 报告 TTFT 收益，同时报告 snapshot 保存/恢复成本与显存代价。
+
+## 5. V3：Hybrid Decode CUDA Graph（已纳入，未实现）
+
+### 5.1 当前已有基础
 
 - 原 nano-vLLM 在 `ModelRunner.capture_cudagraph()` 中有普通 Attention 模型的 CUDA Graph 骨架。
 - 当前 Qwen3.5 Hybrid Runtime 已有稳定的 Batched Decode、紧凑 Paged KV、GDN state-slot Gather/Scatter 和三轴 mRoPE。
 - 当前 Qwen3.5 Hybrid 路径仍要求 `enforce_eager=True`；旧 Graph 骨架不能直接证明 Hybrid Decode 可 capture。
 
-### 4.2 技术目标
+### 5.2 技术目标
 
 只 capture 高频、shape 相对稳定的 Decode 路径：
 
@@ -462,7 +523,7 @@ state_slot_ids
 
 Full Attention 通过 `block_tables/slot_mapping` 读写正确 KV block；GDN 通过 `state_slot_ids` 读写正确 conv/recurrent state。Graph 不能把这些地址或请求映射固化成上一轮的数据。
 
-### 4.3 待实现 Part
+### 5.3 待实现 Part
 
 1. Graph-safe 审计：定位动态分配、CPU 同步和数据相关分支。
 2. 静态 Decode buffer：覆盖 token、三轴位置、KV 元数据和 GDN slot。
@@ -471,7 +532,7 @@ Full Attention 通过 `block_tables/slot_mapping` 读写正确 KV block；GDN �
 5. 正确性：Eager/Graph greedy token、padding、重复 replay 和状态串槽测试。
 6. Benchmark：TPOT、Decode tokens/s、CPU launch overhead 和额外显存。
 
-### 4.4 完成判定
+### 5.4 完成判定
 
 只有满足以下条件才可以声称“实现 Qwen3.5 Hybrid CUDA Graph”：
 
@@ -481,67 +542,77 @@ Full Attention 通过 `block_tables/slot_mapping` 读写正确 KV block；GDN �
 - 不支持的 shape 能自动、安全回退 Eager。
 - 有原始 Benchmark 和 Graph 额外显存数据。
 
-## 5. V3：GDN-aware Prefix State Cache（已纳入，未实现）
+## 6. V4：状态感知 GDN Decode 融合算子（已纳入，未实现）
 
-### 5.1 为什么不能直接打开原 Prefix Cache
+### 6.1 项目定位
 
-Qwen3.5 的历史状态由两部分组成：
-
-```text
-Full Attention 历史 → Paged KV blocks
-Gated DeltaNet 历史 → conv_state + recurrent_state
-```
-
-如果请求 B 只命中请求 A 的 Attention KV，却没有恢复同一前缀边界的 GDN state，后续 Decode 会从错误历史继续，生成结果不可信。因此一次命中必须是联合、原子的：
+V4 不是孤立复现一个教学 Kernel，而是在 V2 Prefix restore 和 V3 CUDA Graph 接口稳定后，根据真实 Decode Profile 优化 GDN 状态访问。候选热点包括：
 
 ```text
-Prefix Hit
-   ├── Full Attention KV 有效
-   └── 所有 GDN state snapshot 有效
-两者同时满足 → restore
-任一缺失     → 整体 miss，重新 Prefill
+GDN state Gather/Scatter
+Depthwise causal-conv1d 单 token update
+FLA fused recurrent update
+FP32 recurrent state 的重复 HBM 往返
+多个小 Kernel 的 Launch 开销
 ```
 
-### 5.2 首版范围
+只有 Nsight Systems/PyTorch Profiler 证明其中至少一项是显著瓶颈后，才冻结最终算子边界。
 
-- 只支持纯文本共享前缀。
-- 只在完整 token block 边界创建 Prefix Entry。
-- 保存 KV block 引用以及对应的全部 GDN `conv_state/recurrent_state` snapshot。
-- 使用显存预算、checkpoint interval、引用计数和 LRU 控制开销。
-- Prefix 命中后从该边界继续执行剩余 suffix Prefill。
+### 6.2 首版范围与主要变量
 
-图文 Prefix Cache 暂缓，因为缓存身份还必须包含图片内容、processor 结果、image grid、mRoPE layout 和视觉模型版本；只按 image placeholder token IDs 做 hash 会错误共享不同图片。
-
-### 5.3 待实现 Part
-
-1. Prefix Key：模型/配置身份、完整 block token hash 和前驱链。
-2. Prefix Entry：联合持有 KV blocks 与 GDN snapshot。
-3. snapshot commit：只在完整 block 边界原子提交。
-4. lookup/restore：KV/GDN 同时命中才恢复到活跃 state slot。
-5. 显存预算：`prefix_state_cache_max_bytes` 与 checkpoint interval。
-6. 生命周期：引用计数、LRU、请求完成、抢占、失效和异常回滚。
-7. 正确性：Cache on/off、Chunked Prefill、batch、抢占和淘汰后重算。
-8. Benchmark：TTFT、跳过的 Prefill tokens、hit rate、snapshot 拷贝耗时和显存。
-
-### 5.4 关键资源风险
-
-9B 的单请求 GDN active state 约为 49.5 MiB。若每 256 tokens 保存一次 8K 前缀，粗略需要 32 份 checkpoint，单条前缀的 GDN snapshot 就可能约为：
+只支持 `L=1` Decode、动态 batch 和任意不连续的：
 
 ```text
-49.5 MiB × 32 ≈ 1.55 GiB
+state_slot_ids[B]
 ```
 
-因此不能无界保存每个 block 的状态。V3 必须使用显存上限、稀疏 checkpoint 和 LRU，并把 snapshot 显存作为一等指标。
+第一子算子直接更新：
 
-### 5.5 完成判定
+```text
+mixed_qkv[B,conv_dim]
+conv_state_pool[num_slots,num_gdn_layers,conv_dim,kernel_size]
+```
 
-- Cache on/off 的 greedy token 完全一致。
-- 命中恢复后的 KV 和全部 GDN state 与完整重算一致。
-- 实际 scheduled Prefill tokens 按命中长度减少。
-- 引用、淘汰、抢占和请求完成后无 KV/state snapshot 泄漏。
-- 报告 TTFT 收益，同时报告 snapshot 保存/恢复成本与显存代价。
+第二子算子接收：
 
-## 6. 当前开发断点：V1 基线冻结，准备进入 V2
+```text
+q/k[B,H,K]、v[B,H,V]、beta/g
+recurrent_state_pool[num_slots,num_gdn_layers,H,K,V] FP32
+```
+
+并融合执行：
+
+```text
+S = exp(g) · S
+prediction = k^T S
+delta = beta · (v - prediction)
+S = S + k ⊗ delta
+o = q^T S
+```
+
+Kernel 必须通过 `state_slot_ids[row]` 直接定位真实状态池并原地写回，不能先 Gather 整个 FP32 state 再 Scatter。
+
+### 6.3 待实现 Part
+
+1. Eager/Graph Decode 热点 Profile 与算子输入契约。
+2. `torch/fla/custom` 微基准框架。
+3. Naive state-aware causal-conv1d update。
+4. Naive state-aware recurrent update/read。
+5. `[K,V]` tiling、向量化、访存与融合优化。
+6. HybridStateManager/ModelRunner 接入和 FLA fallback。
+7. Prefix restore、slot 复用和 CUDA Graph custom replay 正确性。
+8. Nsight Compute、微基准和端到端 Benchmark。
+
+### 6.4 完成判定
+
+- `torch/fla/custom` 的输出、conv state 和 FP32 recurrent state 对齐。
+- 连续、离散、乱序 slot 和动态 batch 无状态串写。
+- Prefix restore 后首次 Decode、抢占重算和 slot 复用保持正确。
+- custom backend 可被 V3 CUDA Graph 正确 capture/replay，或对不安全形状明确 fallback。
+- 同时报告 Kernel latency、HBM/L2/occupancy 与 TPOT/Decode 吞吐，不能把微基准加速直接写成端到端收益。
+- 如果 custom 未超过 FLA，如实记录原因和适用边界，不宣称优化成功。
+
+## 7. 当前开发断点：V1 基线冻结，准备进入 V2 Prefix Cache
 
 V1 Runtime 的主要功能代码已接通。先把当前 Eager/Cache-off 行为冻结为后续优化的正确性基线：
 
@@ -551,9 +622,9 @@ V1 Runtime 的主要功能代码已接通。先把当前 Eager/Cache-off 行为�
 4. 编写简历描述和面试高频追问。
 5. 检查 Git 工作区，排除模型权重、大型 profiler 文件和不需要的临时产物后提交。
 
-随后进入 V2 第 1 个 Part：审计 Qwen3.5 Decode 路径的 Graph-safe 条件。第一步不是直接调用 capture，而是逐项检查 Full Attention、FLA recurrent GDN、causal-conv1d、Sampler 和 Context 中是否存在动态分配、CPU 同步或依赖实际 batch size 的控制流。
+随后进入 V2 第 1 个 Part：定义纯文本 `PrefixKey`。第一步先核对当前 `BlockManager` 的 block hash、前驱链和引用计数，再把模型/配置身份、完整 token block 和前驱 prefix hash 纳入稳定缓存身份；此时只建立 key/lookup 骨架，不直接保存 49.5 MiB 的 GDN snapshot。
 
-## 7. 剩余 Part
+## 8. 剩余 Part
 
 V1 收尾剩余 4 个 Part：
 
@@ -562,11 +633,19 @@ V1 收尾剩余 4 个 Part：
 3. 实验报告、简历要点和面试问答。
 4. Git 工作区清点、提交和推送。
 
-V2 CUDA Graph 共 6 个 Part，V3 Prefix State Cache 共 8 个 Part；连同 V1 收尾，总计还剩 18 个 Part。
+V2 Prefix State Cache 共 8 个 Part，V3 CUDA Graph 共 6 个 Part，V4 GDN Decode 算子共 8 个 Part；连同 V1 收尾，总计还剩 26 个 Part。
 
-当前正式扩展只包含 CUDA Graph 和纯文本 Prefix State Cache。MTP、MoE、TP>1、多图、视频和图文 Prefix Cache 不计入这 18 个 Part。
+当前正式扩展按以下顺序执行：
 
-## 8. 当前可以和不能在面试中声称的内容
+```text
+V2 Prefix State Cache
+→ V3 Hybrid Decode CUDA Graph
+→ V4 状态感知 GDN Decode 算子
+```
+
+MTP、MoE、TP>1、多图、视频、图文 Prefix Cache 和完整 Chunk Gated Delta Rule 自研 Kernel 不计入这 26 个 Part。
+
+## 9. 当前可以和不能在面试中声称的内容
 
 可以准确表述：
 
@@ -574,7 +653,7 @@ V2 CUDA Graph 共 6 个 Part，V3 Prefix State Cache 共 8 个 Part；连同 V1 
 
 目前不能声称：
 
-- 已实现 Qwen3.5 Prefix Cache 或 Hybrid CUDA Graph；两者目前只是已完成设计并纳入正式路线。
+- 已实现 Qwen3.5 Prefix Cache、Hybrid CUDA Graph 或自研 GDN Decode Kernel；三者目前只是已完成设计并纳入正式路线。
 - 已实现 MTP 或 MoE；两者仍不在当前正式范围内。
 - 已支持多图、视频或 TP>1。
 - 已达到生产级 vLLM 完整性或超过官方 vLLM 性能。
@@ -583,13 +662,17 @@ V2 CUDA Graph 共 6 个 Part，V3 Prefix State Cache 共 8 个 Part；连同 V1 
 
 完成 V2 后可以增加的表述：
 
-> 为 Qwen3.5 Hybrid Decode 构建 batch-bucket CUDA Graph，通过静态三轴位置、Paged KV 元数据和 GDN state-slot buffer 完成 capture/replay，并为动态形状保留 Eager fallback；性能数字只填写实测结果。
+> 实现 GDN-aware Prefix State Cache，在完整 block 边界原子复用 Full Attention KV 与 GDN conv/recurrent snapshot，通过显存预算、checkpoint interval、引用计数和 LRU 管理缓存生命周期；性能数字只填写实测结果。
 
 完成 V3 后可以增加的表述：
 
-> 实现 GDN-aware Prefix State Cache，在完整 block 边界原子复用 Full Attention KV 与 GDN conv/recurrent snapshot，通过显存预算、checkpoint interval、引用计数和 LRU 管理缓存生命周期；性能数字只填写实测结果。
+> 为 Qwen3.5 Hybrid Decode 构建 batch-bucket CUDA Graph，通过静态三轴位置、Paged KV 元数据和 GDN state-slot buffer 完成 capture/replay，并为动态形状保留 Eager fallback；性能数字只填写实测结果。
 
-## 9. 关键文件地图
+完成 V4 后可以增加的表述：
+
+> 基于 Nsight 定位 Qwen3.5 Decode 的 GDN 状态访问热点，实现支持离散 `state_slot_ids` 的状态感知融合 Kernel，原地更新 causal-conv state 与 FP32 recurrent state，并与 FLA 完成状态级对齐；性能数字必须同时填写微基准和端到端实测结果。
+
+## 10. 关键文件地图
 
 ```text
 config.py                 根/文本/视觉配置与资源参数
@@ -617,15 +700,6 @@ tests/saturation_benchmark.py    持续闭环饱和压测
 V2 预计主要修改：
 
 ```text
-config.py                 Graph bucket、fallback 和开关配置
-engine/model_runner.py    静态 Decode buffer、capture/replay 和统计
-utils/context.py          Graph replay 所需静态 Context 元数据
-tests/                    Eager/Graph 对齐、bucket 和 Benchmark
-```
-
-V3 预计主要修改：
-
-```text
 config.py                 Prefix snapshot 预算与 checkpoint interval
 engine/block_manager.py   KV block 引用与 Prefix Entry 联动
 engine/hybrid_state.py    GDN snapshot 保存、恢复与显存统计
@@ -634,7 +708,26 @@ engine/sequence.py        命中边界和恢复元数据
 tests/                    Cache on/off、淘汰、抢占和 Benchmark
 ```
 
-## 10. Git 工作区与恢复入口
+V3 预计主要修改：
+
+```text
+config.py                 Graph bucket、fallback 和开关配置
+engine/model_runner.py    静态 Decode buffer、capture/replay 和统计
+utils/context.py          Graph replay 所需静态 Context 元数据
+tests/                    Eager/Graph 对齐、bucket 和 Benchmark
+```
+
+V4 预计主要修改/新增：
+
+```text
+layers/gated_delta_net.py torch/fla/custom backend 和调用边界
+engine/hybrid_state.py    state pool 直接访问接口与 slot 校验
+engine/model_runner.py    custom backend、Graph capture 和 fallback
+nanovllm/kernels/         state-aware conv/recurrent CUDA 扩展
+tests/                    状态级对齐、动态 slot、微基准和端到端 Benchmark
+```
+
+## 11. Git 工作区与恢复入口
 
 2026-08-29 本次核对时 `git status --short` 显示：
 
@@ -666,4 +759,4 @@ source .venv/bin/activate
 git status
 ```
 
-然后先按本文第 6 节冻结 V1 基线并提交可恢复节点，再进入第 4 节 V2 的第 1 个 Part：Hybrid Decode Graph-safe 审计。
+然后先按本文第 7 节冻结 V1 基线并提交可恢复节点，再进入第 4 节 V2 的第 1 个 Part：定义 Prefix Key、核对 block hash 与前驱链。
