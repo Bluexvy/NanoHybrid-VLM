@@ -49,6 +49,42 @@ class Config:
     # 纯 Attention 模型 → 开启
     # 含 GDN 的混合模型 → 关闭
     enable_prefix_cache: bool | None = None
+        
+    # Qwen3.5 联合 KV + GDN Prefix Cache 模式。
+    #
+    # disabled：
+    #     完全关闭联合 Prefix State Cache。
+    #
+    # opportunistic：
+    #     只在 Prefill chunk 自然结束于合法
+    #     checkpoint 时创建 Entry，不额外切分 Forward。
+    #
+    # aligned_debug 和 adaptive 会在后续 Part 实现。
+    hybrid_prefix_cache_mode: str = "disabled"
+
+    # 每隔多少个完整 token block，才允许保存一个
+    # GDN Prefix checkpoint。
+    #
+    # block_size=256、interval=4 时：
+    #     checkpoint 间隔 = 1024 tokens。
+    prefix_checkpoint_interval_blocks: int = 4
+
+    # Prefix Entry 中休眠 recurrent state 的 dtype。
+    #
+    # float32：
+    #     正确性基线，约 49.5 MiB/Entry。
+    #
+    # bfloat16：
+    #     压缩实验，约 25.5 MiB/Entry。
+    #
+    # active recurrent state 始终仍为 FP32。
+    prefix_recurrent_snapshot_dtype: str = "float32"
+
+    # 单条请求最多创建多少个新 Prefix snapshot。
+    #
+    # 先限制为 1，防止一个长 Prompt 保存大量
+    # 49.5 MiB 的 GDN states。
+    max_new_prefix_snapshots_per_request: int = 1
     
     # Config是dataclass 
     # __post_init__() 是 @dataclass 在自动执行完 __init__() 后调用的初始化hook
@@ -109,6 +145,73 @@ class Config:
             layer_type == "linear_attention"
             for layer_type in layer_types
         )
+        
+        supported_hybrid_prefix_modes = {
+            "disabled",
+            "opportunistic",
+        }
+
+        if (
+            self.hybrid_prefix_cache_mode
+            not in supported_hybrid_prefix_modes
+        ):
+            raise ValueError(
+                "hybrid_prefix_cache_mode must be "
+                "'disabled' or 'opportunistic' "
+                "in the current implementation"
+            )
+
+        if self.prefix_checkpoint_interval_blocks <= 0:
+            raise ValueError(
+                "prefix_checkpoint_interval_blocks "
+                "must be positive"
+            )
+
+        supported_snapshot_dtypes = {
+            "float32",
+            "bfloat16",
+        }
+
+        if (
+            self.prefix_recurrent_snapshot_dtype
+            not in supported_snapshot_dtypes
+        ):
+            raise ValueError(
+                "prefix_recurrent_snapshot_dtype must "
+                "be 'float32' or 'bfloat16'"
+            )
+
+        if (
+            self.max_new_prefix_snapshots_per_request
+            <= 0
+        ):
+            raise ValueError(
+                "max_new_prefix_snapshots_per_request "
+                "must be positive"
+            )
+
+        hybrid_prefix_cache_enabled = (
+            self.hybrid_prefix_cache_mode
+            != "disabled"
+        )
+
+        if (
+            hybrid_prefix_cache_enabled
+            and not has_gdn_layers
+        ):
+            raise ValueError(
+                "hybrid_prefix_cache_mode is only "
+                "valid for models containing GDN layers"
+            )
+
+        if (
+            hybrid_prefix_cache_enabled
+            and self.tensor_parallel_size != 1
+        ):
+            raise NotImplementedError(
+                "Hybrid Prefix State Cache currently "
+                "supports TP=1 only"
+            )
 
         if self.enable_prefix_cache is None:
             # Qwen3 保持原来的 Prefix Cache。

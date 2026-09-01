@@ -534,6 +534,201 @@ class HybridStateManager:
         self._validate_slot(slot)
         self.initialized_slots[slot] = False
 
+    @torch.inference_mode()
+    def snapshot_slot(
+        self,
+        slot: int,
+        recurrent_snapshot_dtype: torch.dtype,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """
+        为一个已经初始化的 active state slot
+        创建独立的 GDN Prefix Snapshot。
+
+        conv snapshot 始终保持 spec.conv_dtype。
+
+        recurrent snapshot 支持：
+            torch.float32：正确性模式
+            torch.bfloat16：压缩模式
+        """
+
+        self._validate_slot(slot)
+
+        supported_snapshot_dtypes = {
+            torch.float32,
+            torch.bfloat16,
+        }
+
+        if (
+            recurrent_snapshot_dtype
+            not in supported_snapshot_dtypes
+        ):
+            raise ValueError(
+                "recurrent_snapshot_dtype must be "
+                "torch.float32 or torch.bfloat16"
+            )
+
+        if not self.initialized_slots[slot]:
+            raise RuntimeError(
+                f"Cannot snapshot uninitialized "
+                f"GDN state slot {slot}"
+            )
+
+        conv_state_snapshot = (
+            self.conv_state_pool[slot]
+            .detach()
+            .clone()
+        )
+
+        recurrent_state_source = (
+            self.recurrent_state_pool[slot]
+            .detach()
+        )
+
+        if (
+            recurrent_snapshot_dtype
+            == recurrent_state_source.dtype
+        ):
+            recurrent_state_snapshot = (
+                recurrent_state_source.clone()
+            )
+        else:
+            recurrent_state_snapshot = (
+                recurrent_state_source.to(
+                    dtype=recurrent_snapshot_dtype
+                )
+            )
+
+        return (
+            conv_state_snapshot,
+            recurrent_state_snapshot,
+        )
+        
+    @torch.inference_mode()
+    def restore_slot(
+        self,
+        slot: int,
+        conv_state_snapshot: torch.Tensor,
+        recurrent_state_snapshot: torch.Tensor,
+    ) -> None:
+        """
+        将一个独立的 GDN Prefix Snapshot 恢复到
+        active state slot。
+
+        conv snapshot 必须与 active conv dtype 一致。
+
+        recurrent snapshot 可以是 FP32 或 BF16；
+        copy_() 会在写入 FP32 active pool 时完成转换。
+        """
+
+        self._validate_slot(slot)
+
+        expected_conv_shape = (
+            self.spec.conv_state_shape_per_slot
+        )
+
+        if (
+            tuple(conv_state_snapshot.shape)
+            != expected_conv_shape
+        ):
+            raise ValueError(
+                "Invalid conv snapshot shape: "
+                f"expected {expected_conv_shape}, "
+                f"got {tuple(conv_state_snapshot.shape)}"
+            )
+
+        expected_recurrent_shape = (
+            self.spec
+            .recurrent_state_shape_per_slot
+        )
+
+        if (
+            tuple(recurrent_state_snapshot.shape)
+            != expected_recurrent_shape
+        ):
+            raise ValueError(
+                "Invalid recurrent snapshot shape: "
+                f"expected {expected_recurrent_shape}, "
+                "got "
+                f"{tuple(recurrent_state_snapshot.shape)}"
+            )
+
+        if (
+            conv_state_snapshot.dtype
+            != self.spec.conv_dtype
+        ):
+            raise TypeError(
+                "conv snapshot dtype does not match "
+                "active conv state dtype"
+            )
+
+        supported_recurrent_dtypes = {
+            torch.float32,
+            torch.bfloat16,
+        }
+
+        if (
+            recurrent_state_snapshot.dtype
+            not in supported_recurrent_dtypes
+        ):
+            raise TypeError(
+                "recurrent snapshot must use "
+                "torch.float32 or torch.bfloat16"
+            )
+
+        if (
+            conv_state_snapshot.device
+            != self.device
+        ):
+            raise ValueError(
+                "conv snapshot must be on the same "
+                "device as the active state pool"
+            )
+
+        if (
+            recurrent_state_snapshot.device
+            != self.device
+        ):
+            raise ValueError(
+                "recurrent snapshot must be on the same "
+                "device as the active state pool"
+            )
+
+        if conv_state_snapshot.requires_grad:
+            raise ValueError(
+                "conv snapshot must not require grad"
+            )
+
+        if recurrent_state_snapshot.requires_grad:
+            raise ValueError(
+                "recurrent snapshot must not require grad"
+            )
+
+        # 在两份 Tensor 都成功写入前，不能把 slot
+        # 标记成可读取状态。
+        self.initialized_slots[slot] = False
+
+        try:
+            self.conv_state_pool[slot].copy_(
+                conv_state_snapshot
+            )
+
+            # active recurrent pool 是 FP32。
+            #
+            # 如果 Snapshot 是 BF16，copy_() 会在这里
+            # 将其转换回 FP32。
+            self.recurrent_state_pool[slot].copy_(
+                recurrent_state_snapshot
+            )
+
+        except Exception:
+            self.initialized_slots[slot] = False
+            raise
+
+        self.initialized_slots[slot] = True
+
     def read_states(
         self,
         slot: int,

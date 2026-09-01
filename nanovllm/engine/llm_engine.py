@@ -6,8 +6,14 @@ from dataclasses import (
 )
 from time import perf_counter
 from tqdm.auto import tqdm
+import torch
 import torch.multiprocessing as mp
 
+
+from nanovllm.engine.prefix_cache import (
+    PrefixKey,
+    PrefixStateCache,
+)
 from nanovllm.config import Config
 from nanovllm.inputs import (
     InputProcessor,
@@ -216,6 +222,92 @@ class LLMEngine:
 
         config.eos = model_eos_token_id
         self.scheduler = Scheduler(config)
+        
+        self.hybrid_prefix_cache_mode = (
+            config.hybrid_prefix_cache_mode
+        )
+
+        self.prefix_checkpoint_interval_blocks = (
+            config.prefix_checkpoint_interval_blocks
+        )
+
+        self.max_new_prefix_snapshots_per_request = (
+            config.max_new_prefix_snapshots_per_request
+        )
+
+        self.prefix_state_cache: (
+            PrefixStateCache | None
+        ) = None
+
+        if (
+            self.hybrid_prefix_cache_mode
+            != "disabled"
+        ):
+            state_manager = (
+                self.model_runner
+                .hybrid_state_manager
+            )
+
+            if state_manager is None:
+                raise RuntimeError(
+                    "Hybrid Prefix Cache requires an "
+                    "initialized HybridStateManager"
+                )
+
+            snapshot_dtype_by_name = {
+                "float32": torch.float32,
+                "bfloat16": torch.bfloat16,
+            }
+
+            recurrent_snapshot_dtype = (
+                snapshot_dtype_by_name[
+                    config.prefix_recurrent_snapshot_dtype
+                ]
+            )
+
+            spec = state_manager.spec
+
+            # Prefix Cache 目前位于进程内存中，不会跨进程
+            # 持久化，但仍然为所有影响状态布局的参数
+            # 建立明确 namespace。
+            self.prefix_model_namespace = (
+                "hybrid-prefix-v1"
+                f"|model={config.model}"
+                f"|model_dtype={self.model_runner.model_dtype}"
+                f"|active_recurrent_dtype="
+                f"{spec.recurrent_dtype}"
+                f"|snapshot_recurrent_dtype="
+                f"{recurrent_snapshot_dtype}"
+                f"|conv_dtype={spec.conv_dtype}"
+                f"|block_size={config.kvcache_block_size}"
+                f"|gdn_layers={spec.num_gdn_layers}"
+            )
+
+            self.prefix_state_cache = (
+                PrefixStateCache(
+                    block_manager=(
+                        self.scheduler.block_manager
+                    ),
+                    state_manager=state_manager,
+                    model_namespace=(
+                        self.prefix_model_namespace
+                    ),
+                    recurrent_snapshot_dtype=(
+                        recurrent_snapshot_dtype
+                    ),
+                )
+            )
+        else:
+            self.prefix_model_namespace = None
+            
+        # 无论 Cache 是否开启，都显式通知 Scheduler。
+        #
+        # disabled 模式传入 None；
+        # opportunistic 模式传入 PrefixStateCache。
+        self.scheduler.set_prefix_state_cache(
+            self.prefix_state_cache
+        )        
+
         # seq_id -> 请求生命周期指标
         self.request_metrics: dict[
             int,
@@ -391,6 +483,124 @@ class LLMEngine:
                     progress_time
                 )
 
+    def _commit_opportunistic_prefixes(
+        self,
+        seqs: list[Sequence],
+    ) -> None:
+        """
+        为本轮 Prefill 自然结束在合法 checkpoint
+        的纯文本请求创建联合 KV + GDN Prefix Entry。
+
+        调用时必须满足：
+
+            1. ModelRunner 已经写回最新 GDN state；
+            2. BlockManager 已经记录完整 block hash；
+            3. Scheduler.postprocess() 尚未释放资源。
+        """
+
+        cache = self.prefix_state_cache
+
+        if cache is None:
+            return
+
+        if (
+            self.hybrid_prefix_cache_mode
+            != "opportunistic"
+        ):
+            return
+
+        checkpoint_interval_tokens = (
+            self.prefix_checkpoint_interval_blocks
+            * self.scheduler.block_size
+        )
+
+        for seq in seqs:
+            # 首版只支持纯文本 Prefix Cache。
+            #
+            # 不同图片可能拥有相同的 image placeholder
+            # token IDs，因此不能只按 token hash 共享。
+            if seq.is_multimodal:
+                continue
+
+            # 每条请求限制创建的新 snapshot 数量。
+            if (
+                seq.num_prefix_snapshots_created
+                >= self.max_new_prefix_snapshots_per_request
+            ):
+                continue
+
+            if seq.state_slot is None:
+                raise RuntimeError(
+                    f"Sequence {seq.seq_id} lost its "
+                    "GDN state slot before Prefix commit"
+                )
+
+            checkpoint_tokens = (
+                seq.num_cached_tokens
+                + seq.num_scheduled_tokens
+            )
+
+            # Prefix Entry 不保存 logits。
+            #
+            # 因此命中后至少要保留一个 Prompt token
+            # 交给模型执行，以重新产生最后位置的 logits。
+            if (
+                checkpoint_tokens
+                >= seq.num_prompt_tokens
+            ):
+                continue
+
+            # 只接受完整 token-block 边界。
+            if (
+                checkpoint_tokens
+                % self.scheduler.block_size
+                != 0
+            ):
+                continue
+
+            # 进一步应用稀疏 checkpoint 间隔。
+            #
+            # block_size=256，interval_blocks=4：
+            # checkpoint 必须位于 1024、2048、3072……
+            if (
+                checkpoint_tokens
+                % checkpoint_interval_tokens
+                != 0
+            ):
+                continue
+
+            (
+                kv_block_ids,
+                block_hash,
+            ) = (
+                self.scheduler.block_manager
+                .prefix_metadata_at_boundary(
+                    seq,
+                    num_cached_tokens=(
+                        checkpoint_tokens
+                    ),
+                )
+            )
+
+            key = PrefixKey(
+                model_namespace=(
+                    self.prefix_model_namespace
+                ),
+                block_hash=block_hash,
+                num_cached_tokens=(
+                    checkpoint_tokens
+                ),
+            )
+
+            _, created = cache.commit(
+                key=key,
+                kv_block_ids=kv_block_ids,
+                state_slot=seq.state_slot,
+            )
+
+            if created:
+                seq.num_prefix_snapshots_created += 1
+
     def step(
         self,
     ) -> tuple[
@@ -433,6 +643,10 @@ class LLMEngine:
                     plan.decode_seqs,
                     False,
                 )
+            )
+
+            self.scheduler.record_computed_block_metadata(
+                plan.decode_seqs
             )
 
             self.scheduler.postprocess(
@@ -484,11 +698,20 @@ class LLMEngine:
                 )
             )
 
+            self.scheduler.record_computed_block_metadata(
+                plan.prefill_seqs
+            )
+
+            self._commit_opportunistic_prefixes(
+                plan.prefill_seqs
+            )
+
             self.scheduler.postprocess(
                 plan.prefill_seqs,
                 prefill_token_ids,
                 True,
             )
+            
             self._record_request_progress(
                 plan.prefill_seqs
             )

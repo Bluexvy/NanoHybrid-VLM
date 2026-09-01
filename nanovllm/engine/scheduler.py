@@ -8,6 +8,10 @@ from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.hybrid_state import (
     StateSlotAllocator,
 )
+from nanovllm.engine.prefix_cache import (
+    PrefixStateCache,
+    PrefixStateEntry,
+)
 
 @dataclass(slots=True)
 class SchedulePlan:
@@ -43,33 +47,36 @@ class SchedulePlan:
 
 class Scheduler:
 
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+    ):
         self.scheduler_policy = (
             config.scheduler_policy
         )
-        self.max_num_seqs = config.max_num_seqs
-        self.max_num_batched_tokens = config.max_num_batched_tokens
-        self.max_prefill_wait_ms = (config.max_prefill_wait_ms)
-        self.eos = config.eos
-        self.block_size = config.kvcache_block_size
-        self.block_manager = BlockManager(
-            num_blocks=config.num_kvcache_blocks,
-            block_size=config.kvcache_block_size,
-            enable_prefix_cache=(
-                config.enable_prefix_cache
-            ),
+
+        self.max_num_seqs = (
+            config.max_num_seqs
         )
-        self.waiting: deque[Sequence] = deque()
-        self.running: deque[Sequence] = deque()
-        # seq_id -> 本次进入 waiting 队列的单调时间。
-        self.waiting_since: dict[int, float] = {}
-        # Scheduler 生命周期内的累计抢占次数。
-        self.num_preemptions = 0
-        # 被抢占请求需要重新计算的累计 token 数。
-        self.num_recomputed_tokens = 0
+
+        self.max_num_batched_tokens = (
+            config.max_num_batched_tokens
+        )
+
+        self.max_prefill_wait_ms = (
+            config.max_prefill_wait_ms
+        )
+
+        self.eos = config.eos
+
+        self.block_size = (
+            config.kvcache_block_size
+        )
+
+        # 先判断模型中是否存在 GDN 层。
         layer_types = getattr(
-        config.text_config,
-        "layer_types",
+            config.text_config,
+            "layer_types",
             (),
         )
 
@@ -77,6 +84,63 @@ class Scheduler:
             layer_type == "linear_attention"
             for layer_type in layer_types
         )
+
+        # 普通 Qwen3：
+        #     config.enable_prefix_cache=True
+        #     允许传统 KV Prefix Cache lookup。
+        #
+        # Qwen3.5：
+        #     config.enable_prefix_cache=False
+        #     当前禁止 KV-only lookup。
+        self.enable_kv_prefix_lookup = bool(
+            config.enable_prefix_cache
+        )
+
+        # 普通 Qwen3 开启传统 Prefix Cache 时需要记录。
+        #
+        # Qwen3.5 为了开发联合 KV + GDN Prefix Cache，
+        # 即使暂时禁止 KV-only lookup，也需要记录
+        # 完整 block 的 token/hash 元数据。
+        self.record_prefix_metadata = (
+            self.enable_kv_prefix_lookup
+            or self.requires_gdn_state
+        )
+
+        self.block_manager = BlockManager(
+            num_blocks=config.num_kvcache_blocks,
+            block_size=config.kvcache_block_size,
+            enable_kv_prefix_lookup=(
+                self.enable_kv_prefix_lookup
+            ),
+            record_prefix_metadata=(
+                self.record_prefix_metadata
+            ),
+        )
+        
+        # PrefixStateCache 由 LLMEngine 创建后注入。
+        #
+        # Scheduler 本身不能创建它，因为创建
+        # PrefixStateCache 还需要 ModelRunner 中的
+        # HybridStateManager。
+        self.prefix_state_cache: (
+            PrefixStateCache | None
+        ) = None
+
+        # Prefix Cache 命中统计。
+        self.num_prefix_hit_requests = 0
+        self.num_prefix_hit_tokens = 0
+
+        self.waiting: deque[Sequence] = deque()
+        self.running: deque[Sequence] = deque()
+
+        # seq_id -> 本次进入 waiting 队列的时间。
+        self.waiting_since: dict[
+            int,
+            float,
+        ] = {}
+
+        self.num_preemptions = 0
+        self.num_recomputed_tokens = 0
 
         if self.requires_gdn_state:
             if config.num_state_slots <= 0:
@@ -94,6 +158,97 @@ class Scheduler:
 
         else:
             self.state_slot_allocator = None
+
+    def set_prefix_state_cache(
+        self,
+        cache: PrefixStateCache | None,
+    ) -> None:
+        """
+        将 LLMEngine 创建的 Hybrid Prefix State
+        Cache 注入 Scheduler。
+        """
+
+        if cache is not None:
+            if not self.requires_gdn_state:
+                raise RuntimeError(
+                    "Hybrid Prefix State Cache can only "
+                    "be attached to a model with GDN layers"
+                )
+
+            if (
+                cache.block_manager
+                is not self.block_manager
+            ):
+                raise RuntimeError(
+                    "Scheduler and PrefixStateCache must "
+                    "share the same BlockManager"
+                )
+
+        self.prefix_state_cache = cache
+
+    def _lookup_prefix_for_new_request(
+        self,
+        seq: Sequence,
+    ) -> PrefixStateEntry | None:
+        """
+        为尚未分配运行时资源的新请求执行一次
+        Hybrid Prefix State Cache lookup。
+
+        同一个 waiting 周期只扫描一次 Prompt。
+        """
+
+        cache = self.prefix_state_cache
+
+        # Cache 未开启时走普通 Prefill。
+        if cache is None:
+            seq.prefix_lookup_completed = True
+            return None
+
+        # 首版不缓存图文前缀。
+        #
+        # 仅比较 image placeholder token IDs 无法区分
+        # 两张内容不同、但视觉 token 数量相同的图片。
+        if seq.is_multimodal:
+            seq.prefix_lookup_completed = True
+            return None
+
+        # 第一次处理这个新请求时，扫描 Prompt 的
+        # 完整 token blocks，寻找最长命中。
+        if not seq.prefix_lookup_completed:
+            entry = cache.lookup_longest(
+                seq.prompt_token_ids
+            )
+
+            seq.prefix_lookup_completed = True
+
+            if entry is None:
+                seq.prefix_cache_key = None
+                return None
+
+            seq.prefix_cache_key = entry.key
+            return entry
+
+        # 请求之前已经 lookup 过但没有命中。
+        if seq.prefix_cache_key is None:
+            return None
+
+        # 请求可能因为资源不足而在 waiting 中停留多轮。
+        #
+        # 不需要每轮重新计算整个 Prompt 的链式 Hash，
+        # 直接使用保存的 PrefixKey 取 Entry。
+        entry = cache.get_resident_entry(
+            seq.prefix_cache_key
+        )
+
+        # 当前版本还没有 LRU，正常情况下不会进入这里。
+        #
+        # 但提前处理 Entry 被删除的情况，可以避免以后
+        # 加入显存预算和 LRU 后出现悬空引用。
+        if entry is None:
+            seq.prefix_cache_key = None
+            return None
+
+        return entry
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -425,11 +580,71 @@ class Scheduler:
 
             is_new_request = not seq.block_table
 
+            # 只有新请求才可能在这里查到 Prefix Entry。
+            #
+            # 已经执行过 Prefill chunk 的请求已经拥有
+            # block_table 和 state slot，不应再次 lookup。
+            prefix_entry: (
+                PrefixStateEntry | None
+            ) = None
+
             if is_new_request:
-                # 先检查当前 KV blocks 是否足够。
-                num_cached_blocks = (
-                    self.block_manager.can_allocate(seq)
+                # =================================
+                # 1. 查询联合 KV + GDN Prefix
+                # =================================
+
+                prefix_entry = (
+                    self._lookup_prefix_for_new_request(
+                        seq
+                    )
                 )
+
+                if prefix_entry is not None:
+                    # Entry 中保存的每个物理 Block，
+                    # 分别对应一个完整的逻辑 token block。
+                    num_cached_blocks = len(
+                        prefix_entry.kv_block_ids
+                    )
+
+                    # 命中时不能使用普通 can_allocate()。
+                    #
+                    # 普通 can_allocate() 会从全局
+                    # hash_to_block_id 中自行查找 KV，
+                    # 但联合 Prefix Cache 必须使用 Entry
+                    # 明确保存的那组 KV Block。
+                    has_kv_blocks = (
+                        self.block_manager
+                        .can_allocate_from_prefix(
+                            seq,
+                            prefix_entry.kv_block_ids,
+                        )
+                    )
+
+                    expected_cached_tokens = (
+                        num_cached_blocks
+                        * self.block_size
+                    )
+
+                    if (
+                        expected_cached_tokens
+                        != prefix_entry
+                        .key.num_cached_tokens
+                    ):
+                        raise RuntimeError(
+                            "Prefix Entry token boundary "
+                            "does not match its KV blocks"
+                        )
+
+                else:
+                    # Prefix miss，沿用普通分配路径。
+                    num_cached_blocks = (
+                        self.block_manager
+                        .can_allocate(seq)
+                    )
+
+                    has_kv_blocks = (
+                        num_cached_blocks != -1
+                    )
 
                 def resources_available() -> bool:
                     """
@@ -442,10 +657,6 @@ class Scheduler:
                         < self.max_num_seqs
                     )
 
-                    has_kv_blocks = (
-                        num_cached_blocks != -1
-                    )
-
                     has_state_slot = (
                         self.can_allocate_state_slot(seq)
                     )
@@ -456,12 +667,10 @@ class Scheduler:
                         and has_state_slot
                     )
 
-                # 普通 Prefill：
-                # 资源不足就继续等待。
+                # 普通 Prefill 资源不足时继续等待。
                 #
-                # 超时 Prefill：
-                # 尝试抢占未进入本轮 Decode 的请求，
-                # 直到资源足够或者没有合法 victim。
+                # 等待超时后，可以抢占没有进入本轮
+                # Decode microbatch 的运行中请求。
                 while (
                     reserve_prefill
                     and not resources_available()
@@ -480,34 +689,50 @@ class Scheduler:
                     preempted_seq_ids.append(
                         victim.seq_id
                     )
-                    # victim 还在 running 中，
-                    # 必须先将其移出。
-                    self.running.remove(victim)
 
-                    # 释放 victim 的 KV blocks 和
-                    # GDN state slot，并放回 waiting 队尾。
+                    self.running.remove(victim)
                     self.preempt(victim)
 
                     num_active_seqs -= 1
 
-                    # 抢占释放了 KV blocks，
-                    # 因此必须重新检查目标请求能否分配。
-                    num_cached_blocks = (
-                        self.block_manager.can_allocate(seq)
-                    )
+                    # 抢占释放了 KV blocks，因此重新检查。
+                    #
+                    # Prefix hit 与 miss 必须分别调用各自
+                    # 对应的资源检查函数。
+                    if prefix_entry is not None:
+                        has_kv_blocks = (
+                            self.block_manager
+                            .can_allocate_from_prefix(
+                                seq,
+                                prefix_entry.kv_block_ids,
+                            )
+                        )
 
-                # while 可能因为没有合法 victim 而退出，
-                # 所以退出后必须再次检查资源。
+                    else:
+                        num_cached_blocks = (
+                            self.block_manager
+                            .can_allocate(seq)
+                        )
+
+                        has_kv_blocks = (
+                            num_cached_blocks != -1
+                        )
+
                 if not resources_available():
                     break
 
-                # admission 成功。
-                #
-                # 对 Qwen3.5，Prefix Cache 关闭，
-                # num_cached_blocks 通常等于 0。
+                # =================================
+                # 2. 计算真正需要执行的 Prompt tokens
+                # =================================
+
+                num_cached_tokens = (
+                    num_cached_blocks
+                    * self.block_size
+                )
+
                 num_tokens = (
                     seq.num_tokens
-                    - num_cached_blocks * self.block_size
+                    - num_cached_tokens
                 )
 
             else:
@@ -528,15 +753,81 @@ class Scheduler:
                 )
 
             if is_new_request:
-                # can_allocate() 只做检查，
-                # allocate() 才真正占用 KV blocks。
-                self.block_manager.allocate(
-                    seq,
-                    num_cached_blocks,
-                )
+                # =================================
+                # 3. 真正占用 KV Block
+                # =================================
 
-                # Qwen3.5 在这里获得一个固定 state slot。
+                if prefix_entry is not None:
+                    reused_blocks = (
+                        self.block_manager
+                        .allocate_from_prefix(
+                            seq,
+                            prefix_entry.kv_block_ids,
+                        )
+                    )
+
+                    if (
+                        reused_blocks
+                        != num_cached_blocks
+                    ):
+                        raise RuntimeError(
+                            "Allocated Prefix KV block "
+                            "count changed unexpectedly"
+                        )
+
+                else:
+                    # Prefix miss，走原来的普通分配路径。
+                    self.block_manager.allocate(
+                        seq,
+                        num_cached_blocks,
+                    )
+
+                # =================================
+                # 4. 分配 active GDN state slot
+                # =================================
+
                 self.allocate_state_slot(seq)
+
+                # =================================
+                # 5. 记录 Prefix 命中状态
+                # =================================
+
+                if prefix_entry is not None:
+                    if seq.state_slot is None:
+                        raise RuntimeError(
+                            "Prefix hit request did not "
+                            "receive a GDN state slot"
+                        )
+
+                    if (
+                        seq.num_cached_tokens
+                        != prefix_entry
+                        .key.num_cached_tokens
+                    ):
+                        raise RuntimeError(
+                            "Sequence cached-token boundary "
+                            "does not match Prefix Entry"
+                        )
+
+                    # Scheduler 已经完成：
+                    #
+                    # 1. KV Block attach；
+                    # 2. state slot 分配。
+                    #
+                    # 但 GDN Snapshot 还没有复制进 slot。
+                    # Engine 会在模型执行前完成复制。
+                    seq.prefix_restore_pending = True
+
+                    seq.num_prefix_hit_tokens = (
+                        prefix_entry
+                        .key.num_cached_tokens
+                    )
+
+                    self.num_prefix_hit_requests += 1
+
+                    self.num_prefix_hit_tokens += (
+                        seq.num_prefix_hit_tokens
+                    )
 
                 num_active_seqs += 1
 
@@ -629,6 +920,16 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         seq.num_scheduled_tokens = 0
+        
+        # 被抢占请求重新回到 waiting 后，需要重新进行
+        # Prefix lookup。
+        #
+        # 它可能再次命中同一个 Entry，也可能因为未来的
+        # LRU 淘汰而发生 miss。
+        seq.prefix_lookup_completed = False
+        seq.prefix_cache_key = None
+        seq.prefix_restore_pending = False
+        seq.num_prefix_hit_tokens = 0
 
         # 释放 Full Attention KV。
         self.block_manager.deallocate(seq)
@@ -647,9 +948,29 @@ class Scheduler:
         self.waiting.append(seq)
         self._mark_waiting(seq)
 
+    def record_computed_block_metadata(
+        self,
+        seqs: list[Sequence],
+    ) -> None:
+        """
+        模型 Forward 成功后，为本轮刚计算完成的
+        完整 KV blocks 记录 token IDs 和链式 Hash。
+
+        该阶段不推进 num_cached_tokens，
+        也不释放请求资源。
+        """
+
+        for seq in seqs:
+            if seq.num_scheduled_tokens <= 0:
+                raise RuntimeError(
+                    f"Sequence {seq.seq_id} has no "
+                    "completed scheduled tokens"
+                )
+
+            self.block_manager.hash_blocks(seq)
+
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):
-            self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:

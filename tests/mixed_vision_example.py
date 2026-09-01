@@ -56,29 +56,29 @@ def main() -> None:
         MODEL_PATH,
         enforce_eager=True,
         tensor_parallel_size=1,
-
         max_model_len=1024,
-
         # 三条 prompt 总长度应小于512，
         # 使它们能够进入同一个 Prefill microbatch。
-        max_num_batched_tokens=512,
-
+        max_num_batched_tokens=64,
         max_num_seqs=3,
         num_state_slots=3,
-
         gpu_memory_utilization=0.8,
     )
 
-    image = create_test_image()
+    #image = create_test_image()
+    from PIL import Image
 
+    image_path = "/workspace/nano-vllm/assets/logo.png"
+    image = Image.open(image_path).convert("RGB")
+    
     text_prompt_1 = format_text_prompt(
         llm,
-        "2加3等于多少？只回答结果。",
+        "用中文回答什么是KVcache？",
     )
 
     text_prompt_2 = format_text_prompt(
         llm,
-        "用一句话解释什么是线性注意力。",
+        "用中文回答什么是线性注意力？",
     )
 
     prompts = [
@@ -86,7 +86,7 @@ def main() -> None:
 
         {
             "prompt": (
-                "请描述图片中的颜色和形状。"
+                "请描述一下这幅图片？"
             ),
             "multi_modal_data": {
                 "image": image,
@@ -101,7 +101,7 @@ def main() -> None:
 
         # 本轮重点是混合批处理，不要求模型完成
         # 很长的思考过程。
-        max_tokens=64,
+        max_tokens=2048,
     )
 
     outputs = llm.generate(

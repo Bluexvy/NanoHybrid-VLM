@@ -3,9 +3,14 @@ from enum import Enum, auto
 from itertools import count
 import torch
 from torch import Tensor
+from typing import TYPE_CHECKING
 
 from nanovllm.sampling_params import SamplingParams
 
+if TYPE_CHECKING:
+    from nanovllm.engine.prefix_cache import (
+        PrefixKey,
+    )
 
 class SequenceStatus(Enum):
     WAITING = auto()
@@ -42,6 +47,11 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
+        # 当前请求成功创建了多少个新的
+        # GDN-aware Prefix Entry。
+        # duplicate commit 不会增加这个数字，
+        # 因为它没有创建新的 GPU snapshot。
+        self.num_prefix_snapshots_created = 0
         self.is_prefill = True
         self.block_table = []
         self.temperature = sampling_params.temperature
@@ -51,6 +61,25 @@ class Sequence:
         # 只保存整数 slot 编号，
         # 不保存任何 GPU Tensor。
         self.state_slot: int | None = None
+        
+        # Scheduler 是否已经为该请求执行过一次
+        # Prefix State Cache lookup。
+        self.prefix_lookup_completed = False
+
+        # 命中的 CPU PrefixKey。
+        #
+        # 不在 Sequence 中保存 PrefixStateEntry，
+        # 因为 Entry 含有大型 GPU Tensor Snapshot。
+        self.prefix_cache_key: (
+            "PrefixKey | None"
+        ) = None
+
+        # Scheduler 已经 attach KV 并分配 state slot，
+        # 但 Engine 尚未把 GDN Snapshot 恢复进该 slot。
+        self.prefix_restore_pending = False
+
+        # 实际通过 Prefix Hit 跳过了多少 Prompt tokens。
+        self.num_prefix_hit_tokens = 0
         
         multimodal_fields = (
             mm_token_type_ids is not None,

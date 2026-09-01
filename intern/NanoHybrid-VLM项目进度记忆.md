@@ -1,11 +1,11 @@
 # NanoHybrid-VLM 项目进度记忆
 
-> 更新时间：2026-08-29  
+> 更新时间：2026-08-31
 > 当前分支：`main`  
-> 最近提交：`aa76678 benchmark`
+> 最近提交：`8791901 new plan`
 > 用途：记录实际完成、已经验证、当前断点和下一步。  
 > V1 完成度：约 90%～95%；文本/单图 Hybrid Runtime 已接通。
-> 扩展后总体完成度：约 50%～55%；V2 GDN-aware Prefix State Cache、V3 Decode CUDA Graph 与 V4 状态感知 GDN Decode 算子已纳入正式方案，但均尚未实现。
+> 扩展后总体完成度：约 55%～60%；V2 GDN-aware Prefix State Cache 已完成 Key/Entry、GDN snapshot、KV pin/unpin 和 opportunistic 原子 commit 写路径，lookup/restore 读路径正在实施；V3/V4 尚未实现。
 
 ## 1. 项目目标与边界
 
@@ -33,7 +33,7 @@ V1 范围：RTX 5090、BF16、TP=1、Eager；每个请求最多一张本地 PIL 
 
 ```text
 V1：Qwen3.5-9B 文本/单图 Hybrid Runtime（当前主要功能已完成）
-V2：纯文本 GDN-aware Prefix State Cache（已规划，未实现；当前首先实施）
+V2：纯文本 GDN-aware Prefix State Cache（已进入实施；写路径已通，读路径进行中）
 V3：Qwen3.5 Hybrid Decode-only CUDA Graph（已规划，未实现）
 V4：状态感知 GDN Decode 融合算子（已规划，未实现；必须先完成真实 Profile）
 ```
@@ -430,7 +430,7 @@ PIL Image + prompt
 → decode text
 ```
 
-## 4. V2：GDN-aware Prefix State Cache（已纳入，未实现；当前首先实施）
+## 4. V2：GDN-aware Prefix State Cache（已开始实施）
 
 ### 4.1 为什么不能直接打开原 Prefix Cache
 
@@ -456,12 +456,72 @@ Prefix Hit
 - 只支持纯文本共享前缀。
 - 只在完整 token block 边界创建 Prefix Entry。
 - 保存 KV block 引用以及对应的全部 GDN `conv_state/recurrent_state` snapshot。
+- `conv_state` snapshot 保持模型 BF16 dtype；`recurrent_state` snapshot 支持 FP32 正确性模式和 BF16 压缩模式。
+- BF16 只压缩休眠的 Prefix snapshot；恢复到 active state slot 时转回 FP32，后续 GDN 递推仍使用 FP32 recurrent state。
 - 使用显存预算、checkpoint interval、引用计数和 LRU 控制开销。
 - Prefix 命中后从该边界继续执行剩余 suffix Prefill。
 
 图文 Prefix Cache 暂缓，因为缓存身份还必须包含图片内容、processor 结果、image grid、mRoPE layout 和视觉模型版本；只按 image placeholder token IDs 做 hash 会错误共享不同图片。
 
-### 4.3 待实现 Part
+### 4.3 缓存准入与 checkpoint 策略
+
+不将“每个 checkpoint 强制切断 Prefill”作为最终默认策略。该做法可用于 correctness/debug，但会增加 Model Forward 次数、Kernel Launch 和小 chunk 开销，降低冷请求 Prefill 吞吐。
+
+V2 保留三种策略：
+
+```text
+aligned_debug
+    强制 checkpoint 对齐，只用于边界与正确性验证
+
+opportunistic
+    只在 Prefill chunk 自然结束于合法 checkpoint 时提交
+
+adaptive
+    在 CPU 侧统计轻量 PrefixKey 热度，只为热前缀最多额外对齐一次
+```
+
+默认目标是 `adaptive`。热前缀判定同时考虑：
+
+- 完整 token-block 的链式 `PrefixKey` 在时间窗口内被不同请求重复观察。
+- `seen_count >= hot_prefix_min_observations`。
+- `num_cached_tokens >= hot_prefix_min_tokens`。
+- 候选 Entry 尚未 resident，且 snapshot 预算允许。
+- 每个请求最多创建一份新 snapshot，多个候选同时变热时选择最长前缀。
+- 候选边界必须严格小于 Prompt token 数，因为首版 Entry 不缓存 logits，命中后至少要真正执行一个 token。
+- Observation 表只占 CPU 内存，使用独立的容量上限、时间窗和 LRU，不与 GPU Prefix Entry LRU 混用。
+
+初始实验参数（最终由 Benchmark 决定）：
+
+```text
+prefix_checkpoint_interval_blocks = 4
+hot_prefix_min_observations = 2
+hot_prefix_min_tokens = 1024
+hot_prefix_window_s = 300
+prefix_observation_max_entries = 10000
+max_new_snapshots_per_request = 1
+```
+
+### 4.4 Snapshot 精度模式
+
+```text
+FP32 mode
+    conv snapshot: BF16
+    recurrent snapshot: FP32
+    GDN snapshot 约 49.5 MiB/Entry
+    用于 Cache on/off 严格正确性基线
+
+BF16 mode
+    conv snapshot: BF16
+    recurrent snapshot: BF16
+    GDN snapshot 约 25.5 MiB/Entry
+    恢复时转回 FP32 active recurrent state
+```
+
+BF16 模式约减少 48.5% 的 GDN snapshot 显存，但会在保存时引入一次精度损失，因此不预设逐 token 完全一致。必须单独报告 recurrent state/logits 最大与平均误差、top-1 一致率和 greedy token 一致率；若未通过正确性门槛，BF16 保持为实验模式，FP32 作为安全 fallback。
+
+`model_namespace` 必须包含 model dtype、active recurrent dtype、snapshot recurrent dtype、block size 和 Prefix schema version，避免不同缓存布局误共享。
+
+### 4.5 待实现 Part
 
 1. Prefix Key：模型/配置身份、完整 block token hash 和前驱链。
 2. Prefix Entry：联合持有 KV blocks 与 GDN snapshot。
@@ -472,7 +532,7 @@ Prefix Hit
 7. 正确性：Cache on/off、Chunked Prefill、batch、抢占和淘汰后重算。
 8. Benchmark：TTFT、跳过的 Prefill tokens、hit rate、snapshot 拷贝耗时和显存。
 
-### 4.4 关键资源风险
+### 4.6 关键资源风险
 
 9B 的单请求 GDN active state 约为 49.5 MiB。若每 256 tokens 保存一次 8K 前缀，粗略需要 32 份 checkpoint，单条前缀的 GDN snapshot 就可能约为：
 
@@ -480,15 +540,16 @@ Prefix Hit
 49.5 MiB × 32 ≈ 1.55 GiB
 ```
 
-因此不能无界保存每个 block 的状态。V2 必须使用显存上限、稀疏 checkpoint 和 LRU，并把 snapshot 显存作为一等指标。
+因此不能无界保存每个 block 的状态。V2 必须使用显存上限、稀疏 checkpoint、热度准入和 LRU，并把 snapshot 显存作为一等指标。BF16 snapshot 会缓解但不会消除该风险，KV blocks 仍然随前缀长度增长。
 
-### 4.5 完成判定
+### 4.7 完成判定
 
-- Cache on/off 的 greedy token 完全一致。
-- 命中恢复后的 KV 和全部 GDN state 与完整重算一致。
+- FP32 Cache on/off 的 greedy token 完全一致。
+- FP32 命中恢复后的 KV 和全部 GDN state 与完整重算一致。
+- BF16 单独报告 state/logits 误差、top-1 和 greedy token 一致率，不把压缩模式与 FP32 基线混为同一正确性结论。
 - 实际 scheduled Prefill tokens 按命中长度减少。
 - 引用、淘汰、抢占和请求完成后无 KV/state snapshot 泄漏。
-- 报告 TTFT 收益，同时报告 snapshot 保存/恢复成本与显存代价。
+- 报告冷 miss TTFT、热 hit TTFT、Prefill 吞吐、额外 Forward 次数、snapshot 保存/恢复成本、命中率与 FP32/BF16 显存代价。
 
 ## 5. V3：Hybrid Decode CUDA Graph（已纳入，未实现）
 
@@ -612,17 +673,56 @@ Kernel 必须通过 `state_slot_ids[row]` 直接定位真实状态池并原地�
 - 同时报告 Kernel latency、HBM/L2/occupancy 与 TPOT/Decode 吞吐，不能把微基准加速直接写成端到端收益。
 - 如果 custom 未超过 FLA，如实记录原因和适用边界，不宣称优化成功。
 
-## 7. 当前开发断点：V1 基线冻结，准备进入 V2 Prefix Cache
+## 7. 当前开发断点：V2 Prefix Cache Part 3 写路径已验证，Part 4 读路径进行中
 
-V1 Runtime 的主要功能代码已接通。先把当前 Eager/Cache-off 行为冻结为后续优化的正确性基线：
+### 7.1 已实现的 Prefix Cache 基础
 
-1. 整理最终技术复习文档。
-2. 整理 README：架构、安装、文本/单图用法、边界。
-3. 整理实验报告，区分正确性结果、单次性能结果和未验证结论。
-4. 编写简历描述和面试高频追问。
-5. 检查 Git 工作区，排除模型权重、大型 profiler 文件和不需要的临时产物后提交。
+- `PrefixKey` 包含 `model_namespace` / 链式 `block_hash` / `num_cached_tokens`。
+- `PrefixStateEntry` 联合持有有序物理 `kv_block_ids`、全部 GDN `conv_state_snapshot` 和 `recurrent_state_snapshot`。
+- `PrefixStateEntry.validate()` 按 Cache 配置校验 FP32/BF16 recurrent snapshot，并检查 shape/dtype/device/完整 block 边界。
+- `HybridStateManager.snapshot_slot()` 对已初始化 active slot 创建独立 GPU snapshot；conv 保持 BF16，recurrent 支持 FP32 或 BF16 休眠格式。
+- `Block` 已区分 `request_ref_count` 与 `cache_ref_count`；`pin_blocks()` / `unpin_blocks()` 维护 Prefix Entry 的 KV 所有权。
+- `PrefixStateCache.commit()` 按“校验→重复检测→snapshot→pin KV→插入索引”的顺序原子提交，异常时回滚 KV pin。
+- `PrefixStateCache.discard()` 删除 Entry 并释放 cache-owner KV 引用。
+- `enable_kv_prefix_lookup` 与 `record_prefix_metadata` 已解耦：Qwen3.5 可记录 block token/hash，但联合 restore 接通前仍禁止 KV-only lookup。
+- Engine 已在 `ModelRunner.run()` 与 `Scheduler.postprocess()` 之间建立安全 commit 窗口：此时 KV、GDN state 和 block hash 已完成，请求引用与 state slot 尚未释放。
+- `Config` 已增加 `hybrid_prefix_cache_mode`、`prefix_checkpoint_interval_blocks`、`prefix_recurrent_snapshot_dtype` 和 `max_new_prefix_snapshots_per_request`。
+- `_commit_opportunistic_prefixes()` 只在纯文本 Chunked Prefill 自然结束于稀疏完整 block checkpoint、且边界严格小于 Prompt 长度时创建 Entry；当前不为冷前缀强制额外切分 Forward。
 
-随后进入 V2 第 1 个 Part：定义纯文本 `PrefixKey`。第一步先核对当前 `BlockManager` 的 block hash、前驱链和引用计数，再把模型/配置身份、完整 token block 和前驱 prefix hash 纳入稳定缓存身份；此时只建立 key/lookup 骨架，不直接保存 49.5 MiB 的 GDN snapshot。
+### 7.2 Part 3G 已通过的实测
+
+`tests/test_prefix_commit.py` 已在 Qwen3.5-9B、TP=1、Eager、FP32 recurrent snapshot 下通过：
+
+```text
+long prompt tokens: 1165
+cached boundary: 1024
+cached KV blocks: (0, 1, 2, 3)
+GDN snapshot MiB: 49.5
+Snapshot stayed unchanged after active state-slot reuse.
+Duplicate prefix reused the existing Entry without creating another Snapshot.
+Part 3G passed.
+```
+
+该测试已证明：
+
+- 1165-token Prompt 在 `max_num_batched_tokens=1024` 时，第一个自然 chunk 能在 1024-token checkpoint 创建 Entry。
+- Entry 持有 4 个 256-token Paged KV blocks，FP32 GDN snapshot 实测为 49.5 MiB。
+- 源请求结束后 `request_ref_count=0`、`cache_ref_count=1`，KV 不会被提前回收。
+- active state slot 被新请求复用后，Entry 中 `clone()` 出的 conv/recurrent snapshot 保持不变。
+- 重复前缀增加 `num_duplicate_commits`，但 `num_entries`、`num_commits` 和 snapshot bytes 不增加。
+- `discard()` 后 cache-owner 引用清零，无请求引用的 KV blocks 回到 `free_block_ids`。
+
+### 7.3 当前正在实施的 Part 4A
+
+已给出、但尚未确认用户保存和运行通过的代码：
+
+- `BlockManager.validate_prefix_blocks(..., require_request_owner=False)`：校验由 cache-owner 单独持有的 resident KV blocks。
+- `HybridStateManager.restore_slot()`：将 FP32/BF16 休眠 snapshot 复制到 active slot，只在 conv/recurrent 都复制成功后设置 `initialized_slots[slot]=True`。
+- `PrefixStateCache.lookup_longest()`：遍历严格短于 Prompt 的完整 block 边界，根据链式 Hash 找最长 Entry，并逐 block 比较真实 token IDs 防止 Hash 碰撞。
+- `PrefixStateCache.restore_gdn_state()`：确认 Entry 仍 resident 后，将 GDN snapshot 恢复到新 active state slot。
+- `tests/test_prefix_commit.py` 待增加 longest-hit、精确边界保留一个 token、不同前缀 miss 和 GDN restore 断言。
+
+下一步恢复点：先保存并运行 Part 4A；通过后实现 Part 4B，为命中 Entry 的 KV blocks 增加 request-owner 引用、写入新 `Sequence.block_table`、推进 `num_cached_tokens`，并在首次 suffix Prefill 前恢复 GDN state。
 
 ## 8. 剩余 Part
 
@@ -633,7 +733,20 @@ V1 收尾剩余 4 个 Part：
 3. 实验报告、简历要点和面试问答。
 4. Git 工作区清点、提交和推送。
 
-V2 Prefix State Cache 共 8 个 Part，V3 CUDA Graph 共 6 个 Part，V4 GDN Decode 算子共 8 个 Part；连同 V1 收尾，总计还剩 26 个 Part。
+V2 Prefix State Cache 的 Part 1～3 已完成，Part 4 进行中，仍剩约 5 个大 Part；V3 CUDA Graph 共 6 个 Part，V4 GDN Decode 算子共 8 个 Part，V1 收尾剩 4 个 Part。
+
+从当前断点计算：
+
+```text
+V2 Prefix State Cache 剩余       5
+V3 Hybrid CUDA Graph             6
+V4 GDN Decode 自定义算子         8
+V1 文档/报告/简历/Git 收尾      4
+----------------------------------
+总计                             23
+```
+
+若只计算核心技术实现、不计最后 4 个收尾 Part，则还剩约 19 个大 Part。
 
 当前正式扩展按以下顺序执行：
 
@@ -643,7 +756,7 @@ V2 Prefix State Cache
 → V4 状态感知 GDN Decode 算子
 ```
 
-MTP、MoE、TP>1、多图、视频、图文 Prefix Cache 和完整 Chunk Gated Delta Rule 自研 Kernel 不计入这 26 个 Part。
+MTP、MoE、TP>1、多图、视频、图文 Prefix Cache 和完整 Chunk Gated Delta Rule 自研 Kernel 不计入这 23 个 Part。
 
 ## 9. 当前可以和不能在面试中声称的内容
 
@@ -651,9 +764,14 @@ MTP、MoE、TP>1、多图、视频、图文 Prefix Cache 和完整 Chunk Gated D
 
 > 基于 nano-vLLM 实现 Qwen3.5-9B 文本/单图 Hybrid Runtime：根据 `layer_types` 为 Full Attention 分配紧凑 Paged KV Cache，为 Gated DeltaNet 设计 state-slot 池管理 depthwise causal-convolution state 和 FP32 recurrent state；实现 FLA GDN Prefill/Decode、Variable-length Batched Prefill、Batched Decode、Chunked Prefill、Decode-first 双 microbatch 调度、Prefill 饥饿保护及 KV/GDN/视觉状态联合抢占重算。接入 Qwen3.5 Vision Transformer/Patch Merger、图像 embedding 替换、三轴 mRoPE 和请求级 visual embedding cache，并完成 HF 64-token greedy 对齐、文本/图文混合批处理、Chunked Prefill 和抢占重算一致性验证。
 
+对当前 V2 进度可以准确表述：
+
+> 已实现 GDN-aware Prefix State Cache 的写路径原型：在纯文本 Chunked Prefill 的完整 block 边界，基于链式 token Hash 原子提交 Full Attention 物理 KV block 引用与 GDN conv/recurrent snapshot，通过 request/cache 双引用计数管理 KV 生命周期；已验证 1024-token checkpoint、49.5 MiB FP32 GDN snapshot、state-slot 复用隔离、重复提交去重和 discard 回收。该表述仅限“写路径原型”，不能声称已完成 Prefix hit 加速。
+
 目前不能声称：
 
-- 已实现 Qwen3.5 Prefix Cache、Hybrid CUDA Graph 或自研 GDN Decode Kernel；三者目前只是已完成设计并纳入正式路线。
+- 已完整实现 Qwen3.5 Prefix Cache 命中加速；目前只有已验证的写路径，lookup/restore、调度接入、显存预算/LRU 和端到端性能数据尚未完成。
+- 已实现 Hybrid CUDA Graph 或自研 GDN Decode Kernel；两者目前只是已完成设计并纳入正式路线。
 - 已实现 MTP 或 MoE；两者仍不在当前正式范围内。
 - 已支持多图、视频或 TP>1。
 - 已达到生产级 vLLM 完整性或超过官方 vLLM 性能。
@@ -729,27 +847,21 @@ tests/                    状态级对齐、动态 slot、微基准和端到端 
 
 ## 11. Git 工作区与恢复入口
 
-2026-08-29 本次核对时 `git status --short` 显示：
+2026-08-31 本次核对时，最近提交为 `8791901 new plan`。当前 Prefix Cache 相关未提交变更包括：
 
 ```text
-D  bench.py
-D  hf_cache_probe.py
-D  hf_gdn_layer_probe.py
-D  hf_text_baseline.py
-M  intern/NanoHybrid-VLM项目实施方案.md
 M  intern/NanoHybrid-VLM项目进度记忆.md
 M  nanovllm/config.py
+M  nanovllm/engine/block_manager.py
+M  nanovllm/engine/hybrid_state.py
 M  nanovllm/engine/llm_engine.py
 M  nanovllm/engine/scheduler.py
-?? artifacts/bench/
-?? tests/benchmark_hybrid.py
-?? tests/dynamic_scheduler_benchmark.py
-?? tests/run_benchmark_matrix.py
-?? tests/saturation_benchmark.py
-?? tests/vision_preemption.py
+M  nanovllm/engine/sequence.py
+?? nanovllm/engine/prefix_cache.py
+?? tests/test_prefix_commit.py
 ```
 
-这些删除、修改和未跟踪文件尚未在本次文档更新中处理。Git 收尾时必须逐项确认，不能直接删除或全部提交。
+工作区还包含 Benchmark 产物、脚本和其他已有未提交变更。Git 收尾时必须逐项确认，不能直接删除或不加检查地全部提交。
 
 恢复命令：
 
@@ -759,4 +871,4 @@ source .venv/bin/activate
 git status
 ```
 
-然后先按本文第 7 节冻结 V1 基线并提交可恢复节点，再进入第 4 节 V2 的第 1 个 Part：定义 Prefix Key、核对 block hash 与前驱链。
+恢复开发时从本文第 7.3 节继续：先核对 Part 4A 代码已保存，运行扩展后的 `tests/test_prefix_commit.py`，再接入 Part 4B 的 KV request-owner attach 和 suffix Prefill 前 GDN restore。
