@@ -1,0 +1,78 @@
+{
+  "policy": "always",
+  "repeat_index": 0,
+  "pollution_count": 6,
+  "hot_prompt_tokens": 4618,
+  "checkpoint_tokens": 4096,
+  "expected_hot_suffix_tokens": 522,
+  "warmup_runs": 1,
+  "warmup_results": [
+    {
+      "output_token_ids": [
+        90700
+      ],
+      "prefill_tokens": 4618,
+      "single_token_latency_ms": 769.0293319756165
+    }
+  ],
+  "pre_pollution_hot": {
+    "output_token_ids": [
+      90700
+    ],
+    "prefill_tokens": 522,
+    "single_token_latency_ms": 68.21214500814676
+  },
+  "post_pollution_hot": {
+    "output_token_ids": [
+      90700
+    ],
+    "prefill_tokens": 4618,
+    "single_token_latency_ms": 425.9786210022867
+  },
+  "hot_resident_after_pollution": false,
+  "measured_hot_hits": 1,
+  "measured_hot_hit_rate": 0.5,
+  "pollution_total_prefill_tokens": 27726,
+  "pollution_total_latency_ms": 2552.917461958714,
+  "pollution_request_latencies_ms": [
+    424.5513300411403,
+    425.1623189775273,
+    425.6634679622948,
+    425.7937769871205,
+    425.8163640042767,
+    425.9302039863542
+  ],
+  "counters_before_pollution": {
+    "commits": 1,
+    "evictions": 0,
+    "capacity_rejections": 0,
+    "admission_observations": 1,
+    "admission_accepts": 1,
+    "admission_deferrals": 0
+  },
+  "counters_after_pollution": {
+    "commits": 7,
+    "evictions": 5,
+    "capacity_rejections": 0,
+    "admission_observations": 7,
+    "admission_accepts": 7,
+    "admission_deferrals": 0
+  },
+  "counters_after_post_hot": {
+    "commits": 8,
+    "evictions": 6,
+    "capacity_rejections": 0,
+    "admission_observations": 8,
+    "admission_accepts": 8,
+    "admission_deferrals": 0
+  },
+  "commits_during_pollution": 6,
+  "evictions_during_pollution": 5,
+  "deferrals_during_pollution": 0,
+  "commits_pollution_and_post": 7,
+  "evictions_pollution_and_post": 6,
+  "cache_entries_after_post": 2,
+  "cache_capacity_mib_after_post": 307.0,
+  "unique_pinned_kv_blocks_after_post": 32,
+  "admission_candidate_count": 0
+}

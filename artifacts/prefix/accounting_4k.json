@@ -1,0 +1,34 @@
+{
+  "snapshot_dtype": "bfloat16",
+  "prompt_tokens": 4609,
+  "checkpoint_tokens": 4096,
+  "suffix_tokens": 513,
+  "output_tokens": 16,
+  "hot_runs": 1,
+  "cold_prefill_tokens": 4609,
+  "hot_prefill_tokens": 513,
+  "skipped_prefill_tokens_per_hit": 4096,
+  "snapshot_bytes": 26738688,
+  "snapshot_mib": 25.5,
+  "cold_elapsed_ms": 1055.5654229829088,
+  "hot_elapsed_ms": [
+    343.6347959795967
+  ],
+  "hot_median_ms": 343.6347959795967,
+  "single_run_e2e_reduction_percent": 67.44542891443682,
+  "token_comparisons": [
+    {
+      "exact_match": true,
+      "matching_tokens": 16,
+      "match_ratio": 1.0,
+      "first_mismatch_index": null
+    }
+  ],
+  "prefix_hit_requests": 1,
+  "prefix_hit_tokens": 4096,
+  "gdn_restores": 1,
+  "unique_pinned_kv_blocks": 16,
+  "kv_block_bytes": 8388608,
+  "pinned_kv_capacity_bytes": 134217728,
+  "total_prefix_cache_capacity_bytes": 160956416
+}

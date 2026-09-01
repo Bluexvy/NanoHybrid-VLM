@@ -295,6 +295,28 @@ class LLMEngine:
                     recurrent_snapshot_dtype=(
                         recurrent_snapshot_dtype
                     ),
+                    kv_block_bytes=(
+                        self.model_runner.kv_cache_block_bytes
+                    ),
+                    capacity_bytes=(
+                        config
+                        .hybrid_prefix_cache_capacity_mib
+                        * 1024
+                        * 1024
+                    ),
+                    admission_policy=(
+                        config.prefix_admission_policy
+                    ),
+
+                    admission_min_observations=(
+                        config
+                        .prefix_admission_min_observations
+                    ),
+
+                    admission_max_candidates=(
+                        config
+                        .prefix_admission_max_candidates
+                    ),
                 )
             )
         else:
@@ -592,14 +614,138 @@ class LLMEngine:
                 ),
             )
 
-            _, created = cache.commit(
-                key=key,
-                kv_block_ids=kv_block_ids,
-                state_slot=seq.state_slot,
+            # 先进行轻量准入判断。
+            #
+            # frequency模式第一次看到该Prefix时只记录：
+            #
+            #     PrefixKey -> observation count
+            #
+            # 不分配GDN Snapshot，也不pin KV blocks。
+            if not cache.observe_and_should_admit(
+                key
+            ):
+                continue
+
+            committed_entry, created = (
+                cache.commit(
+                    key=key,
+                    kv_block_ids=kv_block_ids,
+                    state_slot=seq.state_slot,
+                )
             )
+
+            # 容量不足不是推理错误。
+            #
+            # 当前请求已经正常计算，只是不把这份状态
+            # 保留给未来请求。
+            if committed_entry is None:
+                continue
 
             if created:
                 seq.num_prefix_snapshots_created += 1
+
+    def _restore_pending_prefix_states(
+        self,
+        seqs: list[Sequence],
+    ) -> None:
+        """
+        在 Prefix-hit Prefill 真正执行之前，把 Entry
+        中的 GDN Snapshot 恢复到请求的 active slot。
+
+        此时 Scheduler 已经完成：
+
+            1. Prefix KV blocks attach；
+            2. 剩余 KV blocks 分配；
+            3. active GDN state slot 分配。
+        """
+
+        cache = self.prefix_state_cache
+
+        for seq in seqs:
+            # Prefix miss 和后续 Chunked Prefill 不需要恢复。
+            if not seq.prefix_restore_pending:
+                continue
+
+            if cache is None:
+                raise RuntimeError(
+                    "Sequence requires Prefix state "
+                    "restore, but PrefixStateCache is "
+                    "disabled"
+                )
+
+            if seq.is_multimodal:
+                raise RuntimeError(
+                    "Multimodal Prefix state restore "
+                    "is not supported"
+                )
+
+            if seq.prefix_cache_key is None:
+                raise RuntimeError(
+                    "Pending Prefix restore does not "
+                    "have a PrefixKey"
+                )
+
+            if seq.state_slot is None:
+                raise RuntimeError(
+                    "Pending Prefix restore does not "
+                    "have an active GDN state slot"
+                )
+
+            # Scheduler lookup 后，请求可能短暂停留在
+            # waiting 队列，因此执行前重新确认 Entry
+            # 仍然 resident。
+            entry = cache.get_resident_entry(
+                seq.prefix_cache_key
+            )
+
+            if entry is None:
+                raise RuntimeError(
+                    "Prefix Entry disappeared after "
+                    "KV attachment but before GDN restore"
+                )
+
+            # KV、GDN state 和 token 边界必须完全一致。
+            if (
+                seq.num_cached_tokens
+                != entry.key.num_cached_tokens
+            ):
+                raise RuntimeError(
+                    "Sequence cached-token boundary "
+                    "does not match Prefix Entry during "
+                    "GDN restore"
+                )
+
+            num_prefix_blocks = len(
+                entry.kv_block_ids
+            )
+
+            attached_prefix_blocks = tuple(
+                seq.block_table[:num_prefix_blocks]
+            )
+
+            if (
+                attached_prefix_blocks
+                != entry.kv_block_ids
+            ):
+                raise RuntimeError(
+                    "Sequence block_table does not contain "
+                    "the Prefix Entry KV blocks"
+                )
+
+            # 将只读 Snapshot 复制到可修改的 active slot。
+            #
+            # 后续 GDN Prefill/Decode 只修改 active slot，
+            # 不会修改 Prefix Entry 中的 Snapshot。
+            cache.restore_gdn_state(
+                entry=entry,
+                state_slot=seq.state_slot,
+            )
+
+            # 同一请求只在第一次 Prefix-hit Prefill 前恢复。
+            #
+            # 后续 Chunked Prefill 和 Decode 都直接延续
+            # active slot 中的最新状态。
+            seq.prefix_restore_pending = False
 
     def step(
         self,
@@ -689,6 +835,10 @@ class LLMEngine:
 
         if plan.prefill_seqs:
             start = perf_counter()
+
+            self._restore_pending_prefix_states(
+                plan.prefill_seqs
+            )
 
             prefill_token_ids = (
                 self.model_runner.call(

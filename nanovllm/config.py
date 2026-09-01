@@ -86,6 +86,46 @@ class Config:
     # 49.5 MiB 的 GDN states。
     max_new_prefix_snapshots_per_request: int = 1
     
+    # Hybrid Prefix Cache 的逻辑容量预算。
+    #
+    # 同时计算：
+    #     GDN Snapshot bytes
+    #     唯一 pinned KV Block capacity bytes
+    #
+    # 注意：KV Tensor 已经预分配，这里统计的是
+    # 被缓存占用、不能提供给活跃请求的容量。
+    hybrid_prefix_cache_capacity_mib: int = 1024
+    
+    # Prefix Cache 准入策略。
+    #
+    # always：
+    #     每个合法 checkpoint 都立即缓存。
+    #     保持此前行为，主要用于正确性测试。
+    #
+    # frequency：
+    #     先使用CPU中的轻量Hash历史统计出现次数；
+    #     达到 prefix_admission_min_observations 后
+    #     才真正保存 KV blocks 和 GDN Snapshot。
+    prefix_admission_policy: str = "always"
+
+    # frequency策略下，一个Prefix至少被完整计算多少次，
+    # 才允许进入GPU Prefix Cache。
+    #
+    # 设为2时：
+    #
+    # 第一次：记录Hash，不缓存
+    # 第二次：创建Entry
+    # 第三次：真正Prefix Hit
+    prefix_admission_min_observations: int = 2
+
+    # CPU侧最多保存多少个候选Prefix的热度记录。
+    #
+    # 这里只保存：
+    #     PrefixKey
+    #     observation count
+    #
+    # 不保存GPU Tensor和完整KV。
+    prefix_admission_max_candidates: int = 4096
     # Config是dataclass 
     # __post_init__() 是 @dataclass 在自动执行完 __init__() 后调用的初始化hook
     # 但有些初始化工作不能只是赋值 还需要检查参数是否合法 所以不能只用dataclass
@@ -94,6 +134,15 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+        
+        if (
+            self.hybrid_prefix_cache_capacity_mib
+            <= 0
+        ):
+            raise ValueError(
+                "hybrid_prefix_cache_capacity_mib "
+                "must be positive"
+            )
         
         if self.scheduler_policy not in {
             "decode_first",
@@ -127,6 +176,37 @@ class Config:
                 "between 0 and 1"
             )
 
+        supported_admission_policies = {
+            "always",
+            "frequency",
+        }
+
+        if (
+            self.prefix_admission_policy
+            not in supported_admission_policies
+        ):
+            raise ValueError(
+                "prefix_admission_policy must be "
+                "'always' or 'frequency'"
+            )
+
+        if (
+            self.prefix_admission_min_observations
+            <= 0
+        ):
+            raise ValueError(
+                "prefix_admission_min_observations "
+                "must be positive"
+            )
+
+        if (
+            self.prefix_admission_max_candidates
+            <= 0
+        ):
+            raise ValueError(
+                "prefix_admission_max_candidates "
+                "must be positive"
+            )
 
         # 读取完整模型的 config.json
         root_config = AutoConfig.from_pretrained(self.model)

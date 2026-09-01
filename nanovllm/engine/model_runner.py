@@ -299,7 +299,55 @@ class ModelRunner:
             "runtime_peak_extra_bytes": (
                 runtime_peak_extra_bytes
             ),
+            "kv_cache_block_bytes": (
+                self.kv_cache_block_bytes
+            ),
         }
+
+    @property
+    def kv_cache_block_bytes(self) -> int:
+        """
+        一个物理 Paged KV Block 在完整 KV Cache
+        Tensor 中对应的字节数。
+
+        kv_cache shape：
+
+            [
+                2,
+                num_full_attention_layers,
+                num_physical_blocks,
+                block_size,
+                num_kv_heads,
+                head_dim,
+            ]
+        """
+
+        if self.kv_cache.ndim != 6:
+            raise RuntimeError(
+                "KV Cache must have six dimensions"
+            )
+
+        if self.kv_cache.shape[2] <= 0:
+            raise RuntimeError(
+                "KV Cache does not contain any "
+                "physical blocks"
+            )
+
+        # 固定物理 block 维度的下标为 0，
+        # 剩下的 Tensor 正好代表一个完整物理 Block。
+        one_block = self.kv_cache[
+            :,
+            :,
+            0,
+            :,
+            :,
+            :,
+        ]
+
+        return (
+            one_block.numel()
+            * one_block.element_size()
+        )
 
     def exit(self):
         self.release_visual_embedding_cache(

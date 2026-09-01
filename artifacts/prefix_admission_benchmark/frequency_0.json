@@ -1,0 +1,85 @@
+{
+  "policy": "frequency",
+  "repeat_index": 0,
+  "pollution_count": 6,
+  "hot_prompt_tokens": 4618,
+  "checkpoint_tokens": 4096,
+  "expected_hot_suffix_tokens": 522,
+  "warmup_runs": 2,
+  "warmup_results": [
+    {
+      "output_token_ids": [
+        90700
+      ],
+      "prefill_tokens": 4618,
+      "single_token_latency_ms": 730.937632964924
+    },
+    {
+      "output_token_ids": [
+        90700
+      ],
+      "prefill_tokens": 4618,
+      "single_token_latency_ms": 425.2111129462719
+    }
+  ],
+  "pre_pollution_hot": {
+    "output_token_ids": [
+      90700
+    ],
+    "prefill_tokens": 522,
+    "single_token_latency_ms": 68.296167999506
+  },
+  "post_pollution_hot": {
+    "output_token_ids": [
+      90700
+    ],
+    "prefill_tokens": 522,
+    "single_token_latency_ms": 68.41167691163719
+  },
+  "hot_resident_after_pollution": true,
+  "measured_hot_hits": 2,
+  "measured_hot_hit_rate": 1.0,
+  "pollution_total_prefill_tokens": 27726,
+  "pollution_total_latency_ms": 2559.1770746978,
+  "pollution_request_latencies_ms": [
+    426.22299201320857,
+    426.58786999527365,
+    426.4577989233658,
+    426.5871949028224,
+    426.63070594426244,
+    426.69051291886717
+  ],
+  "counters_before_pollution": {
+    "commits": 1,
+    "evictions": 0,
+    "capacity_rejections": 0,
+    "admission_observations": 2,
+    "admission_accepts": 1,
+    "admission_deferrals": 1
+  },
+  "counters_after_pollution": {
+    "commits": 1,
+    "evictions": 0,
+    "capacity_rejections": 0,
+    "admission_observations": 8,
+    "admission_accepts": 1,
+    "admission_deferrals": 7
+  },
+  "counters_after_post_hot": {
+    "commits": 1,
+    "evictions": 0,
+    "capacity_rejections": 0,
+    "admission_observations": 8,
+    "admission_accepts": 1,
+    "admission_deferrals": 7
+  },
+  "commits_during_pollution": 0,
+  "evictions_during_pollution": 0,
+  "deferrals_during_pollution": 6,
+  "commits_pollution_and_post": 0,
+  "evictions_pollution_and_post": 0,
+  "cache_entries_after_post": 1,
+  "cache_capacity_mib_after_post": 153.5,
+  "unique_pinned_kv_blocks_after_post": 16,
+  "admission_candidate_count": 7
+}

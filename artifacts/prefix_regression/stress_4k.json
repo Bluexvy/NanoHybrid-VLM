@@ -1,0 +1,48 @@
+{
+  "snapshot_dtype": "bfloat16",
+  "prompt_tokens": 4609,
+  "checkpoint_tokens": 4096,
+  "suffix_tokens": 513,
+  "output_tokens": 128,
+  "hot_runs": 3,
+  "cold_prefill_tokens": 4609,
+  "hot_prefill_tokens": 513,
+  "skipped_prefill_tokens_per_hit": 4096,
+  "snapshot_bytes": 26738688,
+  "snapshot_mib": 25.5,
+  "cold_elapsed_ms": 3101.1232709279284,
+  "hot_elapsed_ms": [
+    2417.572182021104,
+    2418.5542330378667,
+    2400.9439300280064
+  ],
+  "hot_median_ms": 2417.572182021104,
+  "single_run_e2e_reduction_percent": 22.042048289885948,
+  "token_comparisons": [
+    {
+      "exact_match": true,
+      "matching_tokens": 128,
+      "match_ratio": 1.0,
+      "first_mismatch_index": null
+    },
+    {
+      "exact_match": true,
+      "matching_tokens": 128,
+      "match_ratio": 1.0,
+      "first_mismatch_index": null
+    },
+    {
+      "exact_match": true,
+      "matching_tokens": 128,
+      "match_ratio": 1.0,
+      "first_mismatch_index": null
+    }
+  ],
+  "prefix_hit_requests": 3,
+  "prefix_hit_tokens": 12288,
+  "gdn_restores": 3,
+  "unique_pinned_kv_blocks": 16,
+  "kv_block_bytes": 8388608,
+  "pinned_kv_capacity_bytes": 134217728,
+  "total_prefix_cache_capacity_bytes": 160956416
+}

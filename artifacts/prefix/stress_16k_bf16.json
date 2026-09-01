@@ -1,0 +1,44 @@
+{
+  "snapshot_dtype": "bfloat16",
+  "prompt_tokens": 16915,
+  "checkpoint_tokens": 16384,
+  "suffix_tokens": 531,
+  "output_tokens": 128,
+  "hot_runs": 3,
+  "cold_prefill_tokens": 16915,
+  "hot_prefill_tokens": 531,
+  "skipped_prefill_tokens_per_hit": 16384,
+  "snapshot_bytes": 26738688,
+  "snapshot_mib": 25.5,
+  "cold_elapsed_ms": 4042.0087999664247,
+  "hot_elapsed_ms": [
+    2384.0584779391065,
+    2375.3522330662236,
+    2381.05687208008
+  ],
+  "hot_median_ms": 2381.05687208008,
+  "single_run_e2e_reduction_percent": 41.0922392821149,
+  "token_comparisons": [
+    {
+      "exact_match": true,
+      "matching_tokens": 128,
+      "match_ratio": 1.0,
+      "first_mismatch_index": null
+    },
+    {
+      "exact_match": true,
+      "matching_tokens": 128,
+      "match_ratio": 1.0,
+      "first_mismatch_index": null
+    },
+    {
+      "exact_match": true,
+      "matching_tokens": 128,
+      "match_ratio": 1.0,
+      "first_mismatch_index": null
+    }
+  ],
+  "prefix_hit_requests": 3,
+  "prefix_hit_tokens": 49152,
+  "gdn_restores": 3
+}

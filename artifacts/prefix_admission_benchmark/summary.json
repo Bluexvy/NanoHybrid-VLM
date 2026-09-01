@@ -1,0 +1,16 @@
+{
+  "num_repetitions": 3,
+  "always": {
+    "median_post_pollution_latency_ms": 426.59914202522486,
+    "median_hot_hit_rate": 0.5,
+    "median_evictions_during_pollution": 5.0,
+    "median_commits_during_pollution": 6.0
+  },
+  "frequency": {
+    "median_post_pollution_latency_ms": 68.43135098461062,
+    "median_hot_hit_rate": 1.0,
+    "median_evictions_during_pollution": 0.0,
+    "median_commits_during_pollution": 0.0
+  },
+  "post_pollution_latency_reduction_percent": 83.9588634286179
+}
