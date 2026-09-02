@@ -1,38 +1,41 @@
 from dataclasses import dataclass
+
 import torch
 
 
 @dataclass(slots=True)
 class Context:
+    # Attention/GDN 根据它区分 Prefill 与 Decode。
     is_prefill: bool = False
+
+    # FlashAttention Variable-length Prefill 元数据。
     cu_seqlens_q: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None
     max_seqlen_q: int = 0
     max_seqlen_k: int = 0
+
+    # Paged KV Cache 元数据。
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
-    # Prefill microbatch中每条Sequence
-    # 本轮实际执行的token数量。
+
+    # Variable-length GDN Prefill 元数据。
     #
-    # 例如：
-    #     prefill_seqlens = (5, 3, 7)
+    # prefill_seqlens：
+    #     每条请求当前 Prefill chunk 的长度。
     #
-    # 对应：
-    #     cu_seqlens_q = [0, 5, 8, 15]
-    #
-    # 它保留在CPU上，避免GDN层为了获得序列
-    # 长度而将cu_seqlens_q从GPU同步回CPU。
+    # gdn_cu_seqlens：
+    #     FLA 使用的累积序列边界。
     prefill_seqlens: tuple[int, ...] | None = None
-    # FLA Gated Delta Rule使用的变长边界。
-    #
-    # 数值与cu_seqlens_q相同，但dtype为torch.long。
     gdn_cu_seqlens: torch.Tensor | None = None
+
 
 _CONTEXT = Context()
 
-def get_context():
+
+def get_context() -> Context:
     return _CONTEXT
+
 
 def set_context(
     is_prefill: bool,
@@ -43,12 +46,8 @@ def set_context(
     slot_mapping: torch.Tensor | None = None,
     context_lens: torch.Tensor | None = None,
     block_tables: torch.Tensor | None = None,
-    prefill_seqlens: (
-        tuple[int, ...] | None
-    ) = None,
-    gdn_cu_seqlens: (
-        torch.Tensor | None
-    ) = None,
+    prefill_seqlens: tuple[int, ...] | None = None,
+    gdn_cu_seqlens: torch.Tensor | None = None,
 ) -> None:
     global _CONTEXT
 
@@ -64,7 +63,8 @@ def set_context(
         prefill_seqlens=prefill_seqlens,
         gdn_cu_seqlens=gdn_cu_seqlens,
     )
-    
-def reset_context():
+
+
+def reset_context() -> None:
     global _CONTEXT
     _CONTEXT = Context()

@@ -14,6 +14,10 @@ from nanovllm.engine.hybrid_state import (
     HybridCacheSpec,
     HybridStateManager,
 )
+from nanovllm.engine.hybrid_cuda_graph import (
+    HybridDecodeGraphPolicy,
+    HybridDecodeStaticWorkspace,
+)
 
 class ModelRunner:
     
@@ -142,13 +146,56 @@ class ModelRunner:
 
         self.hybrid_state_manager = None
         
-        if (
-            self.is_hybrid_model
-            and not self.enforce_eager
-        ):
-            raise NotImplementedError(
-                "Qwen3.5 Hybrid Runtime currently "
-                "requires enforce_eager=True"
+        # Hybrid CUDA Graph 路由策略。
+        self.hybrid_graph_policy = None
+
+        # 固定地址输入、输出和 GDN 状态。
+        self.hybrid_graph_workspace = None
+
+        # batch_size -> torch.cuda.CUDAGraph
+        self.hybrid_graphs: dict[
+            int,
+            torch.cuda.CUDAGraph,
+        ] = {}
+
+        # 多张 Graph 共用的 CUDA memory pool handle。
+        self.hybrid_graph_pool = None
+
+        # batch_size -> 模型输入状态列表。
+        #
+        # 列表以全局 Decoder layer 编号索引：
+        # GDN 层保存 GDNLayerState；
+        # Full Attention 层保存 None。
+        self.hybrid_graph_input_states = {}
+
+        # batch_size -> Graph 输出状态列表。
+        self.hybrid_graph_output_states = {}
+
+        # 运行时统计。
+        self.num_hybrid_graph_replays = 0
+        self.num_hybrid_graph_eager_fallbacks = 0
+
+        self.hybrid_graph_fallback_reasons: dict[
+            str,
+            int,
+        ] = {}
+
+        # Capture 前后 torch.cuda.memory_allocated()
+        # 的差值。包括 Workspace 和 Graph 中长期存活
+        # 的一部分 Tensor。
+        self.hybrid_graph_capture_allocated_bytes = 0
+
+        if self.is_hybrid_model:
+            self.hybrid_graph_policy = (
+                HybridDecodeGraphPolicy(
+                    batch_sizes=(
+                        config
+                        .hybrid_cuda_graph_batch_sizes
+                    ),
+                    max_num_seqs=(
+                        config.max_num_seqs
+                    ),
+                )
             )
 
         dist.init_process_group(
@@ -176,9 +223,12 @@ class ModelRunner:
         self.warmup_model()
         # 计算并分配KV cache
         self.allocate_model_caches()
-        # 可选 CUDA Graph 捕获
+
         if not self.enforce_eager:
-            self.capture_cudagraph()
+            if self.is_hybrid_model:
+                self.capture_hybrid_cudagraph()
+            else:
+                self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -361,7 +411,17 @@ class ModelRunner:
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            if self.is_hybrid_model:
+                self.hybrid_graphs.clear()
+                self.hybrid_graph_input_states.clear()
+                self.hybrid_graph_output_states.clear()
+
+                self.hybrid_graph_workspace = None
+                self.hybrid_graph_pool = None
+
+            else:
+                del self.graphs
+                del self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -1570,21 +1630,23 @@ class ModelRunner:
         seqs: list[Sequence],
     ) -> list[int]:
 
-        state_manager = self.hybrid_state_manager
+        state_manager = (
+            self.hybrid_state_manager
+        )
 
         if state_manager is None:
             raise RuntimeError(
-                "HybridStateManager has not been "
-                "allocated"
+                "HybridStateManager has not "
+                "been allocated"
             )
 
-        state_slots = []
+        state_slots: list[int] = []
 
         for seq in seqs:
             if seq.state_slot is None:
                 raise RuntimeError(
-                    f"Sequence {seq.seq_id} does not "
-                    "own a GDN state slot"
+                    f"Sequence {seq.seq_id} does "
+                    "not own a GDN state slot"
                 )
 
             if seq.num_cached_tokens <= 0:
@@ -1593,65 +1655,107 @@ class ModelRunner:
                     "Decode before Prefill completed"
                 )
 
-            if not state_manager.is_slot_initialized(
-                seq.state_slot
+            if not (
+                state_manager
+                .is_slot_initialized(
+                    seq.state_slot
+                )
             ):
                 raise RuntimeError(
-                    f"GDN state slot {seq.state_slot} "
-                    f"for Sequence {seq.seq_id} is "
+                    f"GDN state slot "
+                    f"{seq.state_slot} for "
+                    f"Sequence {seq.seq_id} is "
                     "not initialized"
                 )
 
-            state_slots.append(seq.state_slot)
+            state_slots.append(
+                seq.state_slot
+            )
 
-        # 一次为所有 Decode 请求构造输入。
-        #
-        # input_ids [B]
-        # positions [B]
-        #
-        # Context 中还会保存：
-        # slot_mapping [B]
-        # context_lens [B]
-        # block_tables [B, max_blocks]
-        input_ids, positions = self.prepare_decode(
-            seqs
+        input_ids, positions = (
+            self.prepare_decode(seqs)
         )
 
         try:
-            # 将分散的 state slots Gather 成：
+            # Active state pool：
+            # [num_slots, layer, ...]
             #
-            # 每个 GDN 层：
-            # conv      [B, C, K]
-            # recurrent [B, H, Dk, Dv]
+            # Gather 后：
+            # 每个 GDN layer 对应 [B, ...]
             old_gdn_states = (
-                state_manager.read_batched_states(
+                state_manager
+                .read_batched_states(
                     state_slots
                 )
             )
 
-            # 一次模型前向处理 B 条请求。
-            (
-                hidden_states,
-                updated_gdn_states,
-            ) = self.model(
-                input_ids=input_ids,
-                positions=positions,
-                gdn_states=old_gdn_states,
+            policy = self.hybrid_graph_policy
+
+            if policy is None:
+                raise RuntimeError(
+                    "Hybrid CUDA Graph policy "
+                    "has not been initialized"
+                )
+
+            route = policy.route(
+                batch_size=len(seqs),
+                is_prefill=False,
+                enforce_eager=(
+                    self.enforce_eager
+                ),
             )
 
-            # Decode 时 hidden_states 为 [B, hidden_size]，
-            # 因此 logits 为 [B, vocab_size]。
+            if route.use_graph:
+                (
+                    hidden_states,
+                    updated_gdn_states,
+                ) = self.replay_hybrid_cudagraph(
+                    batch_size=len(seqs),
+                    input_ids=input_ids,
+                    positions=positions,
+                    state_slots=state_slots,
+                    old_gdn_states=(
+                        old_gdn_states
+                    ),
+                )
+
+            else:
+                self.num_hybrid_graph_eager_fallbacks += 1
+
+                old_count = (
+                    self
+                    .hybrid_graph_fallback_reasons
+                    .get(
+                        route.reason,
+                        0,
+                    )
+                )
+
+                self.hybrid_graph_fallback_reasons[
+                    route.reason
+                ] = old_count + 1
+
+                (
+                    hidden_states,
+                    updated_gdn_states,
+                ) = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    gdn_states=old_gdn_states,
+                )
+
+            # 首版 LM Head 不进入 Graph。
             logits = self.model.compute_logits(
                 hidden_states
             )
 
-            # 将 Batch 第 i 行的新状态写回
-            # state_slots[i]。
+            # Graph 和 Eager 共用相同的状态写回逻辑。
             state_manager.write_batched_states(
                 state_slots,
                 updated_gdn_states,
             )
 
+            # 首版 Sampling 不进入 Graph。
             temperatures = self.prepare_sample(
                 seqs
             )
@@ -1665,7 +1769,7 @@ class ModelRunner:
 
         finally:
             reset_context()
-
+            
     def run_hybrid(
         self,
         seqs: list[Sequence],
@@ -1742,6 +1846,443 @@ class ModelRunner:
         reset_context()
 
         return token_ids
+
+    @torch.inference_mode()
+    def run_hybrid_graph_body(
+        self,
+        batch_size: int,
+    ) -> None:
+        """
+        Hybrid CUDA Graph 真正捕获的 GPU 工作。
+
+        注意：
+        - 输入来自固定 Workspace；
+        - 输出复制回固定 Workspace；
+        - LM Head 和 Sampling 不在 Graph 中。
+        """
+
+        workspace = (
+            self.hybrid_graph_workspace
+        )
+
+        if workspace is None:
+            raise RuntimeError(
+                "Hybrid CUDA Graph Workspace "
+                "has not been allocated"
+            )
+
+        input_states = (
+            self.hybrid_graph_input_states.get(
+                batch_size
+            )
+        )
+
+        if input_states is None:
+            raise RuntimeError(
+                "Missing static GDN input states "
+                f"for batch size {batch_size}"
+            )
+
+        (
+            hidden_states,
+            updated_gdn_states,
+        ) = self.model(
+            input_ids=(
+                workspace.input_ids[:batch_size]
+            ),
+            positions=(
+                workspace.positions[
+                    :,
+                    :batch_size,
+                ]
+            ),
+            gdn_states=input_states,
+        )
+
+        # 这里的 copy_ 会被 CUDA Graph 捕获。
+        #
+        # 模型产生的临时输出地址可能位于 Graph
+        # private pool，而 Workspace 输出地址长期固定。
+        workspace.copy_model_outputs(
+            batch_size=batch_size,
+            hidden_states=hidden_states,
+            updated_gdn_states=(
+                updated_gdn_states
+            ),
+        )
+
+    @torch.inference_mode()
+    def capture_hybrid_cudagraph(
+        self,
+    ) -> None:
+        """
+        为配置中的 Hybrid Decode batch sizes
+        捕获 CUDA Graph。
+
+        首版建议只配置：
+            hybrid_cuda_graph_batch_sizes=(1,)
+        """
+
+        spec = self.hybrid_cache_spec
+
+        if spec is None:
+            raise RuntimeError(
+                "Hybrid CUDA Graph requires "
+                "HybridCacheSpec"
+            )
+
+        if self.hybrid_state_manager is None:
+            raise RuntimeError(
+                "Hybrid CUDA Graph requires "
+                "HybridStateManager"
+            )
+
+        batch_sizes = (
+            self.config
+            .hybrid_cuda_graph_batch_sizes
+        )
+
+        max_batch_size = batch_sizes[-1]
+
+        max_num_blocks = (
+            self.config.max_model_len
+            + self.block_size
+            - 1
+        ) // self.block_size
+
+        if (
+            self.config.num_kvcache_blocks
+            < max_batch_size
+        ):
+            raise RuntimeError(
+                "CUDA Graph capture requires at "
+                "least one scratch KV block per "
+                "captured batch row"
+            )
+
+        memory_before = (
+            torch.cuda.memory_allocated(
+                self.rank
+            )
+        )
+
+        workspace = (
+            HybridDecodeStaticWorkspace
+            .allocate(
+                spec=spec,
+                max_batch_size=max_batch_size,
+                max_num_blocks=max_num_blocks,
+                hidden_size=(
+                    self.text_config.hidden_size
+                ),
+                device=f"cuda:{self.rank}",
+            )
+        )
+
+        # Capture 的虚拟 Decode 从确定的零状态开始。
+        workspace.gdn_conv_states.zero_()
+        workspace.gdn_recurrent_states.zero_()
+        workspace.updated_gdn_conv_states.zero_()
+        workspace.updated_gdn_recurrent_states.zero_()
+        workspace.hidden_states.zero_()
+
+        self.hybrid_graph_workspace = (
+            workspace
+        )
+
+        self.hybrid_graphs = {}
+        self.hybrid_graph_pool = None
+        self.hybrid_graph_input_states = {}
+        self.hybrid_graph_output_states = {}
+
+        # 和原 nano-vLLM 一样，从大 batch 向小 batch
+        # 捕获，便于共享 Graph memory pool。
+        for batch_size in reversed(
+            batch_sizes
+        ):
+            # ---------------------------------
+            # 构造合法的虚拟 Decode metadata
+            # ---------------------------------
+
+            workspace.input_ids[
+                :batch_size
+            ].zero_()
+
+            workspace.positions[
+                :,
+                :batch_size,
+            ].zero_()
+
+            # 第 i 条虚拟请求使用第 i 个物理 KV block。
+            scratch_block_ids = torch.arange(
+                batch_size,
+                dtype=torch.int32,
+                device=workspace.device,
+            )
+
+            workspace.slot_mapping.fill_(-1)
+
+            workspace.slot_mapping[
+                :batch_size
+            ].copy_(
+                scratch_block_ids
+                * self.block_size
+            )
+
+            workspace.context_lens.zero_()
+
+            # 每条 Capture 请求当前上下文只有一个 token。
+            workspace.context_lens[
+                :batch_size
+            ].fill_(1)
+
+            workspace.block_tables.fill_(-1)
+
+            workspace.block_tables[
+                :batch_size,
+                0,
+            ].copy_(
+                scratch_block_ids
+            )
+
+            workspace.state_slot_ids.fill_(-1)
+
+            workspace.state_slot_ids[
+                :batch_size
+            ].copy_(
+                torch.arange(
+                    batch_size,
+                    dtype=torch.long,
+                    device=workspace.device,
+                )
+            )
+
+            input_states = (
+                workspace.input_gdn_state_views(
+                    batch_size
+                )
+            )
+
+            output_states = (
+                workspace.output_gdn_state_views(
+                    batch_size
+                )
+            )
+
+            self.hybrid_graph_input_states[
+                batch_size
+            ] = input_states
+
+            self.hybrid_graph_output_states[
+                batch_size
+            ] = output_states
+
+            # Attention.forward() 在 Capture 时通过
+            # Context 取得这些固定地址。
+            set_context(
+                is_prefill=False,
+                slot_mapping=(
+                    workspace.slot_mapping[
+                        :batch_size
+                    ]
+                ),
+                context_lens=(
+                    workspace.context_lens[
+                        :batch_size
+                    ]
+                ),
+                block_tables=(
+                    workspace.block_tables[
+                        :batch_size
+                    ]
+                ),
+            )
+
+            try:
+                # -----------------------------
+                # 在非默认 Stream 上预热
+                # -----------------------------
+
+                warmup_stream = (
+                    torch.cuda.Stream(
+                        device=self.rank
+                    )
+                )
+
+                warmup_stream.wait_stream(
+                    torch.cuda.current_stream(
+                        self.rank
+                    )
+                )
+
+                with torch.cuda.stream(
+                    warmup_stream
+                ):
+                    for _ in range(3):
+                        self.run_hybrid_graph_body(
+                            batch_size
+                        )
+
+                torch.cuda.current_stream(
+                    self.rank
+                ).wait_stream(
+                    warmup_stream
+                )
+
+                torch.cuda.synchronize(
+                    self.rank
+                )
+
+                # -----------------------------
+                # 捕获真正的 CUDA Graph
+                # -----------------------------
+
+                graph = torch.cuda.CUDAGraph()
+
+                with torch.cuda.graph(
+                    graph,
+                    self.hybrid_graph_pool,
+                ):
+                    self.run_hybrid_graph_body(
+                        batch_size
+                    )
+
+                if self.hybrid_graph_pool is None:
+                    self.hybrid_graph_pool = (
+                        graph.pool()
+                    )
+
+                self.hybrid_graphs[
+                    batch_size
+                ] = graph
+
+                torch.cuda.synchronize(
+                    self.rank
+                )
+
+            finally:
+                reset_context()
+
+        memory_after = (
+            torch.cuda.memory_allocated(
+                self.rank
+            )
+        )
+
+        self.hybrid_graph_capture_allocated_bytes = (
+            max(
+                0,
+                memory_after - memory_before,
+            )
+        )
+
+    @torch.inference_mode()
+    def replay_hybrid_cudagraph(
+        self,
+        *,
+        batch_size: int,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        state_slots: list[int],
+        old_gdn_states,
+    ):
+        """
+        把本轮动态 Decode 数据复制进固定 Workspace，
+        然后 Replay 对应 batch size 的 Graph。
+        """
+
+        workspace = (
+            self.hybrid_graph_workspace
+        )
+
+        if workspace is None:
+            raise RuntimeError(
+                "Hybrid CUDA Graph Workspace "
+                "has not been allocated"
+            )
+
+        graph = self.hybrid_graphs.get(
+            batch_size
+        )
+
+        if graph is None:
+            raise RuntimeError(
+                "No captured Hybrid CUDA Graph "
+                f"for batch size {batch_size}"
+            )
+
+        dynamic_context = get_context()
+
+        if (
+            dynamic_context.slot_mapping is None
+            or dynamic_context.context_lens is None
+            or dynamic_context.block_tables is None
+        ):
+            raise RuntimeError(
+                "prepare_decode() did not create "
+                "complete Paged KV metadata"
+            )
+
+        workspace.copy_decode_inputs(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=(
+                dynamic_context.slot_mapping
+            ),
+            context_lens=(
+                dynamic_context.context_lens
+            ),
+            block_tables=(
+                dynamic_context.block_tables
+            ),
+            state_slot_ids=state_slots,
+            gdn_states=old_gdn_states,
+        )
+
+        # Context 切换到 Capture 时使用的固定地址。
+        #
+        # Replay 本身不会重新执行 Python，
+        # 但这样可以保证当前逻辑 Context 与 Graph
+        # 中记录的 Tensor 完全一致。
+        set_context(
+            is_prefill=False,
+            slot_mapping=(
+                workspace.slot_mapping[
+                    :batch_size
+                ]
+            ),
+            context_lens=(
+                workspace.context_lens[
+                    :batch_size
+                ]
+            ),
+            block_tables=(
+                workspace.block_tables[
+                    :batch_size
+                ]
+            ),
+        )
+
+        graph.replay()
+
+        self.num_hybrid_graph_replays += 1
+
+        hidden_states = (
+            workspace.hidden_states[
+                :batch_size
+            ]
+        )
+
+        updated_gdn_states = (
+            self.hybrid_graph_output_states[
+                batch_size
+            ]
+        )
+
+        return (
+            hidden_states,
+            updated_gdn_states,
+        )
 
     @torch.inference_mode()
     def capture_cudagraph(self):

@@ -26,6 +26,18 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    # Qwen3.5 Hybrid Decode 需要捕获的固定 batch size。
+    #
+    # 首版只捕获 B=1，控制静态 GDN Workspace
+    # 和 CUDA Graph private pool 的显存开销。
+    #
+    # 正确性和收益验证完成后，可以逐步扩展为：
+    #     (1, 2, 4, 8)
+    hybrid_cuda_graph_batch_sizes: tuple[int, ...] = (
+        1,
+    )
+    
+
     # 完整模型的根配置
     hf_config: PretrainedConfig | None = None
     # 语言模型部分的配置
@@ -134,6 +146,68 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+        
+        graph_batch_sizes = (
+            self.hybrid_cuda_graph_batch_sizes
+        )
+
+        if not isinstance(
+            graph_batch_sizes,
+            (tuple, list),
+        ):
+            raise TypeError(
+                "hybrid_cuda_graph_batch_sizes "
+                "must be a tuple or list of integers"
+            )
+
+        graph_batch_sizes = tuple(
+            graph_batch_sizes
+        )
+
+        if not graph_batch_sizes:
+            raise ValueError(
+                "hybrid_cuda_graph_batch_sizes "
+                "must not be empty"
+            )
+
+        if any(
+            (
+                not isinstance(batch_size, int)
+                or isinstance(batch_size, bool)
+            )
+            for batch_size in graph_batch_sizes
+        ):
+            raise TypeError(
+                "Every hybrid CUDA Graph batch "
+                "size must be an integer"
+            )
+
+        if any(
+            batch_size <= 0
+            for batch_size in graph_batch_sizes
+        ):
+            raise ValueError(
+                "Every hybrid CUDA Graph batch "
+                "size must be positive"
+            )
+
+        if tuple(
+            sorted(set(graph_batch_sizes))
+        ) != graph_batch_sizes:
+            raise ValueError(
+                "hybrid_cuda_graph_batch_sizes "
+                "must be unique and strictly increasing"
+            )
+
+        if graph_batch_sizes[-1] > self.max_num_seqs:
+            raise ValueError(
+                "The largest hybrid CUDA Graph batch "
+                "size must not exceed max_num_seqs"
+            )
+
+        self.hybrid_cuda_graph_batch_sizes = (
+            graph_batch_sizes
+        )
         
         if (
             self.hybrid_prefix_cache_capacity_mib
