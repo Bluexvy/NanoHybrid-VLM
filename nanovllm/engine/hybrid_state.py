@@ -892,6 +892,271 @@ class HybridStateManager:
 
         return states
 
+    @torch.inference_mode()
+    def gather_batched_states_for_graph(
+        self,
+        slot_indices: torch.Tensor,
+    ) -> list[GDNLayerState | None]:
+        """
+        在 CUDA Graph 内，根据固定地址的 GPU
+        state_slot_ids，从 active state pool Gather
+        本轮 Decode 请求的 GDN 状态。
+
+        使用条件：
+        - 只用于 Decode；
+        - 所有 slot 已经初始化；
+        - slot_indices 位于 GPU；
+        - slot_indices 的地址固定，但内容可在 replay 前更新。
+        """
+
+        if slot_indices.ndim != 1:
+            raise ValueError(
+                "slot_indices must have shape [B]"
+            )
+
+        if slot_indices.numel() <= 0:
+            raise ValueError(
+                "slot_indices must not be empty"
+            )
+
+        if slot_indices.dtype != torch.long:
+            raise TypeError(
+                "slot_indices must use torch.long"
+            )
+
+        if slot_indices.device != self.device:
+            raise ValueError(
+                "slot_indices must be on the same "
+                "device as the GDN state pool"
+            )
+
+        # 一次性从状态池 Gather 全部 GDN 层。
+        #
+        # conv_state_pool:
+        # [num_slots, num_gdn_layers, C, K]
+        #
+        # Gather 后：
+        # [B, num_gdn_layers, C, K]
+        batched_conv_states = torch.index_select(
+            self.conv_state_pool,
+            dim=0,
+            index=slot_indices,
+        )
+
+        # recurrent_state_pool:
+        # [num_slots, num_gdn_layers, H, Dk, Dv]
+        #
+        # Gather 后：
+        # [B, num_gdn_layers, H, Dk, Dv]
+        batched_recurrent_states = (
+            torch.index_select(
+                self.recurrent_state_pool,
+                dim=0,
+                index=slot_indices,
+            )
+        )
+
+        states: list[
+            GDNLayerState | None
+        ] = [
+            None
+            for _ in range(
+                self.spec.num_hidden_layers
+            )
+        ]
+
+        # 把紧凑 GDN layer 维度重新映射到
+        # 全局 Decoder layer 编号。
+        for (
+            gdn_index,
+            global_layer_idx,
+        ) in enumerate(
+            self.spec.gdn_layer_indices
+        ):
+            states[global_layer_idx] = (
+                GDNLayerState(
+                    conv_state=(
+                        batched_conv_states[
+                            :,
+                            gdn_index,
+                        ]
+                    ),
+                    recurrent_state=(
+                        batched_recurrent_states[
+                            :,
+                            gdn_index,
+                        ]
+                    ),
+                )
+            )
+
+        return states
+
+    @torch.inference_mode()
+    def scatter_batched_states_for_graph(
+        self,
+        slot_indices: torch.Tensor,
+        states: list[
+            GDNLayerState | None
+        ],
+    ) -> None:
+        """
+        在 CUDA Graph 内，把 Decode 更新后的
+        GDN 状态 Scatter 回 active state pool。
+
+        initialized_slots 是 CPU 侧生命周期信息，
+        不在 CUDA Graph 内修改。Decode 请求进入
+        这里以前必须已经完成初始化。
+        """
+
+        if slot_indices.ndim != 1:
+            raise ValueError(
+                "slot_indices must have shape [B]"
+            )
+
+        if slot_indices.numel() <= 0:
+            raise ValueError(
+                "slot_indices must not be empty"
+            )
+
+        if slot_indices.dtype != torch.long:
+            raise TypeError(
+                "slot_indices must use torch.long"
+            )
+
+        if slot_indices.device != self.device:
+            raise ValueError(
+                "slot_indices must be on the same "
+                "device as the GDN state pool"
+            )
+
+        batch_size = slot_indices.shape[0]
+
+        if (
+            len(states)
+            != self.spec.num_hidden_layers
+        ):
+            raise ValueError(
+                "states must contain one entry "
+                "per Decoder layer"
+            )
+
+        expected_conv_shape = (
+            batch_size,
+            self.spec.conv_dim,
+            self.spec.conv_kernel_size,
+        )
+
+        expected_recurrent_shape = (
+            batch_size,
+            self.spec.num_gdn_value_heads,
+            self.spec.gdn_key_head_dim,
+            self.spec.gdn_value_head_dim,
+        )
+
+        # Full Attention 层不应该返回 GDN 状态。
+        for global_layer_idx in (
+            self.spec.full_attention_layer_indices
+        ):
+            if states[global_layer_idx] is not None:
+                raise ValueError(
+                    "Full Attention layer "
+                    f"{global_layer_idx} returned "
+                    "a GDN state"
+                )
+
+        for (
+            gdn_index,
+            global_layer_idx,
+        ) in enumerate(
+            self.spec.gdn_layer_indices
+        ):
+            state = states[global_layer_idx]
+
+            if (
+                state is None
+                or state.conv_state is None
+                or state.recurrent_state is None
+            ):
+                raise ValueError(
+                    "GDN layer "
+                    f"{global_layer_idx} did not "
+                    "return complete state"
+                )
+
+            if (
+                tuple(state.conv_state.shape)
+                != expected_conv_shape
+            ):
+                raise ValueError(
+                    "Invalid Graph conv_state shape "
+                    f"for layer {global_layer_idx}: "
+                    f"{tuple(state.conv_state.shape)}"
+                )
+
+            if (
+                tuple(state.recurrent_state.shape)
+                != expected_recurrent_shape
+            ):
+                raise ValueError(
+                    "Invalid Graph recurrent_state "
+                    f"shape for layer "
+                    f"{global_layer_idx}: "
+                    f"{tuple(state.recurrent_state.shape)}"
+                )
+
+            if state.conv_state.device != self.device:
+                raise ValueError(
+                    "Graph conv_state is on the "
+                    "wrong device"
+                )
+
+            if (
+                state.recurrent_state.device
+                != self.device
+            ):
+                raise ValueError(
+                    "Graph recurrent_state is on "
+                    "the wrong device"
+                )
+
+            if (
+                state.conv_state.dtype
+                != self.spec.conv_dtype
+            ):
+                raise TypeError(
+                    "Graph conv_state has the "
+                    "wrong dtype"
+                )
+
+            if (
+                state.recurrent_state.dtype
+                != self.spec.recurrent_dtype
+            ):
+                raise TypeError(
+                    "Graph recurrent_state must "
+                    "use the active FP32 dtype"
+                )
+
+            # 把 batch 第 i 行写回
+            # slot_indices[i] 对应的状态槽。
+            self.conv_state_pool[
+                :,
+                gdn_index,
+            ].index_copy_(
+                dim=0,
+                index=slot_indices,
+                source=state.conv_state,
+            )
+
+            self.recurrent_state_pool[
+                :,
+                gdn_index,
+            ].index_copy_(
+                dim=0,
+                index=slot_indices,
+                source=state.recurrent_state,
+            )
 
     def write_states(
         self,

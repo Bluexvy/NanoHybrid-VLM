@@ -5,10 +5,8 @@ from dataclasses import dataclass
 import torch
 
 from nanovllm.engine.hybrid_state import (
-    GDNLayerState,
     HybridCacheSpec,
 )
-
 
 @dataclass(slots=True)
 class HybridDecodeStaticWorkspace:
@@ -38,18 +36,6 @@ class HybridDecodeStaticWorkspace:
 
     # GDN 请求状态槽编号。
     state_slot_ids: torch.Tensor
-
-    # Graph 使用的 GDN 输入状态。
-    #
-    # [max_batch, num_gdn_layers, C, K]
-    gdn_conv_states: torch.Tensor
-
-    # [max_batch, num_gdn_layers, H, Dk, Dv]
-    gdn_recurrent_states: torch.Tensor
-
-    # Graph 输出状态。
-    updated_gdn_conv_states: torch.Tensor
-    updated_gdn_recurrent_states: torch.Tensor
 
     # Graph 最终 Decoder hidden states。
     hidden_states: torch.Tensor
@@ -135,47 +121,6 @@ class HybridDecodeStaticWorkspace:
             device=normalized_device,
         )
 
-        gdn_conv_shape = (
-            max_batch_size,
-            spec.num_gdn_layers,
-            spec.conv_dim,
-            spec.conv_kernel_size,
-        )
-
-        gdn_recurrent_shape = (
-            max_batch_size,
-            spec.num_gdn_layers,
-            spec.num_gdn_value_heads,
-            spec.gdn_key_head_dim,
-            spec.gdn_value_head_dim,
-        )
-
-        gdn_conv_states = torch.empty(
-            gdn_conv_shape,
-            dtype=spec.conv_dtype,
-            device=normalized_device,
-        )
-
-        gdn_recurrent_states = torch.empty(
-            gdn_recurrent_shape,
-            dtype=spec.recurrent_dtype,
-            device=normalized_device,
-        )
-
-        updated_gdn_conv_states = torch.empty(
-            gdn_conv_shape,
-            dtype=spec.conv_dtype,
-            device=normalized_device,
-        )
-
-        updated_gdn_recurrent_states = (
-            torch.empty(
-                gdn_recurrent_shape,
-                dtype=spec.recurrent_dtype,
-                device=normalized_device,
-            )
-        )
-
         hidden_states = torch.empty(
             max_batch_size,
             hidden_size,
@@ -195,16 +140,6 @@ class HybridDecodeStaticWorkspace:
             context_lens=context_lens,
             block_tables=block_tables,
             state_slot_ids=state_slot_ids,
-            gdn_conv_states=gdn_conv_states,
-            gdn_recurrent_states=(
-                gdn_recurrent_states
-            ),
-            updated_gdn_conv_states=(
-                updated_gdn_conv_states
-            ),
-            updated_gdn_recurrent_states=(
-                updated_gdn_recurrent_states
-            ),
             hidden_states=hidden_states,
         )
 
@@ -223,108 +158,6 @@ class HybridDecodeStaticWorkspace:
                 f"got {batch_size}"
             )
 
-    def input_gdn_state_views(
-        self,
-        batch_size: int,
-    ) -> list[GDNLayerState | None]:
-        """
-        把紧凑 GDN Tensor 转换成模型需要的：
-
-            list[GDNLayerState | None]
-
-        列表长度等于全部 Decoder 层数。
-
-        Full Attention 层对应 None；
-        GDN 层对应固定地址 Tensor View。
-        """
-
-        self.validate_batch_size(
-            batch_size
-        )
-
-        states: list[
-            GDNLayerState | None
-        ] = [
-            None
-            for _ in range(
-                self.spec.num_hidden_layers
-            )
-        ]
-
-        for (
-            gdn_index,
-            global_layer_idx,
-        ) in enumerate(
-            self.spec.gdn_layer_indices
-        ):
-            states[global_layer_idx] = (
-                GDNLayerState(
-                    conv_state=(
-                        self.gdn_conv_states[
-                            :batch_size,
-                            gdn_index,
-                        ]
-                    ),
-                    recurrent_state=(
-                        self.gdn_recurrent_states[
-                            :batch_size,
-                            gdn_index,
-                        ]
-                    ),
-                )
-            )
-
-        return states
-
-    def output_gdn_state_views(
-        self,
-        batch_size: int,
-    ) -> list[GDNLayerState | None]:
-        """
-        返回 Graph 输出状态的固定地址 View。
-
-        之后可以直接交给：
-            HybridStateManager.write_batched_states()
-        """
-
-        self.validate_batch_size(
-            batch_size
-        )
-
-        states: list[
-            GDNLayerState | None
-        ] = [
-            None
-            for _ in range(
-                self.spec.num_hidden_layers
-            )
-        ]
-
-        for (
-            gdn_index,
-            global_layer_idx,
-        ) in enumerate(
-            self.spec.gdn_layer_indices
-        ):
-            states[global_layer_idx] = (
-                GDNLayerState(
-                    conv_state=(
-                        self.updated_gdn_conv_states[
-                            :batch_size,
-                            gdn_index,
-                        ]
-                    ),
-                    recurrent_state=(
-                        self
-                        .updated_gdn_recurrent_states[
-                            :batch_size,
-                            gdn_index,
-                        ]
-                    ),
-                )
-            )
-
-        return states
 
     @torch.inference_mode()
     def copy_decode_inputs(
@@ -336,9 +169,6 @@ class HybridDecodeStaticWorkspace:
         context_lens: torch.Tensor,
         block_tables: torch.Tensor,
         state_slot_ids: list[int],
-        gdn_states: list[
-            GDNLayerState | None
-        ],
     ) -> int:
         """
         把一轮 Eager 准备出的 Decode 数据复制到
@@ -425,15 +255,6 @@ class HybridDecodeStaticWorkspace:
                 "non-negative integers"
             )
 
-        if (
-            len(gdn_states)
-            != self.spec.num_hidden_layers
-        ):
-            raise ValueError(
-                "gdn_states must contain one "
-                "entry per Decoder layer"
-            )
-
         # 清理小型 metadata Buffer，防止上一轮
         # 较长 block table 的尾部残留。
         self.input_ids.zero_()
@@ -491,176 +312,7 @@ class HybridDecodeStaticWorkspace:
             slot_tensor
         )
 
-        # 把 Eager Gather 得到的状态复制进
-        # Graph 固定输入状态。
-        for (
-            gdn_index,
-            global_layer_idx,
-        ) in enumerate(
-            self.spec.gdn_layer_indices
-        ):
-            state = gdn_states[
-                global_layer_idx
-            ]
-
-            if (
-                state is None
-                or state.conv_state is None
-                or state.recurrent_state is None
-            ):
-                raise ValueError(
-                    f"GDN layer {global_layer_idx} "
-                    "is missing input state"
-                )
-
-            expected_conv_shape = (
-                batch_size,
-                self.spec.conv_dim,
-                self.spec.conv_kernel_size,
-            )
-
-            expected_recurrent_shape = (
-                batch_size,
-                self.spec.num_gdn_value_heads,
-                self.spec.gdn_key_head_dim,
-                self.spec.gdn_value_head_dim,
-            )
-
-            if (
-                tuple(state.conv_state.shape)
-                != expected_conv_shape
-            ):
-                raise ValueError(
-                    "Invalid conv state shape for "
-                    f"layer {global_layer_idx}: "
-                    f"{tuple(state.conv_state.shape)}"
-                )
-
-            if (
-                tuple(
-                    state.recurrent_state.shape
-                )
-                != expected_recurrent_shape
-            ):
-                raise ValueError(
-                    "Invalid recurrent state shape "
-                    f"for layer {global_layer_idx}: "
-                    f"{tuple(state.recurrent_state.shape)}"
-                )
-
-            if (
-                state.conv_state.dtype
-                != self.spec.conv_dtype
-            ):
-                raise TypeError(
-                    "Graph conv input has the "
-                    "wrong dtype"
-                )
-
-            if (
-                state.recurrent_state.dtype
-                != self.spec.recurrent_dtype
-            ):
-                raise TypeError(
-                    "Graph recurrent input must "
-                    "use FP32"
-                )
-
-            self.gdn_conv_states[
-                :batch_size,
-                gdn_index,
-            ].copy_(
-                state.conv_state
-            )
-
-            self.gdn_recurrent_states[
-                :batch_size,
-                gdn_index,
-            ].copy_(
-                state.recurrent_state
-            )
-
         return batch_size
-
-    @torch.inference_mode()
-    def copy_model_outputs(
-        self,
-        *,
-        batch_size: int,
-        hidden_states: torch.Tensor,
-        updated_gdn_states: list[
-            GDNLayerState | None
-        ],
-    ) -> None:
-        """
-        在 Capture 区域中调用。
-
-        将模型产生的临时 Tensor 复制到长期存在的
-        Graph 输出 Buffer。GPU copy_ 会被 Graph 记录。
-        """
-
-        self.validate_batch_size(
-            batch_size
-        )
-
-        if hidden_states.shape != (
-            batch_size,
-            self.hidden_size,
-        ):
-            raise ValueError(
-                "hidden_states must have shape "
-                f"[{batch_size}, "
-                f"{self.hidden_size}]"
-            )
-
-        if (
-            len(updated_gdn_states)
-            != self.spec.num_hidden_layers
-        ):
-            raise ValueError(
-                "updated_gdn_states must contain "
-                "one entry per Decoder layer"
-            )
-
-        self.hidden_states[
-            :batch_size
-        ].copy_(
-            hidden_states
-        )
-
-        for (
-            gdn_index,
-            global_layer_idx,
-        ) in enumerate(
-            self.spec.gdn_layer_indices
-        ):
-            state = updated_gdn_states[
-                global_layer_idx
-            ]
-
-            if (
-                state is None
-                or state.conv_state is None
-                or state.recurrent_state is None
-            ):
-                raise ValueError(
-                    f"GDN layer {global_layer_idx} "
-                    "is missing output state"
-                )
-
-            self.updated_gdn_conv_states[
-                :batch_size,
-                gdn_index,
-            ].copy_(
-                state.conv_state
-            )
-
-            self.updated_gdn_recurrent_states[
-                :batch_size,
-                gdn_index,
-            ].copy_(
-                state.recurrent_state
-            )
 
     @property
     def allocated_bytes(self) -> int:
@@ -671,10 +323,6 @@ class HybridDecodeStaticWorkspace:
             self.context_lens,
             self.block_tables,
             self.state_slot_ids,
-            self.gdn_conv_states,
-            self.gdn_recurrent_states,
-            self.updated_gdn_conv_states,
-            self.updated_gdn_recurrent_states,
             self.hidden_states,
         )
 
@@ -709,22 +357,6 @@ class HybridDecodeStaticWorkspace:
             ),
             "state_slot_ids": (
                 self.state_slot_ids.data_ptr()
-            ),
-            "gdn_conv_states": (
-                self.gdn_conv_states.data_ptr()
-            ),
-            "gdn_recurrent_states": (
-                self.gdn_recurrent_states
-                .data_ptr()
-            ),
-            "updated_gdn_conv_states": (
-                self.updated_gdn_conv_states
-                .data_ptr()
-            ),
-            "updated_gdn_recurrent_states": (
-                self
-                .updated_gdn_recurrent_states
-                .data_ptr()
             ),
             "hidden_states": (
                 self.hidden_states.data_ptr()

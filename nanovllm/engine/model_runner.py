@@ -161,16 +161,6 @@ class ModelRunner:
         # 多张 Graph 共用的 CUDA memory pool handle。
         self.hybrid_graph_pool = None
 
-        # batch_size -> 模型输入状态列表。
-        #
-        # 列表以全局 Decoder layer 编号索引：
-        # GDN 层保存 GDNLayerState；
-        # Full Attention 层保存 None。
-        self.hybrid_graph_input_states = {}
-
-        # batch_size -> Graph 输出状态列表。
-        self.hybrid_graph_output_states = {}
-
         # 运行时统计。
         self.num_hybrid_graph_replays = 0
         self.num_hybrid_graph_eager_fallbacks = 0
@@ -413,8 +403,6 @@ class ModelRunner:
         if not self.enforce_eager:
             if self.is_hybrid_model:
                 self.hybrid_graphs.clear()
-                self.hybrid_graph_input_states.clear()
-                self.hybrid_graph_output_states.clear()
 
                 self.hybrid_graph_workspace = None
                 self.hybrid_graph_pool = None
@@ -1677,18 +1665,6 @@ class ModelRunner:
         )
 
         try:
-            # Active state pool：
-            # [num_slots, layer, ...]
-            #
-            # Gather 后：
-            # 每个 GDN layer 对应 [B, ...]
-            old_gdn_states = (
-                state_manager
-                .read_batched_states(
-                    state_slots
-                )
-            )
-
             policy = self.hybrid_graph_policy
 
             if policy is None:
@@ -1706,17 +1682,17 @@ class ModelRunner:
             )
 
             if route.use_graph:
-                (
-                    hidden_states,
-                    updated_gdn_states,
-                ) = self.replay_hybrid_cudagraph(
-                    batch_size=len(seqs),
-                    input_ids=input_ids,
-                    positions=positions,
-                    state_slots=state_slots,
-                    old_gdn_states=(
-                        old_gdn_states
-                    ),
+                # Graph 路径：
+                #
+                # Gather、模型执行和 Scatter
+                # 都在 captured CUDA Graph 内完成。
+                hidden_states = (
+                    self.replay_hybrid_cudagraph(
+                        batch_size=len(seqs),
+                        input_ids=input_ids,
+                        positions=positions,
+                        state_slots=state_slots,
+                    )
                 )
 
             else:
@@ -1735,6 +1711,15 @@ class ModelRunner:
                     route.reason
                 ] = old_count + 1
 
+                # Eager 路径仍然使用原来的
+                # Python list[int] Gather 接口。
+                old_gdn_states = (
+                    state_manager
+                    .read_batched_states(
+                        state_slots
+                    )
+                )
+
                 (
                     hidden_states,
                     updated_gdn_states,
@@ -1744,15 +1729,16 @@ class ModelRunner:
                     gdn_states=old_gdn_states,
                 )
 
-            # 首版 LM Head 不进入 Graph。
+                # Eager 模型执行不包含 Scatter，
+                # 因此仍然需要显式写回状态池。
+                state_manager.write_batched_states(
+                    state_slots,
+                    updated_gdn_states,
+                )
+
+            # LM Head 暂时不进入 Graph。
             logits = self.model.compute_logits(
                 hidden_states
-            )
-
-            # Graph 和 Eager 共用相同的状态写回逻辑。
-            state_manager.write_batched_states(
-                state_slots,
-                updated_gdn_states,
             )
 
             # 首版 Sampling 不进入 Graph。
@@ -1855,10 +1841,13 @@ class ModelRunner:
         """
         Hybrid CUDA Graph 真正捕获的 GPU 工作。
 
-        注意：
-        - 输入来自固定 Workspace；
-        - 输出复制回固定 Workspace；
-        - LM Head 和 Sampling 不在 Graph 中。
+        捕获内容：
+        1. 根据固定地址 state_slot_ids Gather GDN 状态；
+        2. 执行 Qwen3.5 Hybrid Decode；
+        3. 将更新后的 GDN 状态 Scatter 回状态池；
+        4. 保存 Decoder hidden states。
+
+        LM Head 和 Sampling 暂时仍在 Graph 外。
         """
 
         workspace = (
@@ -1871,24 +1860,45 @@ class ModelRunner:
                 "has not been allocated"
             )
 
-        input_states = (
-            self.hybrid_graph_input_states.get(
-                batch_size
-            )
+        state_manager = (
+            self.hybrid_state_manager
         )
 
-        if input_states is None:
+        if state_manager is None:
             raise RuntimeError(
-                "Missing static GDN input states "
-                f"for batch size {batch_size}"
+                "HybridStateManager has not "
+                "been allocated"
             )
+
+        # 这个 Tensor 的地址在 Capture 和 Replay
+        # 期间不变，但其中保存的 slot ID 会在每次
+        # Replay 前根据真实请求更新。
+        slot_indices = (
+            workspace.state_slot_ids[
+                :batch_size
+            ]
+        )
+
+        # Graph 内 Gather：
+        #
+        # active state pool
+        #     -> 按 slot_indices 选择请求
+        #     -> 连续的 batch GDN states
+        input_states = (
+            state_manager
+            .gather_batched_states_for_graph(
+                slot_indices
+            )
+        )
 
         (
             hidden_states,
             updated_gdn_states,
         ) = self.model(
             input_ids=(
-                workspace.input_ids[:batch_size]
+                workspace.input_ids[
+                    :batch_size
+                ]
             ),
             positions=(
                 workspace.positions[
@@ -1899,16 +1909,22 @@ class ModelRunner:
             gdn_states=input_states,
         )
 
-        # 这里的 copy_ 会被 CUDA Graph 捕获。
+        # Graph 内 Scatter：
         #
-        # 模型产生的临时输出地址可能位于 Graph
-        # private pool，而 Workspace 输出地址长期固定。
-        workspace.copy_model_outputs(
-            batch_size=batch_size,
-            hidden_states=hidden_states,
-            updated_gdn_states=(
-                updated_gdn_states
-            ),
+        # updated batch GDN states
+        #     -> 根据相同 slot_indices
+        #     -> 写回 active state pool
+        state_manager.scatter_batched_states_for_graph(
+            slot_indices,
+            updated_gdn_states,
+        )
+
+        # LM Head 仍在 Graph 外执行，因此保留一份
+        # 固定地址的 hidden_states 输出。
+        workspace.hidden_states[
+            :batch_size
+        ].copy_(
+            hidden_states
         )
 
     @torch.inference_mode()
@@ -1980,10 +1996,6 @@ class ModelRunner:
         )
 
         # Capture 的虚拟 Decode 从确定的零状态开始。
-        workspace.gdn_conv_states.zero_()
-        workspace.gdn_recurrent_states.zero_()
-        workspace.updated_gdn_conv_states.zero_()
-        workspace.updated_gdn_recurrent_states.zero_()
         workspace.hidden_states.zero_()
 
         self.hybrid_graph_workspace = (
@@ -1992,8 +2004,6 @@ class ModelRunner:
 
         self.hybrid_graphs = {}
         self.hybrid_graph_pool = None
-        self.hybrid_graph_input_states = {}
-        self.hybrid_graph_output_states = {}
 
         # 和原 nano-vLLM 一样，从大 batch 向小 batch
         # 捕获，便于共享 Graph memory pool。
@@ -2046,7 +2056,15 @@ class ModelRunner:
             )
 
             workspace.state_slot_ids.fill_(-1)
-
+            
+            # Graph Capture 使用 slot 0...B-1
+            # 作为虚拟请求状态槽。
+            #
+            # 状态池由 torch.empty() 分配，因此捕获
+            # 前必须初始化，避免读取未定义值。
+            #
+            # 这里只发生在 Engine 初始化期间，
+            # 此时还没有真实请求占用 state slot。
             workspace.state_slot_ids[
                 :batch_size
             ].copy_(
@@ -2056,26 +2074,14 @@ class ModelRunner:
                     device=workspace.device,
                 )
             )
+            self.hybrid_state_manager.conv_state_pool[
+                :batch_size
+            ].zero_()
 
-            input_states = (
-                workspace.input_gdn_state_views(
-                    batch_size
-                )
-            )
+            self.hybrid_state_manager.recurrent_state_pool[
+                :batch_size
+            ].zero_()
 
-            output_states = (
-                workspace.output_gdn_state_views(
-                    batch_size
-                )
-            )
-
-            self.hybrid_graph_input_states[
-                batch_size
-            ] = input_states
-
-            self.hybrid_graph_output_states[
-                batch_size
-            ] = output_states
 
             # Attention.forward() 在 Capture 时通过
             # Context 取得这些固定地址。
@@ -2184,7 +2190,6 @@ class ModelRunner:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         state_slots: list[int],
-        old_gdn_states,
     ):
         """
         把本轮动态 Decode 数据复制进固定 Workspace，
@@ -2236,7 +2241,6 @@ class ModelRunner:
                 dynamic_context.block_tables
             ),
             state_slot_ids=state_slots,
-            gdn_states=old_gdn_states,
         )
 
         # Context 切换到 Capture 时使用的固定地址。
@@ -2273,16 +2277,10 @@ class ModelRunner:
             ]
         )
 
-        updated_gdn_states = (
-            self.hybrid_graph_output_states[
-                batch_size
-            ]
-        )
-
-        return (
-            hidden_states,
-            updated_gdn_states,
-        )
+        # GDN 状态已经在 Graph 内 Scatter 回
+        # active state pool，因此这里只返回
+        # LM Head 所需的 hidden states。
+        return hidden_states
 
     @torch.inference_mode()
     def capture_cudagraph(self):

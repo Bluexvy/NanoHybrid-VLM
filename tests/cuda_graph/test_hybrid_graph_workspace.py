@@ -5,88 +5,8 @@ from nanovllm.engine.hybrid_cuda_graph import (
 )
 
 from nanovllm.engine.hybrid_state import (
-    GDNLayerState,
     HybridCacheSpec,
 )
-
-
-def make_states(
-    spec: HybridCacheSpec,
-    batch_size: int,
-) -> list[GDNLayerState | None]:
-    states = [
-        None
-        for _ in range(
-            spec.num_hidden_layers
-        )
-    ]
-
-    for global_layer_idx in (
-        spec.gdn_layer_indices
-    ):
-        states[global_layer_idx] = (
-            GDNLayerState(
-                conv_state=torch.randn(
-                    batch_size,
-                    spec.conv_dim,
-                    spec.conv_kernel_size,
-                    device="cuda",
-                    dtype=spec.conv_dtype,
-                ),
-                recurrent_state=torch.randn(
-                    batch_size,
-                    spec.num_gdn_value_heads,
-                    spec.gdn_key_head_dim,
-                    spec.gdn_value_head_dim,
-                    device="cuda",
-                    dtype=(
-                        spec.recurrent_dtype
-                    ),
-                ),
-            )
-        )
-
-    return states
-
-
-def assert_state_views_equal(
-    spec: HybridCacheSpec,
-    actual: list[
-        GDNLayerState | None
-    ],
-    expected: list[
-        GDNLayerState | None
-    ],
-) -> None:
-    for layer_idx in range(
-        spec.num_hidden_layers
-    ):
-        actual_state = actual[layer_idx]
-        expected_state = expected[layer_idx]
-
-        if layer_idx in (
-            spec.full_attention_layer_indices
-        ):
-            assert actual_state is None
-            assert expected_state is None
-            continue
-
-        assert actual_state is not None
-        assert expected_state is not None
-
-        torch.testing.assert_close(
-            actual_state.conv_state,
-            expected_state.conv_state,
-            rtol=0,
-            atol=0,
-        )
-
-        torch.testing.assert_close(
-            actual_state.recurrent_state,
-            expected_state.recurrent_state,
-            rtol=0,
-            atol=0,
-        )
 
 
 def main() -> None:
@@ -95,16 +15,6 @@ def main() -> None:
             "CUDA is not available"
         )
 
-    torch.manual_seed(2026)
-    torch.cuda.manual_seed_all(2026)
-
-    # 使用一个小型 Hybrid 模型配置测试数据结构。
-    #
-    # 全局层：
-    # 0 → GDN compact 0
-    # 1 → Full Attention compact 0
-    # 2 → GDN compact 1
-    # 3 → GDN compact 2
     spec = HybridCacheSpec(
         num_hidden_layers=4,
         full_attention_layer_indices=(1,),
@@ -143,14 +53,37 @@ def main() -> None:
         )
     )
 
-    print(
-        "Workspace MiB:",
-        workspace.allocated_bytes / 1024**2,
-    )
+    # 清理后只应保留这些固定地址 Tensor。
+    expected_pointer_names = {
+        "input_ids",
+        "positions",
+        "slot_mapping",
+        "context_lens",
+        "block_tables",
+        "state_slot_ids",
+        "hidden_states",
+    }
 
     original_pointers = (
         workspace.storage_pointers()
     )
+
+    assert (
+        set(original_pointers)
+        == expected_pointer_names
+    )
+
+    # 确认大型 GDN 输入/输出 Workspace
+    # 已经从数据结构中删除。
+    removed_state_buffers = (
+        "gdn_conv_states",
+        "gdn_recurrent_states",
+        "updated_gdn_conv_states",
+        "updated_gdn_recurrent_states",
+    )
+
+    for name in removed_state_buffers:
+        assert not hasattr(workspace, name)
 
     batch_size = 2
 
@@ -193,11 +126,6 @@ def main() -> None:
 
     state_slot_ids = [5, 1]
 
-    eager_input_states = make_states(
-        spec,
-        batch_size,
-    )
-
     returned_batch_size = (
         workspace.copy_decode_inputs(
             input_ids=input_ids,
@@ -206,7 +134,6 @@ def main() -> None:
             context_lens=context_lens,
             block_tables=block_tables,
             state_slot_ids=state_slot_ids,
-            gdn_states=eager_input_states,
         )
     )
 
@@ -218,17 +145,24 @@ def main() -> None:
     )
 
     torch.testing.assert_close(
-        workspace.positions[:, :batch_size],
+        workspace.positions[
+            :,
+            :batch_size,
+        ],
         positions,
     )
 
     torch.testing.assert_close(
-        workspace.slot_mapping[:batch_size],
+        workspace.slot_mapping[
+            :batch_size
+        ],
         slot_mapping,
     )
 
     torch.testing.assert_close(
-        workspace.context_lens[:batch_size],
+        workspace.context_lens[
+            :batch_size
+        ],
         context_lens,
     )
 
@@ -241,7 +175,9 @@ def main() -> None:
     )
 
     torch.testing.assert_close(
-        workspace.state_slot_ids[:batch_size],
+        workspace.state_slot_ids[
+            :batch_size
+        ],
         torch.tensor(
             state_slot_ids,
             device="cuda",
@@ -249,67 +185,21 @@ def main() -> None:
         ),
     )
 
-    static_input_states = (
-        workspace.input_gdn_state_views(
-            batch_size
-        )
-    )
-
-    assert_state_views_equal(
-        spec,
-        static_input_states,
-        eager_input_states,
-    )
-
-    # 模拟模型输出。
-    fake_hidden_states = torch.randn(
-        batch_size,
-        workspace.hidden_size,
-        device="cuda",
-        dtype=spec.conv_dtype,
-    )
-
-    fake_updated_states = make_states(
-        spec,
-        batch_size,
-    )
-
-    workspace.copy_model_outputs(
-        batch_size=batch_size,
-        hidden_states=fake_hidden_states,
-        updated_gdn_states=(
-            fake_updated_states
-        ),
-    )
-
-    torch.testing.assert_close(
-        workspace.hidden_states[:batch_size],
-        fake_hidden_states,
-    )
-
-    static_output_states = (
-        workspace.output_gdn_state_views(
-            batch_size
-        )
-    )
-
-    assert_state_views_equal(
-        spec,
-        static_output_states,
-        fake_updated_states,
-    )
-
-    # 再复制完全不同的数据，验证地址不变、
-    # 内容可以变化。
+    # 第二轮写入完全不同的数据。
+    # CUDA Graph 要求地址不变，但内容可以变化。
     second_input_ids = torch.tensor(
         [999, 888],
         device="cuda",
         dtype=torch.long,
     )
 
-    second_states = make_states(
-        spec,
-        batch_size,
+    second_block_tables = torch.tensor(
+        [
+            [9, 10],
+            [11, 12],
+        ],
+        device="cuda",
+        dtype=torch.int32,
     )
 
     workspace.copy_decode_inputs(
@@ -317,41 +207,94 @@ def main() -> None:
         positions=positions + 100,
         slot_mapping=slot_mapping + 10,
         context_lens=context_lens + 1,
-        block_tables=block_tables,
+        block_tables=second_block_tables,
         state_slot_ids=[2, 6],
-        gdn_states=second_states,
     )
 
     current_pointers = (
         workspace.storage_pointers()
     )
 
-    assert (
-        current_pointers
-        == original_pointers
-    )
+    # 地址必须保持不变。
+    assert current_pointers == original_pointers
 
+    # 内容必须更新。
     torch.testing.assert_close(
         workspace.input_ids[:batch_size],
         second_input_ids,
     )
 
-    assert_state_views_equal(
-        spec,
-        workspace.input_gdn_state_views(
-            batch_size
+    torch.testing.assert_close(
+        workspace.state_slot_ids[
+            :batch_size
+        ],
+        torch.tensor(
+            [2, 6],
+            device="cuda",
+            dtype=torch.long,
         ),
-        second_states,
+    )
+
+    torch.testing.assert_close(
+        workspace.block_tables[
+            :batch_size,
+            :2,
+        ],
+        second_block_tables,
+    )
+
+    # 第二轮 block table 只有两列。
+    # 上一轮残留的第三列必须被清成 -1。
+    assert torch.all(
+        workspace.block_tables[
+            :batch_size,
+            2:
+        ] == -1
+    )
+
+    # allocated_bytes 必须只统计仍然存在的 Tensor。
+    expected_allocated_bytes = sum(
+        tensor.numel()
+        * tensor.element_size()
+        for tensor in (
+            workspace.input_ids,
+            workspace.positions,
+            workspace.slot_mapping,
+            workspace.context_lens,
+            workspace.block_tables,
+            workspace.state_slot_ids,
+            workspace.hidden_states,
+        )
+    )
+
+    assert (
+        workspace.allocated_bytes
+        == expected_allocated_bytes
     )
 
     print(
-        "All static Tensor addresses stayed fixed."
+        "Workspace bytes:",
+        workspace.allocated_bytes,
     )
 
     print(
-        "Part 2 passed: Hybrid Decode static "
-        "Workspace copies dynamic inputs and "
-        "states without changing storage addresses."
+        "Workspace MiB:",
+        workspace.allocated_bytes / 1024**2,
+    )
+
+    print(
+        "All remaining static Tensor "
+        "addresses stayed fixed."
+    )
+
+    print(
+        "Large GDN input/output staging "
+        "buffers were removed."
+    )
+
+    print(
+        "Part passed: metadata-only CUDA "
+        "Graph Workspace is correct."
     )
 
 
