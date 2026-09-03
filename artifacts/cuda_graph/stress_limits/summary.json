@@ -1,0 +1,302 @@
+{
+  "backend": "graph",
+  "tested_batch_sizes": [
+    16,
+    24,
+    32,
+    48,
+    64,
+    96,
+    128
+  ],
+  "max_successful_tested_batch": 32,
+  "first_failed_tested_batch": 48,
+  "peak_throughput_batch": 32,
+  "peak_decode_tokens_per_second": 1363.4735966423186,
+  "probe_results": [
+    {
+      "status": "success",
+      "backend": "graph",
+      "batch_size": 16,
+      "graph_buckets": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "output_tokens": 128,
+      "repeats": 2,
+      "gpu_memory_utilization": 0.78,
+      "max_model_len": 1024,
+      "token_budget": 32768,
+      "prompt_tokens": 22,
+      "initialization_seconds": 6.224801168078557,
+      "aggregate": {
+        "batch_size": 16,
+        "output_tokens": 128,
+        "repeats": 2,
+        "total_decode_tokens": 4064,
+        "total_decode_steps": 254,
+        "decode_tokens_per_second": 918.0980726948333,
+        "average_tpot_ms": 17.427332085597616,
+        "step_latency_ms": {
+          "mean": 17.427332085597616,
+          "p50": 17.42628199281171,
+          "p95": 17.465985007584095,
+          "p99": 17.50078836339526,
+          "max": 17.521007102914155
+        },
+        "mean_e2e_seconds": 2.267238347500097,
+        "graph_replays": 254,
+        "eager_fallbacks": 0
+      },
+      "captured_buckets": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "workspace_mib": 0.1259765625,
+      "capture_allocated_delta_mib": 48.87939453125,
+      "fallback_reasons": {},
+      "used_state_slots_after_run": 0,
+      "used_kv_blocks_after_run": 0,
+      "memory": {
+        "current_allocated_mib": 24215.74853515625,
+        "peak_allocated_mib": 25855.93603515625,
+        "current_reserved_mib": 27596.0,
+        "peak_reserved_mib": 27596.0,
+        "free_mib": 3783.625,
+        "total_mib": 32110.9375
+      },
+      "return_code": 0,
+      "log_path": "/workspace/nano-vllm/artifacts/cuda_graph/stress_limits/probe_graph_b16.log",
+      "json_path": "/workspace/nano-vllm/artifacts/cuda_graph/stress_limits/probe_graph_b16.json"
+    },
+    {
+      "status": "success",
+      "backend": "graph",
+      "batch_size": 24,
+      "graph_buckets": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        24
+      ],
+      "output_tokens": 128,
+      "repeats": 2,
+      "gpu_memory_utilization": 0.78,
+      "max_model_len": 1024,
+      "token_budget": 32768,
+      "prompt_tokens": 22,
+      "initialization_seconds": 5.211152616073377,
+      "aggregate": {
+        "batch_size": 24,
+        "output_tokens": 128,
+        "repeats": 2,
+        "total_decode_tokens": 6096,
+        "total_decode_steps": 254,
+        "decode_tokens_per_second": 1140.9307628010029,
+        "average_tpot_ms": 21.03545699923072,
+        "step_latency_ms": {
+          "mean": 21.035456999230718,
+          "p50": 21.031749492976815,
+          "p95": 21.076465502846986,
+          "p99": 21.108637476572767,
+          "max": 21.148588974028826
+        },
+        "mean_e2e_seconds": 2.74802139546955,
+        "graph_replays": 254,
+        "eager_fallbacks": 0
+      },
+      "captured_buckets": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        24
+      ],
+      "workspace_mib": 0.18896484375,
+      "capture_allocated_delta_mib": 57.0673828125,
+      "fallback_reasons": {},
+      "used_state_slots_after_run": 0,
+      "used_kv_blocks_after_run": 0,
+      "memory": {
+        "current_allocated_mib": 24227.9365234375,
+        "peak_allocated_mib": 26697.62353515625,
+        "current_reserved_mib": 29302.0,
+        "peak_reserved_mib": 29302.0,
+        "free_mib": 2073.625,
+        "total_mib": 32110.9375
+      },
+      "return_code": 0,
+      "log_path": "/workspace/nano-vllm/artifacts/cuda_graph/stress_limits/probe_graph_b24.log",
+      "json_path": "/workspace/nano-vllm/artifacts/cuda_graph/stress_limits/probe_graph_b24.json"
+    },
+    {
+      "status": "success",
+      "backend": "graph",
+      "batch_size": 32,
+      "graph_buckets": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32
+      ],
+      "output_tokens": 128,
+      "repeats": 2,
+      "gpu_memory_utilization": 0.78,
+      "max_model_len": 1024,
+      "token_budget": 32768,
+      "prompt_tokens": 22,
+      "initialization_seconds": 5.146183769917116,
+      "aggregate": {
+        "batch_size": 32,
+        "output_tokens": 128,
+        "repeats": 2,
+        "total_decode_tokens": 8128,
+        "total_decode_steps": 254,
+        "decode_tokens_per_second": 1363.4735966423186,
+        "average_tpot_ms": 23.469468040160805,
+        "step_latency_ms": {
+          "mean": 23.469468040160805,
+          "p50": 23.466757964342833,
+          "p95": 23.511883575702086,
+          "p99": 23.5292469302658,
+          "max": 23.563573020510375
+        },
+        "mean_e2e_seconds": 3.0710949419881217,
+        "graph_replays": 254,
+        "eager_fallbacks": 0
+      },
+      "captured_buckets": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32
+      ],
+      "workspace_mib": 0.251953125,
+      "capture_allocated_delta_mib": 57.1298828125,
+      "fallback_reasons": {},
+      "used_state_slots_after_run": 0,
+      "used_kv_blocks_after_run": 0,
+      "memory": {
+        "current_allocated_mib": 24223.9990234375,
+        "peak_allocated_mib": 27509.2470703125,
+        "current_reserved_mib": 30928.0,
+        "peak_reserved_mib": 30928.0,
+        "free_mib": 447.625,
+        "total_mib": 32110.9375
+      },
+      "return_code": 0,
+      "log_path": "/workspace/nano-vllm/artifacts/cuda_graph/stress_limits/probe_graph_b32.log",
+      "json_path": "/workspace/nano-vllm/artifacts/cuda_graph/stress_limits/probe_graph_b32.json"
+    },
+    {
+      "status": "failed",
+      "backend": "graph",
+      "batch_size": 48,
+      "graph_buckets": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        48
+      ],
+      "output_tokens": 128,
+      "repeats": 2,
+      "gpu_memory_utilization": 0.78,
+      "max_model_len": 1024,
+      "token_budget": 32768,
+      "prompt_tokens": 22,
+      "initialization_seconds": 5.288108000066131,
+      "error_type": "OutOfMemoryError",
+      "error": "CUDA out of memory. Tried to allocate 96.00 MiB. GPU 0 has a total capacity of 31.36 GiB of which 49.62 MiB is free. Including non-PyTorch memory, this process has 31.30 GiB memory in use. Of the allocated memory 30.49 GiB is allocated by PyTorch, with 4.80 GiB allocated in private pools (e.g., CUDA Graphs), and 97.97 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)",
+      "traceback": "Traceback (most recent call last):\n  File \"/workspace/nano-vllm/tests/cuda_graph/stress_hybrid_graph_limits.py\", line 257, in run_worker\n    run_generation_case(\n  File \"/workspace/nano-vllm/tests/cuda_graph/benchmark_hybrid_graph.py\", line 134, in run_generation_case\n    _, stats = llm.step()\n               ^^^^^^^^^^\n  File \"/workspace/nano-vllm/nanovllm/engine/llm_engine.py\", line 844, in step\n    self.model_runner.call(\n  File \"/workspace/nano-vllm/nanovllm/engine/model_runner.py\", line 444, in call\n    return method(*args)\n           ^^^^^^^^^^^^^\n  File \"/workspace/nano-vllm/nanovllm/engine/model_runner.py\", line 1800, in run\n    return self.run_hybrid(\n           ^^^^^^^^^^^^^^^^\n  File \"/workspace/nano-vllm/nanovllm/engine/model_runner.py\", line 1766, in run_hybrid\n    return self.run_hybrid_prefill(\n           ^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/nano-vllm/.venv/lib/python3.11/site-packages/torch/utils/_contextlib.py\", line 120, in decorate_context\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/nano-vllm/nanovllm/engine/model_runner.py\", line 1538, in run_hybrid_prefill\n    .read_batched_states(\n     ^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/nano-vllm/nanovllm/engine/hybrid_state.py\", line 851, in read_batched_states\n    torch.index_select(\n  File \"/workspace/nano-vllm/.venv/lib/python3.11/site-packages/torch/utils/_device.py\", line 103, in __torch_function__\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 96.00 MiB. GPU 0 has a total capacity of 31.36 GiB of which 49.62 MiB is free. Including non-PyTorch memory, this process has 31.30 GiB memory in use. Of the allocated memory 30.49 GiB is allocated by PyTorch, with 4.80 GiB allocated in private pools (e.g., CUDA Graphs), and 97.97 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)\n",
+      "memory": {
+        "current_allocated_mib": 26314.15283203125,
+        "peak_allocated_mib": 29034.88427734375,
+        "current_reserved_mib": 31324.0,
+        "peak_reserved_mib": 31324.0,
+        "free_mib": 49.625,
+        "total_mib": 32110.9375
+      },
+      "return_code": 1,
+      "log_path": "/workspace/nano-vllm/artifacts/cuda_graph/stress_limits/probe_graph_b48.log",
+      "json_path": "/workspace/nano-vllm/artifacts/cuda_graph/stress_limits/probe_graph_b48.json"
+    }
+  ],
+  "sustained_result": {
+    "status": "success",
+    "backend": "graph",
+    "batch_size": 32,
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "output_tokens": 512,
+    "repeats": 3,
+    "gpu_memory_utilization": 0.78,
+    "max_model_len": 1024,
+    "token_budget": 32768,
+    "prompt_tokens": 22,
+    "initialization_seconds": 4.832776383962482,
+    "aggregate": {
+      "batch_size": 32,
+      "output_tokens": 512,
+      "repeats": 3,
+      "total_decode_tokens": 49056,
+      "total_decode_steps": 1533,
+      "decode_tokens_per_second": 1354.251322697629,
+      "average_tpot_ms": 23.629292040311203,
+      "step_latency_ms": {
+        "mean": 23.629292040311203,
+        "p50": 23.624549969099462,
+        "p95": 23.804847383871675,
+        "p99": 23.851141165941954,
+        "max": 25.411178008653224
+      },
+      "mean_e2e_seconds": 12.170754280329371,
+      "graph_replays": 1533,
+      "eager_fallbacks": 0
+    },
+    "captured_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "workspace_mib": 0.251953125,
+    "capture_allocated_delta_mib": 57.1298828125,
+    "fallback_reasons": {},
+    "used_state_slots_after_run": 0,
+    "used_kv_blocks_after_run": 0,
+    "memory": {
+      "current_allocated_mib": 24224.0009765625,
+      "peak_allocated_mib": 27509.2490234375,
+      "current_reserved_mib": 30928.0,
+      "peak_reserved_mib": 30928.0,
+      "free_mib": 447.625,
+      "total_mib": 32110.9375
+    },
+    "return_code": 0,
+    "log_path": "/workspace/nano-vllm/artifacts/cuda_graph/stress_limits/sustained_graph_b32.log",
+    "json_path": "/workspace/nano-vllm/artifacts/cuda_graph/stress_limits/sustained_graph_b32.json"
+  }
+}

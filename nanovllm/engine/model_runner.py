@@ -1468,7 +1468,18 @@ class ModelRunner:
                 "allocated"
             )
 
+        # 整个 Prefill microbatch 是否都是从 token 0
+        # 开始计算的新请求或抢占重算请求。
+        #
+        # 如果所有 Sequence 的 num_cached_tokens 都为 0，
+        # 就没有任何需要从 State Pool 中读取的旧 GDN 状态。
+        all_fresh_prefill = all(
+            seq.num_cached_tokens == 0
+            for seq in seqs
+        )
+
         state_slots = []
+
 
         # =====================================
         # 第一阶段：收集每条请求的state slot
@@ -1533,12 +1544,31 @@ class ModelRunner:
             # 第三阶段：批量Gather旧GDN状态
             # =================================
 
-            old_gdn_states = (
-                state_manager
-                .read_batched_states(
-                    state_slots
+            if all_fresh_prefill:
+                # 所有请求都是首次 Prefill，或者抢占后从
+                # token 0 开始重算。
+                #
+                # 它们没有需要继承的历史 GDN 状态。
+                # Qwen3_5Model.forward() 接收到 None 后，
+                # 会让所有 GDN 层从零状态开始计算。
+                #
+                # 这样可以避免把全部 GDN 层的空旧状态
+                # 从 State Pool Gather 成大体积临时 Tensor。
+                old_gdn_states = None
+
+            else:
+                # 至少有一条请求需要继承历史状态。
+                #
+                # 可能的情况：
+                # 1. Chunked Prefill 的后续 chunk；
+                # 2. Prefix Cache 命中后的 suffix Prefill；
+                # 3. fresh 和 continuation 混合的 Prefill batch。
+                old_gdn_states = (
+                    state_manager
+                    .read_batched_states(
+                        state_slots
+                    )
                 )
-            )
 
             # =================================
             # 第四阶段：一次模型Forward

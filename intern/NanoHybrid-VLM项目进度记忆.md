@@ -1,11 +1,11 @@
 # NanoHybrid-VLM 项目进度记忆
 
-> 更新时间：2026-09-01
+> 更新时间：2026-09-03
 > 当前分支：`main`  
-> 最近提交：`1883065 trying to achieve prefix cache`
+> 最近提交：`c411cf5 fully achieved partial cuda graph`
 > 用途：记录实际完成、已经验证、当前断点和下一步。  
 > V1 完成度：约 90%～95%；文本/单图 Hybrid Runtime 已接通。
-> 扩展后总体完成度：约 70%～75%；V2 纯文本 GDN-aware Prefix State Cache 已完成联合 KV/GDN 命中、BF16 snapshot、共享块容量核算、LRU 和频率准入，并通过完整回归与污染压测；下一步进入 V3 Hybrid Decode CUDA Graph，V4 GDN Decode 算子尚未实现。
+> 扩展后总体完成度：约 85%～90%；V2 纯文本 GDN-aware Prefix State Cache 已完成；V3 Hybrid Decode CUDA Graph 已完成定义内的 Decode-only、精确 batch bucket、Graph 内 GDN Gather/Scatter、Eager fallback、正确性矩阵和性能实验；下一步进入 V4 状态感知 GDN Decode 算子。
 
 ## 1. 项目目标与边界
 
@@ -34,11 +34,11 @@ V1 范围：RTX 5090、BF16、TP=1、Eager；每个请求最多一张本地 PIL 
 ```text
 V1：Qwen3.5-9B 文本/单图 Hybrid Runtime（当前主要功能已完成）
 V2：纯文本 GDN-aware Prefix State Cache（已完成并通过回归与性能实验）
-V3：Qwen3.5 Hybrid Decode-only CUDA Graph（已规划，未实现）
-V4：状态感知 GDN Decode 融合算子（已规划，未实现；必须先完成真实 Profile）
+V3：Qwen3.5 Hybrid Decode-only CUDA Graph（已完成并通过正确性与性能实验）
+V4：状态感知 GDN Decode 融合算子（已进入 Part 1：真实 Decode Profile；Kernel 尚未实现）
 ```
 
-MTP、MoE、TP>1、多图、视频、图文 Prefix Cache 和完整 Chunk Gated Delta Rule 自研 Kernel 仍不在当前正式范围内。
+MTP、MoE、TP>1、多图、视频、图文 Prefix Cache、Prefill CUDA Graph、LM Head/Sampling CUDA Graph 和完整 Chunk Gated Delta Rule 自研 Kernel 仍不在当前正式范围内。
 
 ## 2. 已实现的核心技术
 
@@ -823,57 +823,344 @@ artifacts/prefix_admission_benchmark/frequency_0.json ... frequency_2.json
 artifacts/prefix_admission_benchmark/summary.json
 ~~~
 
-## 5. V3：Hybrid Decode CUDA Graph（已纳入，未实现）
+## 5. V3：Hybrid Decode CUDA Graph（已完成）
 
-### 5.1 当前已有基础
+### 5.1 为什么 Hybrid Decode 适合 CUDA Graph
 
-- 原 nano-vLLM 在 `ModelRunner.capture_cudagraph()` 中有普通 Attention 模型的 CUDA Graph 骨架。
-- 当前 Qwen3.5 Hybrid Runtime 已有稳定的 Batched Decode、紧凑 Paged KV、GDN state-slot Gather/Scatter 和三轴 mRoPE。
-- 当前 Qwen3.5 Hybrid 路径仍要求 `enforce_eager=True`；旧 Graph 骨架不能直接证明 Hybrid Decode 可 capture。
+普通 Eager Decode 的每一轮都会由 Python 重新发起大量 GPU Kernel：GDN state Gather、线性层、causal convolution、recurrent update、Full Attention 和状态写回。Decode 每轮每条请求只处理一个 token，单个 Kernel 工作量较小，CPU launch、框架调度和 Python 路径的固定开销占比很高。
 
-### 5.2 技术目标
+CUDA Graph 在初始化阶段记录一组固定地址、固定 shape 的 GPU 操作，运行时只更新静态 buffer 的内容并调用 “graph.replay()”，从而减少逐 Kernel 提交开销：
 
-只 capture 高频、shape 相对稳定的 Decode 路径：
+~~~text
+Eager Decode
+每轮 Python → Launch Kernel 1 → Launch Kernel 2 → ... → Launch Kernel N
 
-```text
-Vision + Prefill：继续 Eager
-Decode：
-真实请求数据 → 静态输入 buffer → CUDA Graph replay
-                           ↓ 不支持/失败
-                       Eager fallback
-```
+CUDA Graph Decode
+初始化：capture(Kernel 1 → Kernel 2 → ... → Kernel N)
+运行时：copy 动态 metadata → graph.replay()
+~~~
 
-必须纳入静态输入的主要数据：
+当前 V3 只 Graph 化高频 Decode 主干；Vision、Prefill、LM Head 和 Sampling 继续 Eager。这是“Hybrid Decode-only CUDA Graph”，不是整条请求链全部 Graph 化。
 
-```text
-input_ids[B]
-positions[3,B]
-slot_mapping
-context_lens
-block_tables
-state_slot_ids
-```
+### 5.2 最终执行范围与路由策略
 
-Full Attention 通过 `block_tables/slot_mapping` 读写正确 KV block；GDN 通过 `state_slot_ids` 读写正确 conv/recurrent state。Graph 不能把这些地址或请求映射固化成上一轮的数据。
+“Config.hybrid_cuda_graph_batch_sizes” 指定需要捕获的精确 Decode batch bucket。最终正确性和性能实验使用：
 
-### 5.3 待实现 Part
+~~~python
+hybrid_cuda_graph_batch_sizes = (1, 2, 4, 8, 16)
+~~~
 
-1. Graph-safe 审计：定位动态分配、CPU 同步和数据相关分支。
-2. 静态 Decode buffer：覆盖 token、三轴位置、KV 元数据和 GDN slot。
-3. batch bucket：首版计划 `1/2/4/8/12`，其余形状回退 Eager。
-4. Hybrid capture/replay：验证 FLA recurrent、causal-conv1d 和 Full Attention。
-5. 正确性：Eager/Graph greedy token、padding、重复 replay 和状态串槽测试。
-6. Benchmark：TPOT、Decode tokens/s、CPU launch overhead 和额外显存。
+“HybridDecodeGraphPolicy.route()” 使用三个输入：
 
-### 5.4 完成判定
+- “batch_size”：当前 Decode microbatch 的真实请求数。
+- “is_prefill”：是否为 Prefill。
+- “enforce_eager”：是否强制关闭 Graph。
 
-只有满足以下条件才可以声称“实现 Qwen3.5 Hybrid CUDA Graph”：
+返回 “HybridDecodeGraphRoute”，关键字段为：
 
-- 至少一个真实 Qwen3.5 Hybrid Decode bucket 完成 capture 和稳定 replay。
-- Eager/Graph greedy token 完全一致。
-- 多请求、多轮 replay 后 KV block 与 GDN state slot 无串写。
-- 不支持的 shape 能自动、安全回退 Eager。
-- 有原始 Benchmark 和 Graph 额外显存数据。
+- “use_graph”：本轮是否调用 CUDA Graph。
+- “batch_size”：真实 batch size。
+- “bucket_size”：命中的 Graph bucket；fallback 时为 None。
+- “reason”：路由原因，包括 “exact_graph_bucket”、“prefill_uses_eager”、“enforce_eager”和“unsupported_batch_size”。
+
+最终策略：
+
+~~~text
+Prefill                          → Eager
+Decode + enforce_eager=True      → Eager
+Decode + B 精确属于 buckets      → 对应 B 的 CUDA Graph
+Decode + B 不属于 buckets        → Eager fallback
+~~~
+
+当前不做 padding-to-next-bucket。例如 B=7 不会填充到 B=8，因为 Hybrid Runtime 还需同时保证 padding 行不会误写 KV block 和 GDN state slot；首版采用精确匹配，优先保证状态正确性。
+
+### 5.3 静态 Workspace 和关键变量
+
+“nanovllm/engine/hybrid_cuda_graph.py” 中的 “HybridDecodeStaticWorkspace” 为最大 bucket 一次性分配固定地址 GPU Tensor。不同 bucket 使用 “[:batch_size]” 的固定 shape view：
+
+| 变量 | Shape | 作用 |
+|---|---|---|
+| “input_ids” | “[max_B]” | 每条 Decode 请求当前输入 token |
+| “positions” | “[3,max_B]” | Qwen3.5 temporal/height/width 三轴 mRoPE 位置 |
+| “slot_mapping” | “[max_B]” | 当前 token 写入 Paged KV Tensor 的物理 slot |
+| “context_lens” | “[max_B]” | 每条请求当前 Attention 上下文长度 |
+| “block_tables” | “[max_B,max_num_blocks]” | 逻辑 KV block 到物理 KV block 的映射 |
+| “state_slot_ids” | “[max_B]” | 每条请求在 GDN active state pool 中的槽位 |
+| “hidden_states” | “[max_B,hidden_size]” | Graph 输出给 Graph 外 LM Head 的 Decoder hidden states |
+
+“copy_decode_inputs()” 在每次 replay 前：
+
+1. 校验所有输入 shape 和 “state_slot_ids” 唯一、非负。
+2. 清零或用 -1 清理上一轮 metadata，防止短 block table 继承旧尾部。
+3. 将本轮动态 token、mRoPE、KV metadata 和 state slot ID 复制到固定地址。
+4. 保持所有 Workspace Tensor 的 “data_ptr()” 不变。
+
+当前 Workspace 已删除早期设计中的整份 GDN input/output staging buffer，只保留 metadata 和最终 hidden states。最大 B=16 时 “workspace.allocated_bytes” 实测只有 0.1259 MiB；早期 B=2 版本因暂存 GDN states 曾达到约 198.0 MiB。
+
+### 5.4 Graph 内 GDN Gather/Scatter
+
+Qwen3.5 的 GDN 状态不在 Paged KV 中，而在：
+
+~~~text
+conv_state_pool[num_slots,num_gdn_layers,C,K]
+recurrent_state_pool[num_slots,num_gdn_layers,H,Dk,Dv]
+~~~
+
+如果 Gather/Scatter 留在 Graph 外，虽然 Decoder 主干被 capture，运行时仍需单独提交状态搬运 Kernel。最终实现把状态选择和写回一起录入 Graph：
+
+~~~text
+本轮真实 state_slot_ids
+        ↓ copy 到固定 Workspace
+Graph 内 index_select
+        ↓
+active state pool → batched GDN states
+        ↓
+Qwen3.5 Hybrid Decoder
+        ↓
+updated GDN states
+        ↓ Graph 内 index_copy_
+写回原 state_slot_ids 对应的 active pool
+~~~
+
+“HybridStateManager.gather_batched_states_for_graph(slot_indices)”：
+
+- “slot_indices” 是固定地址 “workspace.state_slot_ids[:B]”，地址不变、内容每轮更新。
+- 对完整 “conv_state_pool” 做一次 “torch.index_select(dim=0)”。
+- 对完整 “recurrent_state_pool” 做一次 “torch.index_select(dim=0)”。
+- 得到 “[B,num_gdn_layers,...]” 后，通过 “spec.gdn_layer_indices” 建立按全局 Decoder layer 编号排列的 “list[GDNLayerState | None]”。
+- 相比逐层 Gather，将全部 GDN 层的状态读取合并为两次 pool-level Gather。
+
+“HybridStateManager.scatter_batched_states_for_graph(slot_indices, states)”：
+
+- 校验 Full Attention 层没有错误返回 GDN state。
+- 校验每个 GDN 层的 conv/recurrent shape 与 dtype。
+- 使用相同 “slot_indices” 将更新结果 “index_copy_” 回对应 active pool。
+- “initialized_slots” 是 CPU 生命周期元数据，不在 Graph 内修改；进入 Decode 前 Scheduler/ModelRunner 已保证 slot 有效并初始化。
+
+因此 Graph replay 可以支持离散且每轮变化的状态槽，例如当前请求可能位于 slot “[1,4,9,13]”，不会把第 i 行固定写回 slot i。
+
+### 5.5 Capture 流程
+
+“ModelRunner.capture_hybrid_cudagraph()” 在模型 warmup 与 Cache 分配后、真实请求进入系统前执行：
+
+~~~text
+读取 configured batch_sizes
+→ 按最大 bucket 分配一个 HybridDecodeStaticWorkspace
+→ 从大 bucket 到小 bucket 依次捕获
+→ 为每个 B 构造合法虚拟 Decode metadata
+→ 非默认 CUDA Stream 预热 3 次
+→ torch.cuda.graph(...) 捕获 run_hybrid_graph_body(B)
+→ hybrid_graphs[B] = graph
+→ 所有 Graph 共享 hybrid_graph_pool
+~~~
+
+捕获阶段的重要变量：
+
+- “hybrid_graphs: dict[int, torch.cuda.CUDAGraph]”：batch size 到 Graph 对象的映射。
+- “hybrid_graph_pool”：多张 Graph 共享的 CUDA private memory pool handle。
+- “scratch_block_ids = arange(B)”：为虚拟请求提供合法 Paged KV block。
+- “workspace.state_slot_ids[:B] = arange(B)”：为 capture 提供合法 GDN slot；不能保留 -1，否则 “index_select” 会触发 GPU 越界。
+- “conv_state_pool[:B].zero_()” 和 “recurrent_state_pool[:B].zero_()”：状态池由 “torch.empty” 分配，capture 前必须初始化。
+- “hybrid_graph_capture_allocated_bytes”：capture 前后 “torch.cuda.memory_allocated()” 的差值。
+
+“run_hybrid_graph_body(B)” 真正被捕获的 GPU 工作为：
+
+~~~text
+state_slot_ids → Gather GDN state
+input_ids + positions → Hybrid Decoder
+Paged Attention 根据静态 Context metadata 读写 KV
+updated GDN state → Scatter 回 active pool
+hidden_states → 固定输出 buffer
+~~~
+
+### 5.6 Replay 流程
+
+“ModelRunner.run_hybrid_decode()” 先使用正常 “prepare_decode(seqs)” 构造动态输入，并收集每条 Sequence 的 “state_slot”。随后 “HybridDecodeGraphPolicy” 选择路径。
+
+精确命中时调用 “replay_hybrid_cudagraph()”：
+
+~~~text
+prepare_decode(seqs)
+→ 动态 input_ids/positions/Paged-KV metadata/state_slots
+→ workspace.copy_decode_inputs()
+→ Context 切到固定 Workspace view
+→ hybrid_graphs[B].replay()
+→ Graph 内 Gather + Decoder + Scatter
+→ 取 workspace.hidden_states[:B]
+→ Graph 外 LM Head
+→ Graph 外 Sampler
+~~~
+
+Eager fallback 继续调用原接口：
+
+~~~text
+read_batched_states(state_slots)
+→ self.model(...)
+→ write_batched_states(state_slots, updated_states)
+→ LM Head → Sampler
+~~~
+
+运行统计变量：
+
+- “num_hybrid_graph_replays”：成功执行 Graph replay 的轮数。
+- “num_hybrid_graph_eager_fallbacks”：走 Eager 的 Hybrid Decode 轮数。
+- “hybrid_graph_fallback_reasons”：按 reason 统计 fallback。
+- “hybrid_graph_capture_allocated_bytes”：Graph capture 后长期 allocated 显存增量。
+
+### 5.7 正确性验证
+
+已完成以下测试：
+
+- “cudagraph_basic_probe.py”：验证 PyTorch CUDA Graph 基本 capture/replay 与固定地址行为。
+- “cudagraph_causal_conv_probe.py”：验证 causal-conv1d 可 capture/replay。
+- “cudagraph_remaining_probe.py”：集中验证 FLA recurrent、Paged Attention 等剩余算子兼容性。
+- “test_hybrid_graph_workspace.py”：验证静态 Workspace shape、地址稳定、输入覆盖和显存规模。
+- “test_hybrid_graph_policy.py”：验证 bucket 路由与 Eager fallback。
+- “hybrid_graph_smoke.py”：真实 Qwen3.5 Hybrid 单请求 Graph smoke test。
+- “compare_hybrid_graph.py”：Eager/Graph 单请求 token、24 层 conv state、24 层 FP32 recurrent state 和逻辑 KV 对齐。
+- “test_hybrid_graph_continuous_batching.py”：动态请求结束导致 B=3→3→3→2→2→1→1 时，B=1/2 走 Graph、B=3 fallback，逐请求状态保持一致。
+- “test_hybrid_graph_bucket_matrix.py”：16 条不同输出长度请求形成 B=16→15→...→1；B=1/2/4/8/16 精确命中 Graph，其余 11 个 batch size 回退 Eager。
+
+最终 Bucket Matrix 结果：
+
+~~~text
+batch transition: 16,15,14,...,2,1
+Graph buckets: 1,2,4,8,16
+Graph replays: 5
+Eager fallbacks: 11
+所有生成 token IDs：Eager/Graph 完全一致
+每条请求最终 KV/GDN fingerprint：完全一致
+结束后 used_state_slots=0、used_kv_blocks=0
+~~~
+
+这里验证的重点不只是输出 token：还验证不同 Sequence 在动态 Continuous Batching 中不会因为 “state_slot_ids” 变化而串写 GDN state 或 KV Cache。
+
+### 5.8 性能和显存实测
+
+“tests/cuda_graph/benchmark_hybrid_graph.py” 使用 Qwen3.5-9B、RTX 5090、TP=1、每个 case 输出 128 tokens、重复 5 次。当前结果：
+
+| Batch | Eager Decode | Graph Decode | 吞吐提升 | Eager TPOT | Graph TPOT | TPOT 降低 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 54.36 tok/s | 78.50 tok/s | 44.41% | 18.397 ms | 12.739 ms | 30.75% |
+| 2 | 104.42 tok/s | 140.62 tok/s | 34.67% | 19.154 ms | 14.223 ms | 25.74% |
+| 4 | 208.52 tok/s | 264.12 tok/s | 26.66% | 19.183 ms | 15.145 ms | 21.05% |
+| 8 | 411.33 tok/s | 488.15 tok/s | 18.67% | 19.449 ms | 16.388 ms | 15.74% |
+| 16 | 796.17 tok/s | 919.33 tok/s | 15.47% | 20.096 ms | 17.404 ms | 13.40% |
+
+收益随 batch 增大而下降是合理现象：小 batch 中 CPU launch 固定开销占比更高；batch 增大后 GPU 计算与访存占比提高，Graph 只能消除其中的调度/提交开销。
+
+显存和初始化代价：
+
+~~~text
+最大 B=16 Workspace：             0.1259 MiB
+Graph capture allocated delta：    48.8794 MiB
+Eager current allocated：          24230.87 MiB
+Graph current allocated：          24279.75 MiB
+allocated 差值：                   48.88 MiB
+Eager current reserved：           26864 MiB
+Graph current reserved：           28606 MiB
+reserved 差值：                    1742 MiB
+初始化：3.592 s → 4.373 s，增加约 0.782 s（21.77%）
+~~~
+
+“allocated delta”与“reserved delta”必须区分：Workspace 和长期实际 Tensor 约增加 48.88 MiB，但 CUDA Graph private pool 使 PyTorch reserved memory 增加约 1.70 GiB。不能只报告 0.126 MiB Workspace 就声称 Graph 总显存代价极小。
+
+将 GDN Gather/Scatter 移入 Graph、删除状态 staging Workspace 后，相对早期 Graph 版本：B=1 吞吐进一步提升约 6.63%，B=2 提升约 5.68%；但早期实验只捕获 B=1/2、配置也不同，因此该数字只作为工程迭代观察，不作为严格同配置结论。
+
+### 5.9 极限压测暴露的首次 Prefill GDN State Gather 峰值问题
+
+使用“tests/cuda_graph/stress_hybrid_graph_limits.py”在 Qwen3.5-9B、RTX 5090、TP=1 下逐步增加 batch size，得到：
+
+~~~text
+B=16： 918.10 tok/s，peak allocated 25855.94 MiB
+B=24：1140.93 tok/s，peak allocated 26697.62 MiB
+B=32：1363.47 tok/s，peak allocated 27509.25 MiB，reserved 30928 MiB
+B=48：CUDA Graph capture 已完成，但首轮 Prefill 在 read_batched_states() 内 OOM
+~~~
+
+B=32 持续压测使用 32 条请求、每条输出 512 tokens、重复 3 次，共执行 49056 个 Decode tokens、1533 次 Graph replay，吞吐为 1354.25 tok/s，平均 TPOT 为 23.629 ms，p95/p99 为 23.805/23.851 ms，无 Eager fallback，结束后 KV block 和 state slot 均完整释放。因此当前可以表述“已验证 B=32 稳定端到端运行”，但不能把 B=32 说成 CUDA Graph capture 的绝对上限，因为 B=48 的 Graph 本身已经成功捕获。
+
+B=48 的具体失败链路：
+
+~~~text
+Graph capture 成功
+→ 第一个真实 Prefill microbatch
+→ run_hybrid_prefill()
+→ read_batched_states(state_slots)
+→ 每个 GDN 层执行 torch.index_select()
+→ 物化 [B, H, Dk, Dv] recurrent state
+→ 申请额外 96 MiB 时显存只剩约 49.62 MiB
+→ CUDA out of memory
+~~~
+
+根因不是“B=48 的 Graph 无法 capture”，而是当前“ModelRunner.run_hybrid_prefill()”对所有 Prefill 无条件执行“read_batched_states(state_slots)”。该函数遍历“spec.gdn_layer_indices”，对“conv_state_pool[:, gdn_index]”和“recurrent_state_pool[:, gdn_index]”分别执行“torch.index_select()”，并把所有 GDN 层的 batched old state 同时保存在“old_gdn_states”列表中。对 B=48，单个 GDN 层 recurrent Gather 约为 96 MiB；24 个 GDN 层的旧 recurrent state 约为 2.25 GiB，还要与 active state pool、updated state、KV Cache、Graph private pool 和临时激活共存，因此推高 Prefill 峰值显存。
+
+一部分 Gather 是必要的：Chunked Prefill、Prefix restore 后的 suffix Prefill 和 Decode 需要已有 GDN 历史，而且当前 FLA 接口需要连续 batched state。但当整个 Prefill microbatch 的“seq.num_cached_tokens”均为 0 时，所有请求都没有旧历史，正确初始状态就是零。当前实现先 Gather 未初始化 slot，再由“initialized_mask”清零，语义正确，但这次大体积内存物化是多余的。
+
+方案 1（已实现并完成极限探测）：在“run_hybrid_prefill()”中计算“all_fresh_prefill”；当所有“seq.num_cached_tokens == 0”时，不调用“read_batched_states()”，而向“self.model()”传入“gdn_states=None”。“Qwen3_5Model.forward()”会令每个 GDN 层的“conv_state”和“recurrent_state”为 None，GDN 从零状态开始计算，与清零后的 Gather 结果语义一致。
+
+关键变量与分支：
+
+- “seq.num_cached_tokens”：0 表示没有可继承的 KV/GDN 历史；大于 0 表示 Chunked Prefill 续算或 Prefix Cache 命中后的 suffix Prefill。
+- “all_fresh_prefill”：整个 microbatch 是否全部从 token 0 开始。
+- “state_slots”：每条 Sequence 的 active GDN state-pool 行号；即使跳过 old-state Gather，Forward 后仍要据此写回“updated_gdn_states”。
+- “old_gdn_states”：全 fresh 时为 None；只要 batch 中有一条 Sequence 需要历史状态，就仍调用“read_batched_states(state_slots)”。
+- “initialized_mask”：混合 fresh/continuation batch 仍走原逻辑，将 fresh 行清零，避免使用“torch.empty()”中的未初始化内容。
+- “updated_gdn_states”：本次 Prefill 的最终状态；方案 1 只省去旧状态副本，不能省去新状态和“write_batched_states()”。
+
+~~~text
+全部 fresh：       cached_tokens=[0,0,0]   → old_gdn_states=None → 跳过 Gather
+全部 continuation：cached_tokens=[512,512] → Gather 已有状态     → 正常续算
+混合 batch：       cached_tokens=[0,512]   → 仍然 Gather         → mask 将 fresh 行清零
+Prefix 命中：      cached_tokens=[4096]    → 必须 Gather         → 从 checkpoint 续算
+~~~
+
+方案 1 实测结果：
+
+~~~text
+                         修改前              修改后
+B=32 peak allocated     27509.25 MiB        25924.50 MiB
+B=32 peak reserved      30928 MiB           29352 MiB
+B=32 测试结束 free       447.63 MiB           2023.63 MiB
+最大成功探测 Batch       32                   40
+B=40 Decode throughput  -                    1550.20 tok/s
+B=40 average TPOT       -                    25.803 ms
+~~~
+
+B=32 peak allocated 降低 1584.75 MiB（约 1.55 GiB），peak reserved 降低 1576 MiB；Decode 吞吐从 1363.47 tok/s 变为 1364.79 tok/s，基本不变，符合“优化 Prefill 显存而非 Decode 算力”的预期。B=40 完成 64-token、1-repeat 端到端探测，63 次 Decode 全部 Graph replay、0 次 Eager fallback，结束后 state slot 和 KV block 归零；该结果只能称为短时探测成功，尚未做 B=40 长时间稳定性验证。
+
+B=48 仍然 OOM，但失败位置已经从“HybridStateManager.read_batched_states() → torch.index_select()”转移到模型内部“FLA chunk_gated_delta_rule_fwd_h() → final_state = k.new_zeros(N, HV, K, V, dtype=torch.float32)”。这次申请的 96 MiB 是当前 GDN 层的新 FP32 final_state，不再是旧 recurrent state 的 Gather 副本，证明“all_fresh_prefill”快速路径已经生效并越过原瓶颈。
+
+方案 1 只降低“全 fresh 首次 Prefill”的峰值显存和 HBM 流量，不优化 Decode、Chunked Prefill、Prefix suffix Prefill 或混合 fresh/continuation microbatch。项目决定不继续为 B=48 做容量型调参或大规模 Prefill 状态生命周期重构：当前结论固定为“B=40 短时端到端探测成功，B=32 已有长时稳定性结果；B=48 的新瓶颈是 FLA final_state 与其他常驻/临时内存的共存峰值”。下一步正式进入 V4 状态感知 GDN Decode 算子。
+
+回归边界保持不变：后续任何 GDN 算子或状态生命周期修改，都必须覆盖全 fresh Prefill、多 chunk Prefill、fresh/continuation 混合 batch、Prefix restore + suffix Prefill、抢占重算、图文 Prefill、greedy token 一致性和 KV/state-slot 无泄漏。
+
+### 5.10 当前限制和完成判定
+
+V3 在定义内已经完成，因为：
+
+- 真实 Qwen3.5 Hybrid Decode 已完成 capture/replay。
+- B=1/2/4/8/16 精确 bucket 均可执行 Graph。
+- 不支持的动态 batch 能自动、安全回退 Eager。
+- Eager/Graph greedy token、KV Cache、conv state 和 recurrent state 对齐。
+- Continuous Batching、多轮 replay、离散 state slot 和资源回收验证通过。
+- 已有原始 TPOT、Decode throughput、初始化和显存数据。
+
+当前仍不支持：
+
+- Prefill、Vision、LM Head 和 Sampling 进入 CUDA Graph。
+- padding-to-next-bucket；非精确 bucket 当前回退 Eager。
+- TP>1 下的 Hybrid CUDA Graph。
+- CUDA Graph 与尚未实现的自研 GDN custom Kernel 联合验证。
+
+原始 Benchmark 数据：
+
+~~~text
+artifacts/cuda_graph/benchmark/eager.json
+artifacts/cuda_graph/benchmark/graph.json
+artifacts/cuda_graph/benchmark/eager_before_graph_gdn_io.json
+artifacts/cuda_graph/benchmark/graph_before_graph_gdn_io.json
+~~~
 
 ## 6. V4：状态感知 GDN Decode 融合算子（已纳入，未实现）
 
@@ -945,114 +1232,110 @@ Kernel 必须通过 `state_slot_ids[row]` 直接定位真实状态池并原地�
 - 同时报告 Kernel latency、HBM/L2/occupancy 与 TPOT/Decode 吞吐，不能把微基准加速直接写成端到端收益。
 - 如果 custom 未超过 FLA，如实记录原因和适用边界，不宣称优化成功。
 
-## 7. 当前开发断点：V2 Prefix Cache 已完成，下一步进入 V3 CUDA Graph
+## 7. 当前开发断点：V3 CUDA Graph 已完成，下一步进入 V4 GDN 算子
 
-### 7.1 V2 最终完成状态
+### 7.1 V3 最终完成状态
 
-纯文本 GDN-aware Prefix Cache 已完成以下闭环：
+Hybrid Decode CUDA Graph 已完成以下闭环：
 
-- PrefixKey/PrefixStateEntry：联合表示同一 token 边界的 Full Attention KV 与 GDN snapshot。
-- 写路径：自然 Chunked Prefill 边界进行 Admission、snapshot、KV pin 和原子 commit。
-- 读路径：longest lookup、真实 token collision guard、KV request-owner attach、GDN restore 和 suffix-only Prefill。
-- 精度：支持 FP32/BF16 recurrent snapshot，active recurrent state 保持 FP32。
-- 生命周期：请求/cache 双 owner、active request ownership、抢占重算、discard 和异常回滚。
-- 容量：全局 MiB budget、oversize rejection、共享 KV 去重计费和 LRU eviction。
-- 热度准入：always/frequency 两种策略、有界 CPU candidate LRU 和两次观察阈值。
-- 验证：完整回归、4K/8K/16K 压力测试、层级共享块测试和 Admission 污染 Benchmark。
+- 静态化 Decode token、三轴 mRoPE、Paged KV metadata、GDN “state_slot_ids”和 Decoder hidden output。
+- 配置化精确 batch bucket；最终验证 “B=1/2/4/8/16”。
+- Prefill/强制 Eager/未支持 batch size 的安全 fallback。
+- 在 Graph 内按动态 slot Gather GDN state、执行 Hybrid Decoder，并 Scatter 回 active pool。
+- 删除按 batch 和 GDN 层复制的状态 staging Workspace，把 Workspace 压缩为 metadata 与 hidden output。
+- 多张 Graph 从大到小捕获，并共享 “hybrid_graph_pool”。
+- 动态 Continuous Batching 中按请求验证 token、KV、conv/recurrent state 和最终资源释放。
+- 完成 Eager/Graph TPOT、Decode throughput、初始化时间、allocated/reserved 显存实验。
 
 关键完成信号：
 
 ~~~text
-ALL CURRENT PREFIX CACHE TESTS PASSED
+Final CUDA Graph bucket matrix passed
+B=1/2/4/8/16 used CUDA Graph
+unsupported batch sizes used Eager fallback
+all generated tokens were exact
+all per-request KV/GDN fingerprints were exact
+all KV blocks and state slots were released
 ~~~
 
-### 7.2 V2 复现入口
+### 7.2 V3 复现入口
 
-完整 Prefix Cache 回归：
+核心正确性矩阵：
 
 ~~~bash
 cd /workspace/nano-vllm
 source .venv/bin/activate
-python tests/test_prefix_remaining.py --full
+python tests/cuda_graph/test_hybrid_graph_bucket_matrix.py
 ~~~
 
-Admission 污染实验：
+静态 Workspace、路由和连续批处理测试：
 
 ~~~bash
-python tests/benchmark_prefix_admission.py
+python tests/cuda_graph/test_hybrid_graph_workspace.py
+python tests/cuda_graph/test_hybrid_graph_policy.py
+python tests/cuda_graph/compare_hybrid_graph.py
+python tests/cuda_graph/test_hybrid_graph_continuous_batching.py
 ~~~
 
-原始数据：
+Eager/Graph 性能对比：
 
-~~~text
-artifacts/prefix_regression/
-artifacts/prefix_admission_benchmark/
+~~~bash
+python tests/cuda_graph/benchmark_hybrid_graph.py
 ~~~
 
-如果后续修改 Scheduler、BlockManager、HybridStateManager 或 Prefix Cache，必须先重新跑这套回归，重点观察：
+如果后续修改 “HybridStateManager”、GDN 层、Paged Attention、Decode metadata 或 “ModelRunner.run_hybrid_decode()”，必须重新运行 Bucket Matrix，重点检查：
 
-- “num_prefix_hit_tokens” 是否等于 checkpoint 边界。
-- 热命中的 “num_scheduled_tokens” 是否只包含 suffix。
-- “num_gdn_restores” 是否随真正命中增长。
-- “request_ref_count/cache_ref_count” 是否在请求结束和 Entry 淘汰后归零。
-- “current_prefix_cache_capacity_bytes” 是否等于唯一 pinned KV 容量加 GDN snapshot 容量。
-- “num_admission_deferrals/accepts” 是否符合两次观察策略。
-- Cache on/off 或 cold/hot greedy token 是否满足对应精度模式的正确性要求。
+- “route_trace” 是否与精确 bucket 策略一致。
+- “num_hybrid_graph_replays/num_hybrid_graph_eager_fallbacks” 是否符合预期。
+- “hybrid_graph_fallback_reasons["unsupported_batch_size"]” 是否正确累计。
+- 所有请求的生成 token 和最终 KV/GDN fingerprint 是否与 Eager 一致。
+- “used_state_slots/used_kv_blocks” 是否在结束后归零。
+- “workspace.storage_pointers()” 是否在多次 replay 中保持不变。
 
-### 7.3 下一步：V3 Hybrid Decode CUDA Graph
+### 7.3 下一步：V4 状态感知 GDN Decode 算子
 
-下一步不再继续扩展 Prefix Cache 功能，而是先冻结 V2 行为，进入 CUDA Graph 的 Graph-safe 审计。第一小步只做只读分析和最小实验：
+下一步先做真实 Profile，不直接凭感觉写 Kernel：
 
-1. 保持 “enforce_eager=True” 跑通当前 Qwen3.5 Hybrid Decode 基线。
-2. 从 “ModelRunner.capture_cudagraph()” 和当前 “run_hybrid_decode()” 对照调用链。
-3. 标出 Decode 中的动态 Tensor 分配、Python 分支、CPU-GPU 同步和 shape 变化。
-4. 明确需要静态化的关键输入：“input_ids”、“positions”、“slot_mapping”、“context_lens”、“block_tables”、“state_slot_ids”。
-5. 验证 FLA recurrent update、causal-conv1d 和 Paged Attention 是否能被 capture；失败路径保留 Eager fallback。
-6. 先支持 batch bucket 1，再逐步扩展到 2/4/8/12，不在第一步同时处理所有动态 shape。
+1. 分别 Profile Eager Decode 和 CUDA Graph Decode。
+2. 区分 GDN state Gather/Scatter、single-token causal convolution、FLA fused recurrent、线性层和 Full Attention 的时间占比。
+3. 检查 “index_select/index_copy_” 的 HBM 流量和 Kernel launch 数。
+4. 根据 Profile 冻结自定义算子边界，优先评估是否让 Kernel 通过 “state_slot_ids” 直接访问 active state pool。
+5. 建立 torch/fla/custom 的状态级正确性和微基准框架。
+6. 自定义算子必须继续兼容 Prefix restore、slot 复用、Continuous Batching 和 CUDA Graph replay。
+
+当前不能提前声称自研 GDN Kernel 已完成或性能超过 FLA；必须以 Profile、状态对齐、Kernel microbenchmark 和端到端 TPOT 数据为依据。
 
 ## 8. 剩余 Part
 
-V2 Prefix State Cache 的核心实现和实验已经结束。剩余工作按以下顺序：
+V2 Prefix Cache 和 V3 Hybrid Decode CUDA Graph 的核心实现与实验已经结束。剩余工作：
 
 ~~~text
-V3 Hybrid Decode CUDA Graph             6 个大 Part
 V4 状态感知 GDN Decode 自定义算子       8 个大 Part
-V1/V2 文档、报告、简历与 Git 收尾       4 个大 Part
+V1/V2/V3 文档、报告、简历与 Git 收尾    4 个大 Part
 --------------------------------------------------
-总计                                    18 个大 Part
+总计                                    12 个大 Part
 ~~~
 
-如果只计算核心技术实现，不计最后的文档/Git 收尾，则还剩约 14 个大 Part。
+如果只计算核心技术实现，不计最后的文档/Git 收尾，则还剩 8 个大 Part：
 
-V3 的 6 个 Part：
+1. Nsight Systems/PyTorch Profiler 定位 Eager/Graph Decode 的真实热点。
+2. 根据 Profile 固定 custom operator 输入、输出、dtype、shape 和 fallback 契约。
+3. 建立 torch/fla/custom 状态级正确性与微基准框架。
+4. 实现支持离散 “state_slot_ids” 的 single-token causal-conv state update。
+5. 实现支持 FP32 state pool 原地访问的 recurrent update/read。
+6. 做 tiling、向量化、融合、寄存器/L2/HBM 访问优化。
+7. 接入 ModelRunner/HybridStateManager，并验证 CUDA Graph capture/replay 与 FLA fallback。
+8. 完成 slot 乱序、Prefix restore、状态复用、Kernel 指标和端到端 Benchmark。
 
-1. Graph-safe 调用链与算子兼容性审计。
-2. 静态 Decode 输入/输出 buffer。
-3. batch bucket、padding 与 Eager fallback。
-4. Hybrid capture/replay 接入。
-5. 多请求、多轮 replay、KV/GDN state 串槽正确性。
-6. TPOT、Decode throughput、CPU launch overhead 与额外显存 Benchmark。
-
-V4 的 8 个 Part：
-
-1. Nsight Systems/PyTorch Profiler 定位真实 Decode 热点。
-2. 固定 custom operator 输入契约。
-3. torch/fla/custom 微基准。
-4. state-aware single-token causal-conv update。
-5. state-aware recurrent update/read。
-6. tiling、向量化、融合与访存优化。
-7. ModelRunner/HybridStateManager/CUDA Graph 接入和 fallback。
-8. 状态级正确性、Kernel 指标和端到端 Benchmark。
-
-当前正式顺序不变：
+当前正式顺序：
 
 ~~~text
 V2 Prefix Cache（已完成）
-→ V3 Hybrid Decode CUDA Graph
-→ V4 状态感知 GDN Decode 算子
+→ V3 Hybrid Decode CUDA Graph（已完成）
+→ V4 状态感知 GDN Decode 算子（下一步）
 ~~~
 
-MTP、MoE、TP>1、多图、视频、图文 Prefix Cache 和完整 Chunk Gated Delta Rule 自研 Kernel 不计入上述 18 个 Part。
+MTP、MoE、TP>1、多图、视频、图文 Prefix Cache、Prefill Graph 和完整 Chunk Gated Delta Rule 自研 Kernel 不计入上述 12 个 Part。
 
 ## 9. 当前可以和不能在面试中声称的内容
 
@@ -1064,26 +1347,30 @@ MTP、MoE、TP>1、多图、视频、图文 Prefix Cache 和完整 Chunk Gated D
 
 > 为 Qwen3.5 的 Full Attention + Gated DeltaNet 混合状态实现纯文本 GDN-aware Prefix Cache：以 PrefixKey(model_namespace、链式 block_hash、num_cached_tokens) 标识完整 block checkpoint，PrefixStateEntry 联合持有物理 kv_block_ids、conv_state_snapshot 和 recurrent_state_snapshot；通过 request_ref_count/cache_ref_count 管理共享 KV 生命周期，通过 BF16 休眠 snapshot 将单 Entry 的 GDN 状态由 49.5 MiB 降至 25.5 MiB，通过唯一物理块计费、全局显存预算和 LRU 支持层级前缀共享与淘汰，并使用有界 CPU admission_history 对重复 PrefixKey 做 frequency admission，避免一次性长前缀污染 GPU 缓存。命中时 longest lookup 后安装 KV request owner、恢复 GDN state_slot、推进 num_cached_tokens，仅执行 suffix Prefill。
 
+可以准确表述 V3：
+
+> 为 Qwen3.5 Hybrid Decode 实现可配置的 batch-bucket CUDA Graph：使用 HybridDecodeStaticWorkspace 固定 input_ids、三轴 positions、slot_mapping、context_lens、block_tables、state_slot_ids 和 hidden_states 地址；将基于离散 state_slot_ids 的 GDN State Pool Gather、Hybrid Decoder 前向和 Scatter 写回一并 capture，并使用 hybrid_graphs/hybrid_graph_pool 管理 B=1/2/4/8/16 的 Graph。运行时精确 bucket 调用 graph.replay()，其余 batch 自动回退 Eager；通过 16→1 Continuous Batching 矩阵验证每条请求 token、KV、conv/recurrent state 一致且资源无泄漏。
+
 可以准确引用、但必须带工作负载限定的数字：
 
 - 4K/8K/16K BF16 checkpoint 的当前压力测试中，热命中 E2E 分别降低 22.04%、31.20%、43.37%，128-token greedy 均为 128/128。
 - 在“320 MiB 预算、一个 4K hot prefix、六个 one-hit 4K 前缀、输出 1 token”的受控污染实验中，frequency 将 hot probe Prefill 从 4618 tokens 降至 522 tokens，median latency 从 426.599 ms 降至 68.431 ms；这是特定工作负载结果，不是通用提升。
 - BF16 休眠 GDN snapshot 从 49.5 MiB 降至 25.5 MiB，降幅 48.5%；当前测试为 64/64 greedy 一致，但不保证所有输入逐 token 一致。
+- 在 Qwen3.5-9B、RTX 5090、TP=1、输出 128 tokens、重复 5 次的 Decode benchmark 中，B=1/2/4/8/16 吞吐分别提升 44.41%、34.67%、26.66%、18.67%、15.47%，TPOT 分别降低 30.75%、25.74%、21.05%、15.74%、13.40%。
+- CUDA Graph 最大 B=16 metadata Workspace 为 0.1259 MiB，capture allocated delta 为 48.88 MiB，但 reserved memory 相对 Eager 增加约 1742 MiB；必须同时报告 Graph private pool 的 reserved 代价。
 
 目前不能声称：
 
 - 已支持图文 Prefix Cache；当前 V2 只支持纯文本，图片身份、processor/mRoPE layout 和视觉状态尚未纳入 Key。
-- 已实现 Hybrid CUDA Graph 或自研 GDN Decode Kernel；两者分别是下一阶段 V3/V4。
+- 已将完整请求链都 CUDA Graph 化；当前只 capture Hybrid Decoder Decode 主干，Vision/Prefill/LM Head/Sampling 仍是 Eager。
+- 任意 B≤16 都走 Graph；当前只有 B=1/2/4/8/16 精确命中，其他 batch 回退 Eager。
+- 已实现自研 GDN Decode Kernel；当前高性能路径仍使用 FLA/causal-conv1d，V4 才会根据真实 Profile 开发状态感知算子。
 - 已实现 MTP 或 MoE。
 - 已支持多图、视频或 TP>1。
 - 已达到生产级 vLLM 的完整功能、稳定性和通用性能。
 - Prefix Cache 在所有负载上都有 83.96% 提升；该数字仅来自明确限定的污染实验。
 - BF16 snapshot 在所有 Prompt 上与 FP32 严格逐 token 等价。
-- 当前 GDN Kernel 是完全自研；高性能路径仍使用 FLA/causal-conv1d，V4 才计划基于真实 Profile 开发状态感知算子。
-
-完成 V3 后才可以增加：
-
-> 为 Qwen3.5 Hybrid Decode 构建 batch-bucket CUDA Graph，通过静态三轴位置、Paged KV 元数据和 GDN state-slot buffer 完成 capture/replay，并为动态形状保留 Eager fallback；性能数字只填写实测结果。
+- CUDA Graph 在所有并发和负载上都有 44.41% 提升；44.41% 是当前 B=1 benchmark，收益随 batch 增大而下降。
 
 完成 V4 后才可以增加：
 
@@ -1092,7 +1379,7 @@ MTP、MoE、TP>1、多图、视频、图文 Prefix Cache 和完整 Chunk Gated D
 ## 10. 关键文件地图
 
 ~~~text
-nanovllm/config.py                   模型/资源、Prefix budget、snapshot dtype 和 Admission 参数
+nanovllm/config.py                   模型/资源、Prefix 参数和 hybrid_cuda_graph_batch_sizes
 nanovllm/models/registry.py          Qwen3/Qwen3.5 自动选择
 nanovllm/models/qwen3_5.py           Hybrid Decoder 和 Vision 顶层接口
 nanovllm/models/qwen3_5_vision.py    Vision Transformer/Patch Merger
@@ -1101,11 +1388,12 @@ nanovllm/layers/gated_delta_net.py   GDN、短卷积、delta rule、FLA
 nanovllm/layers/rotary_embedding.py  Partial RoPE 和 interleaved mRoPE
 nanovllm/inputs.py                   AutoProcessor 和图文输入元数据
 nanovllm/engine/sequence.py          token、block_table、state_slot 和 Prefix 命中元数据
-nanovllm/engine/hybrid_state.py      GDN active pool、snapshot_slot/restore_slot
+nanovllm/engine/hybrid_state.py      GDN active pool、Prefix snapshot、Graph Gather/Scatter
 nanovllm/engine/block_manager.py     Paged KV、双 owner、Prefix attach/pin/unpin
 nanovllm/engine/prefix_cache.py      Key/Entry、lookup/commit、LRU、capacity、Admission
 nanovllm/engine/scheduler.py         Decode-first、Chunked Prefill、Prefix lookup/attach
-nanovllm/engine/model_runner.py      Packed Tensor、GPU 前向和 Cache 读写
+nanovllm/engine/hybrid_cuda_graph.py Hybrid 静态 Workspace、bucket 路由和 fallback
+nanovllm/engine/model_runner.py      Packed 前向、Hybrid Graph capture/replay 和统计
 nanovllm/engine/llm_engine.py        输入、双 microbatch、Prefix restore/commit、采样和 decode
 ~~~
 
@@ -1125,13 +1413,19 @@ tests/test_prefix_remaining.py          ownership/collision/full regression
 tests/benchmark_prefix_admission.py     always/frequency 污染压测
 ~~~
 
-V3 预计主要修改：
+CUDA Graph 正确性与性能文件：
 
 ~~~text
-nanovllm/config.py                   Graph bucket、fallback 和开关配置
-nanovllm/engine/model_runner.py      静态 Decode buffer、capture/replay 和统计
-nanovllm/utils/context.py            Graph replay 所需静态 Context 元数据
-tests/                               Eager/Graph 对齐、bucket 和 Benchmark
+tests/cuda_graph/cudagraph_basic_probe.py             基础 capture/replay
+tests/cuda_graph/cudagraph_causal_conv_probe.py       causal-conv1d capture
+tests/cuda_graph/cudagraph_remaining_probe.py          FLA/Paged Attention 兼容性
+tests/cuda_graph/test_hybrid_graph_workspace.py        静态地址、shape 和显存
+tests/cuda_graph/test_hybrid_graph_policy.py           bucket 路由与 fallback
+tests/cuda_graph/hybrid_graph_smoke.py                 真实 Hybrid Graph smoke
+tests/cuda_graph/compare_hybrid_graph.py               token、KV、GDN state 对齐
+tests/cuda_graph/test_hybrid_graph_continuous_batching.py 动态 batch/slot 一致性
+tests/cuda_graph/test_hybrid_graph_bucket_matrix.py    B=16→1 最终矩阵
+tests/cuda_graph/benchmark_hybrid_graph.py             Eager/Graph 性能和显存
 ~~~
 
 V4 预计主要修改/新增：
@@ -1146,7 +1440,7 @@ tests/                               状态级对齐、动态 slot、微基准�
 
 ## 11. Git 工作区与恢复入口
 
-2026-09-01 本次核对时，最近提交为 “1883065 trying to achieve prefix cache”。Prefix Cache 源码、测试和实验产物仍包含未提交或新增文件；本次仅更新进度记忆，没有修改这些源码和测试。
+2026-09-02 本次核对时，最近提交为 “c411cf5 fully achieved partial cuda graph”。本次修改只更新项目进度记忆，没有改动 CUDA Graph 源码和测试。
 
 恢复命令：
 
@@ -1158,10 +1452,10 @@ git status --short
 
 正式提交前应按类别检查：
 
-1. Prefix Cache 源码：config、sequence、hybrid_state、block_manager、scheduler、llm_engine、prefix_cache。
-2. 正确性测试：test_prefix_commit/hit/admission/LRU/capacity/shared/remaining。
-3. Benchmark：prefix_dtype_probe、prefix_stress、benchmark_prefix_admission。
-4. 小型 JSON/summary 是否需要提交；模型权重、大型 profiler 和临时产物不要提交。
+1. CUDA Graph 源码：“config.py”、“hybrid_cuda_graph.py”、“hybrid_state.py”、“model_runner.py”和“context.py”。
+2. 正确性测试：“tests/cuda_graph/” 下的 probe、workspace、policy、smoke、compare、continuous batching 和 bucket matrix。
+3. Benchmark：“benchmark_hybrid_graph.py” 及 “artifacts/cuda_graph/benchmark/” 中的小型 JSON。
+4. 模型权重、大型 profiler、临时 “*.pt” dump 和无关环境文件不要提交。
 5. 使用 “git diff --check” 检查空白错误，再分别暂存源码、测试、文档和必要结果。
 
-恢复开发时从本文第 7.3 节开始：先做 V3 Graph-safe 审计，当前 Qwen3.5 Hybrid 路径继续保持 “enforce_eager=True”，确认 Eager 正确性基线后再开始 capture/replay。
+恢复开发时从本文第 7.3 节开始：保持 V2 Prefix Cache 与 V3 CUDA Graph 的回归基线，先对 Eager/Graph Decode 做 Profile，再根据真实热点冻结 V4 状态感知 GDN 算子边界。

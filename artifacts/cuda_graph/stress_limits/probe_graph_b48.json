@@ -1,0 +1,31 @@
+{
+  "status": "failed",
+  "backend": "graph",
+  "batch_size": 48,
+  "graph_buckets": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    48
+  ],
+  "output_tokens": 128,
+  "repeats": 2,
+  "gpu_memory_utilization": 0.78,
+  "max_model_len": 1024,
+  "token_budget": 32768,
+  "prompt_tokens": 22,
+  "initialization_seconds": 5.288108000066131,
+  "error_type": "OutOfMemoryError",
+  "error": "CUDA out of memory. Tried to allocate 96.00 MiB. GPU 0 has a total capacity of 31.36 GiB of which 49.62 MiB is free. Including non-PyTorch memory, this process has 31.30 GiB memory in use. Of the allocated memory 30.49 GiB is allocated by PyTorch, with 4.80 GiB allocated in private pools (e.g., CUDA Graphs), and 97.97 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)",
+  "traceback": "Traceback (most recent call last):\n  File \"/workspace/nano-vllm/tests/cuda_graph/stress_hybrid_graph_limits.py\", line 257, in run_worker\n    run_generation_case(\n  File \"/workspace/nano-vllm/tests/cuda_graph/benchmark_hybrid_graph.py\", line 134, in run_generation_case\n    _, stats = llm.step()\n               ^^^^^^^^^^\n  File \"/workspace/nano-vllm/nanovllm/engine/llm_engine.py\", line 844, in step\n    self.model_runner.call(\n  File \"/workspace/nano-vllm/nanovllm/engine/model_runner.py\", line 444, in call\n    return method(*args)\n           ^^^^^^^^^^^^^\n  File \"/workspace/nano-vllm/nanovllm/engine/model_runner.py\", line 1800, in run\n    return self.run_hybrid(\n           ^^^^^^^^^^^^^^^^\n  File \"/workspace/nano-vllm/nanovllm/engine/model_runner.py\", line 1766, in run_hybrid\n    return self.run_hybrid_prefill(\n           ^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/nano-vllm/.venv/lib/python3.11/site-packages/torch/utils/_contextlib.py\", line 120, in decorate_context\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/nano-vllm/nanovllm/engine/model_runner.py\", line 1538, in run_hybrid_prefill\n    .read_batched_states(\n     ^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/nano-vllm/nanovllm/engine/hybrid_state.py\", line 851, in read_batched_states\n    torch.index_select(\n  File \"/workspace/nano-vllm/.venv/lib/python3.11/site-packages/torch/utils/_device.py\", line 103, in __torch_function__\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 96.00 MiB. GPU 0 has a total capacity of 31.36 GiB of which 49.62 MiB is free. Including non-PyTorch memory, this process has 31.30 GiB memory in use. Of the allocated memory 30.49 GiB is allocated by PyTorch, with 4.80 GiB allocated in private pools (e.g., CUDA Graphs), and 97.97 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)\n",
+  "memory": {
+    "current_allocated_mib": 26314.15283203125,
+    "peak_allocated_mib": 29034.88427734375,
+    "current_reserved_mib": 31324.0,
+    "peak_reserved_mib": 31324.0,
+    "free_mib": 49.625,
+    "total_mib": 32110.9375
+  }
+}
