@@ -1583,7 +1583,7 @@ Profile 初稿由助手提供，存在接口对齐错误；用户按聊天框指
 
 用户明确要求把当前 Triton State-aware GDN recurrent Decode 用 CUDA C++ 实现，从 CUDA 零基础一步步教学。此为最后一个开发大 Part，完成集成、验证与必要性能分析后，只做项目细节复盘、八股复习与简历整理，不自动开启新功能。
 
-当前仅完成方案登记，未创建或修改 CUDA/Python/C++ 源码与测试，未编译 CUDA 扩展，未迁移后端，未运行新实验。Triton/FLA/已有 reference 继续作为数值与性能基线；不能将既有 2.26× 或 17.99% 写成 CUDA 实测收益。
+截至 2026-09-06，已完成 CUDA 编程模型入门和四个独立 GDN CUDA 正确性阶段：单 Head 递推、离散 State Pool 寻址、Kernel 内 Q/K normalization，以及 Block 级共享/归约优化。这些代码仍是独立 FP32 `.cu` 教学与验证程序，尚未实现 PyTorch C++/CUDA Extension、BF16 真实接口、真实尺寸性能基准或 Runtime 接入。Triton/FLA/已有 reference 继续作为数值与性能基线；不能将既有 2.26× 或 17.99% 写成 CUDA 实测收益。
 
 范围锁定：L=1 recurrent Decode，query/key/value/output BF16，pool FP32，GPU int64 state_slot_ids，紧凑 gdn_index，原地衰减/Delta Rule/输出读取。g/beta 支持的 dtype 按实际接口核对。首个特化目标 H=32、Dk=Dv=128、B=1/2/4/8/16。短卷积、Prefill 仍用现有实现，自研 causal-conv 从最终必做清单移出；不新增 MTP/MoE、多卡、量化或通用 GEMM 项目。
 
@@ -1591,12 +1591,12 @@ Profile 初稿由助手提供，存在接口对齐错误；用户按聊天框指
 
 | 小节 | 核心内容 | 当前状态 |
 |---|---|---|
-| C1 | 必要 C++、Host/Device、grid/block/thread、指针及第一个最小 Kernel | 待开始，当前恢复入口 |
+| C1 | 必要 C++、Host/Device、grid/block/thread、指针及第一个最小 Kernel | 已完成：CUDA 编程模型、内存、Warp/SIMT、合并访存、Occupancy、同步/原子操作和 `vector_add` |
 | C2 | .py/.cpp/.cu 扩展调用、Tensor 参数、device/current stream | 未开始 |
-| C3 | 五维 pool 的 stride 地址、slot/layer 映射和写入所有权 | 未开始 |
-| C4 | Q/K norm、kᵀS 所需的 warp/block 归约、shared memory 与同步 | 未开始 |
-| C5 | 完整正确版 state-aware recurrent CUDA Kernel，多步状态对齐 | 未开始 |
-| C6 | 合并访存、tile/线程布局、有界调优、Event/Profiler 指标 | 未开始 |
+| C3 | 五维 pool 的 stride 地址、slot/layer 映射和写入所有权 | 已完成独立 FP32 版：`state_slot_ids[b]` 寻址，未选 slot/层保持不变 |
+| C4 | Q/K norm、kᵀS 所需的 warp/block 归约、shared memory 与同步 | 归约部分已完成：实现 Block Reduction、Hybrid Reduction 和 Full Warp Shuffle，最终采用 Full Warp Shuffle；二维 State Tile 未完成 |
+| C5 | 完整正确版 state-aware recurrent CUDA Kernel，多步状态对齐 | 部分完成：独立单步 FP32 数学与 CPU Reference 对齐；真实 shape、BF16 和多步待做 |
+| C6 | 合并访存、tile/线程布局、有界调优、Event/Profiler 指标 | 进行中：完成 Block 级 `(batch,head)` 映射、Q/K 共享、一次状态中间写回消除，以及 B=1～2048 的三种 Reduction CUDA Event 对比；下一步优化 State 访存 |
 | C7 | 拟定 state_aware_cuda 后端接入 Eager/已有 CUDA Graph | 未开始 |
 | C8 | 集中回归、同条件性能对比、报告与最终收尾 | 未开始 |
 
@@ -1621,4 +1621,84 @@ CUDA 超过 Triton 是目标而不是预设完成事实。先完成正确实现�
 
 ### 13.5 文档与协作记录
 
-本次只更新 `intern/NanoHybrid-VLM项目实施方案.md` 和本进度记忆，未改任何源码/测试或提交 Git。助手提供聊天框代码，用户修改与运行的约定继续有效。恢复时先读方案第 28 节与本节，从 C1 起讲，不重新运行已完成的 Triton Tile 实验，不把方案中的拟定文件当成已创建。
+默认仍由助手在聊天框提供 CUDA 代码与修改步骤，用户自行创建、修改和保存；只有用户明确授权时助手才直接修改或运行。用户已单独授权创建并运行 `tests/cuda_basics/gdn_large_batch_reduction_benchmark.cu`，用于 Block/Hybrid/Full Warp Shuffle 公平对比；本次另按明确要求更新进度记忆，未修改 Runtime，未提交 Git。恢复时先读方案第 28 节与本节，从 State 访存优化继续，不重新运行已完成的 Reduction 实验。
+
+### 13.6 CUDA 入门与独立 GDN Kernel 实际进度
+
+已完成并能在 `/workspace/cuda-12.8/bin/nvcc -O2 -std=c++17 -arch=sm_120` 下编译运行的文件：
+
+| 文件 | 技术作用 | 本次核验结果 |
+|---|---|---|
+| `tests/cuda_basics/vector_add.cu` | Host/Device 内存、Kernel launch、grid/block/thread、边界、CUDA Event | `n=1003` 正确，1000 次 launch 平均 Event 区间约 1.303 μs；该数字只限此次微实验 |
+| `tests/cuda_basics/gdn_single_head.cu` | 单 Head、单状态矩阵的 decay/prediction/delta/update/output | CPU 预期 output 和 state 逐元素一致，`PASSED` |
+| `tests/cuda_basics/gdn_state_pool.cu` | `[num_slots,num_layers,H,Dk,Dv]` 地址展平，`batch -> slot` 映射，多 Batch/Head/Value 列所有权 | B=2、slot `[3,1]`、H=2、Dk=2、Dv=3 下 output/state 最大误差为 0，`PASSED` |
+| `tests/cuda_basics/gdn_normalized_state_pool.cu` | Kernel 内 Q/K L2Norm，Q 乘 `1/sqrt(Dk)`，原始 Q/K 输入 | output/state 最大误差均为 `2.38e-7`，`PASSED` |
+| `tests/cuda_basics/gdn_block_optimized.cu` | 一个 Block 对应 `(batch,head)`，128 线程协作，Shared Memory 复用 Q/K，Block Reduction 求模，`g/beta` 共享，中间 `S_decay` 不写回 pool | 小尺寸 CPU Reference 下 output/state 最大误差均为 `2.38e-7`，`PASSED`；已作为三路线 Reduction benchmark 基线 |
+| `tests/cuda_basics/gdn_hybrid_reduction.cu` | Shared Memory 先把 128 个平方项缩减到 32 个，再由 Warp 0 使用 Shuffle 完成 Q/K 归约 | output/state 最大误差约 `6.0e-8/1.19e-7`，`PASSED` |
+| `tests/cuda_basics/gdn_warp_reduction.cu` | 4 个 Warp 分别使用 Shuffle 得到局部和，经 Shared Memory 保存 4 个部分和，再由 Warp 0 完成第二级 Shuffle | output/state 最大误差约 `6.0e-8/1.19e-7`，`PASSED` |
+| `tests/cuda_basics/gdn_large_batch_reduction_benchmark.cu` | 在同一程序、同一输入和公共 State Update 主干下，对 Block、Hybrid、Full Warp 三种归约交替计时并取 5 次中位数 | 覆盖 B=1～2048；Full Warp 在 B=1～16 通常快约 0.4%～0.8%，B=32 快约 0.9%～3.4%，B≥64 基本持平 |
+
+已掌握的索引与线程语义：
+
+- 基线版把 `work_index` 解码为 `value_index=work_index%value_dim`、`remaining=work_index/value_dim`、`head_index=remaining%num_heads`、`batch_index=remaining/num_heads`；`value` 是最内层、变化最快的维度。
+- 单线程沿 `Dk` 跨行遍历固定 `value_index` 列，但同一 Warp 在某个固定 `key_index` 上访问相邻 `Dv` 列，因此全局显存访问仍可合并；可总结为“按行推进，按列负责”。
+- `state_matrix_base = slot*num_layers*H*Dk*Dv + gdn_index*H*Dk*Dv + head*Dk*Dv`，列元素再加 `key_index*Dv+value_index`；偏移使用 64 位整数。
+- 每个 `value_index` 只有一个写入者，因此当活跃 `state_slot_ids` 互异时不需要 atomic。
+
+Block 优化版的当前关键变量：
+
+| 变量 | 作用 |
+|---|---|
+| `batch_head_index=blockIdx.x` | 一维 Block 编号，解码成 `batch_index/head_index` |
+| `thread_index=threadIdx.x` | Block 内线程号；同时承担 Q/K 元素加载/归约和最终 `value_index` 列所有权 |
+| `shared_query/shared_key[128]` | 每个 `(batch,head)` 的 Q/K，归一化后被所有 Value 线程复用 |
+| `shared_query_squared/shared_key_squared[128]` | 保存平方项，通过 stride 64→1 的 Block Reduction 获得平方和 |
+| `shared_decay/shared_beta` | thread 0 计算/加载每个 Head 共享的 `exp(g)` 和 `beta`，再向 Block 广播 |
+| `remembered_value` | 某个 Value 列的 `kᵀS_decay` FP32 累加结果 |
+| `delta` | `beta*(v-remembered)`，表示当前 Value 列的写入误差 |
+| `result` | `qᵀS_new` FP32 累加结果 |
+
+优化版已完成的显存流量变化：基线先把 `S_decay` 写入 pool，再读回计算 `S_new`，每元素为两读两写；当前优化版第一轮只计算 prediction，第二轮重读 `S_old` 并只写最终 `S_new`，变为两读一写。这一改动的性能收益尚未用 CUDA Event/Nsight 隔离测量。
+
+后续优化顺序已经锁定：
+
+1. 用真实 `Dk=Dv=128`、B=1/2/4/8/16 建立 CUDA Event 基线，不用小 shape 推断性能。
+2. 已完成 Block、Hybrid 与 Full Warp Shuffle 对比；最终采用 Full Warp Shuffle，但只表述为小 Batch 小幅收益、大 Batch持平，不声称显著加速。
+3. 实现 `(B,H,ceil(Dv/BLOCK_VALUE))` 的二维 State Tile 映射，评估 `BLOCK_VALUE=16/32/64`、线程数、寄存器与 Occupancy。
+4. 评估 Register/Shared State Tile，减少当前对 `S_old` 的第二次全局读取；必须同时观察 spill 和 Occupancy。
+5. 实现 BF16 Q/K/V/G/Beta/Output + FP32 state/累加，并在对齐允许时评估 `__nv_bfloat162`/16B 向量化访存。
+6. 使用 Nsight 核对 DRAM bandwidth、L2 hit、register、spill、occupancy 和 Kernel time；`cp.async`/双缓冲只在 Profile 证明可以隐藏 State Tile 搬运时尝试。
+7. 独立算子优化和数值/多步状态验证完成后，再实现 PyTorch `.cpp/.cu` Binding、current stream、`state_aware_cuda` 路由和 CUDA Graph 对齐。
+
+算子技术深度的当前边界：已完成功能正确的状态感知 CUDA 原型、Block/Shared Memory 优化和 Full Warp Shuffle 两级归约，并完成真实 H/Dk/Dv 下 B=1～2048 的 Reduction 微基准；仍不能声称已完成二维 Tiling、Register Blocking、BF16/向量化、Shape-aware Dispatch、`cp.async`、Nsight 证据、PyTorch 扩展或 Runtime 集成。CUDA 算子已实测超过 Triton/FLA 也不能声称。
+
+### 13.7 Reduction 三路线对比与最终选择
+
+三条路线保持相同的线程所有权：`blockIdx.x` 对应一个 `(batch_index, head_index)`，`threadIdx.x` 同时负责一个 Q/K 元素和一条固定 `value_index` 状态列。差异只在 Q/K L2 normalization 的平方和归约阶段，后续 `remembered_value`、`delta`、`S_new` 与 `result` 使用相同公共计算主干。
+
+| 路线 | 归约过程 | 关键 Shared Memory | ptxas 资源 |
+|---|---|---|---|
+| Block Reduction | 128→64→32→16→8→4→2→1，每一级通过 Shared Memory 并进行 Block 同步 | `shared_query/key[128]` 与 `shared_query/key_squared[128]` | 40 registers/thread、2056 bytes smem、0 spill |
+| Hybrid Reduction | Shared Memory 完成 128→64→32，Warp 0 使用 5 次 `__shfl_down_sync` 完成 32→1 | 仍保留四个 128 元素 Shared 数组 | 40 registers/thread、2056 bytes smem、0 spill |
+| Full Warp Shuffle | 4 个 Warp 各自完成 32→1，lane 0 写入 4 个部分和；Warp 0 再将 4 个部分和归约为 1 | `shared_query/key[128]` 加 Q/K 各 4 个 Warp 部分和 | 40 registers/thread、1072 bytes smem、0 spill |
+
+关键变量：
+
+- `lane_index=thread_index%32`：线程在所属 Warp 内的 lane 编号。
+- `warp_index=thread_index/32`：线程属于 4 个 Warp 中的哪一个。
+- `query_squared_sum/key_squared_sum`：每个 lane 初始持有的 Q/K 平方项，第一次 `warp_reduce_sum()` 后只有各 Warp 的 lane 0 保存完整局部和。
+- `shared_query_warp_sums[4]/shared_key_warp_sums[4]`：连接四个 Warp 的最小跨 Warp Shared Memory 中间量。
+- `query_block_sum/key_block_sum`：Warp 0 第二级归约的输入和最终 Block 级平方和。
+- `shared_query_multiplier/shared_key_multiplier`：thread 0 计算后广播的 Q/K 归一化乘数；Q 额外包含 `1/sqrt(Dk)`。
+
+统一大 Batch 微基准使用 Qwen3.5 实际 `H=32、Dk=Dv=128`，状态布局缩为 `[B,1,H,Dk,Dv]`，使单层实验能覆盖 B=1～2048；三个 Kernel 位于同一编译单元，复用同一输入与 State Update 尾部，每组交替执行顺序并取 5 次测量中位数。该单层布局只用于研究归约，不代表完整 24 层 Runtime 能容纳 B=2048。
+
+三轮结果的稳定结论：
+
+- Full Warp 相对 Block 在 B=1～16 通常快约 0.4%～0.8%；B=32 三轮快约 0.9%～3.4%，该点靠近缓存/调度临界区域，数值有波动。
+- B≥64 后三者差异通常位于约 `-0.12%～+0.24%`，可视为基本持平；没有证据支持 Full Warp 在超大 B 下明显加速。
+- Hybrid 在 B=1～16 通常快约 0.6%～1.1%，B≥64 同样基本持平。
+- Hybrid 与 Block 的一步输出完全一致；Full Warp 相对 Block 的最大输出误差随 B 增长仍不超过约 `1.9e-9`。独立 CPU Reference 验证中的 output/state 误差为 `1e-7` 量级。
+- B=2048 的单层 FP32 State Pool 为 4 GiB。每个状态元素在当前公共尾部中为两次全局读和一次写，最低 State 流量约 12 GiB/launch；约 7.79 ms 延迟说明超大 B 已由 State 显存流量主导，归约差异被淹没。
+
+最终工程选择为 **Full Warp Shuffle 两级归约**。选择依据是小 Batch 下有稳定但有限的延迟收益，Shared Memory 从 2056 bytes 降到 1072 bytes，且 Warp 级归约结构更适合作为后续布局优化基础；不能表述为“大 Batch 显著超过 Block Reduction”。下一步不再继续调整 Norm Reduction，而是通过 Shared/Register State Staging 或其他布局手段评估能否消除 `S_old` 的第二次全局读取，并同时检查 Occupancy 与 spill。

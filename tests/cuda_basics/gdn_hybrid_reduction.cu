@@ -1,0 +1,574 @@
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+
+void check_cuda(cudaError_t status)
+    {
+    if (status != cudaSuccess) {
+        std::fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(status));
+        std::exit(EXIT_FAILURE);
+    }
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float value)
+{
+    value += __shfl_down_sync(0xffffffffu, value, 16);
+    value += __shfl_down_sync(0xffffffffu, value, 8);
+    value += __shfl_down_sync(0xffffffffu, value, 4);
+    value += __shfl_down_sync(0xffffffffu, value, 2);
+    value += __shfl_down_sync(0xffffffffu, value, 1);
+
+    return value;
+}
+
+/*
+输入形状：
+
+    q:              [B, H, Dk]
+    k:              [B, H, Dk]
+    v:              [B, H, Dv]
+    g:              [B, H]
+    beta:           [B, H]
+    state_slot_ids: [B]
+
+状态池：
+
+    state_pool:
+        [num_slots, num_layers, H, Dk, Dv]
+
+输出：
+
+    output:
+        [B, H, Dv]
+
+线程分工：
+
+    一个线程处理：
+        一个 batch
+        × 一个 head
+        × 一个 value_index
+
+副作用：
+
+    直接更新 state_pool 中相应 slot 的状态。
+*/
+__global__ void gdn_state_pool_decode_fp32(
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* g,
+    const float* beta,
+    const int* state_slot_ids,
+    float* state_pool,
+    float* output,
+    int batch_size,
+    int num_layers,
+    int num_heads,
+    int key_dim,
+    int value_dim,
+    int gdn_index)
+{
+    constexpr int block_size = 128;
+
+    int batch_head_index = blockIdx.x;
+    int batch_index = batch_head_index / num_heads;
+    int head_index = batch_head_index % num_heads;
+
+    int thread_index = threadIdx.x;
+    int value_index = thread_index;
+
+    __shared__ float shared_query[block_size];
+    __shared__ float shared_key[block_size];
+    __shared__ float shared_query_squared[block_size];
+    __shared__ float shared_key_squared[block_size];
+    __shared__ float shared_decay;
+    __shared__ float shared_beta;
+
+    long long qk_base = static_cast<long long>(batch_index * num_heads + head_index) * key_dim;
+    int gate_offset = batch_index * num_heads + head_index;
+
+    float query_value = 0.0f;
+    float key_value = 0.0f;
+
+    if (thread_index < key_dim) {
+        query_value = q[qk_base + thread_index];
+        key_value = k[qk_base + thread_index];
+    }
+
+    shared_query[thread_index] = query_value;
+    shared_key[thread_index] = key_value;
+    shared_query_squared[thread_index] = query_value * query_value;
+    shared_key_squared[thread_index] = key_value * key_value;
+
+    /*
+    第一步：确保128个线程都已经把Q/K平方项
+    写入Shared Memory。
+    */
+    __syncthreads();
+
+    /*
+    第二步：128个部分和压缩成64个。
+
+    thread 0～63分别加上thread 64～127的数据。
+    这里发生跨Warp的Shared Memory读取。
+    */
+    if (thread_index < 64) {
+        shared_query_squared[thread_index] += shared_query_squared[thread_index + 64];
+        shared_key_squared[thread_index] += shared_key_squared[thread_index + 64];
+    }
+
+    /*
+    必须等待thread 0～63完成更新，
+    下一步Warp 0才可以读取thread 32～63的结果。
+    */
+    __syncthreads();
+
+    /*
+    第三步：64个部分和压缩成32个。
+
+    现在只有Warp 0工作：
+        lane 0读取shared[0]和shared[32]
+        lane 1读取shared[1]和shared[33]
+        ...
+        lane31读取shared[31]和shared[63]
+
+    得到32个寄存器部分和以后，
+    使用Warp Shuffle完成最后归约。
+    */
+    if (thread_index < 32) {
+        float query_sum =
+            shared_query_squared[thread_index]
+            + shared_query_squared[thread_index + 32];
+
+        float key_sum =
+            shared_key_squared[thread_index]
+            + shared_key_squared[thread_index + 32];
+
+        query_sum = warp_reduce_sum(query_sum);
+        key_sum = warp_reduce_sum(key_sum);
+
+        /*
+        Warp 0的lane 0，也就是整个Block的thread 0，
+        得到完整的Q/K平方和。
+        */
+        if (thread_index == 0) {
+            float query_inverse_norm = 1.0f / sqrtf(query_sum + 1e-6f);
+            float key_inverse_norm = 1.0f / sqrtf(key_sum + 1e-6f);
+            float query_scale = 1.0f / sqrtf(static_cast<float>(key_dim));
+
+            shared_decay = expf(g[gate_offset]);
+            shared_beta = beta[gate_offset];
+
+            /*
+            暂时借用平方和数组的第0个位置，
+            保存整个Block共享的归一化乘数。
+            */
+            shared_query_squared[0] = query_inverse_norm * query_scale;
+            shared_key_squared[0] = key_inverse_norm;
+        }
+    }
+
+    /*
+    等待thread 0写完两个归一化乘数、
+    shared_decay和shared_beta。
+    */
+    __syncthreads();
+
+    float query_multiplier = shared_query_squared[0];
+    float key_multiplier = shared_key_squared[0];
+
+    if (thread_index < key_dim) {
+        shared_query[thread_index] *= query_multiplier;
+        shared_key[thread_index] *= key_multiplier;
+    }
+
+    /*
+    等待所有Q/K元素归一化完成。
+    */
+    __syncthreads();
+
+    if (value_index >= value_dim) {
+        return;
+    }
+
+    int state_slot = state_slot_ids[batch_index];
+
+    long long state_matrix_base =
+        static_cast<long long>(state_slot) * num_layers * num_heads * key_dim * value_dim
+        + static_cast<long long>(gdn_index) * num_heads * key_dim * value_dim
+        + static_cast<long long>(head_index) * key_dim * value_dim;
+
+    long long value_offset =
+        static_cast<long long>(batch_index * num_heads + head_index) * value_dim
+        + value_index;
+
+    float remembered_value = 0.0f;
+
+    for (int key_index = 0; key_index < key_dim; ++key_index) {
+        long long state_offset =
+            state_matrix_base
+            + static_cast<long long>(key_index) * value_dim
+            + value_index;
+
+        float old_state = state_pool[state_offset];
+        float decayed_state = old_state * shared_decay;
+
+        remembered_value += shared_key[key_index] * decayed_state;
+    }
+
+    float delta = shared_beta * (v[value_offset] - remembered_value);
+    float result = 0.0f;
+
+    for (int key_index = 0; key_index < key_dim; ++key_index) {
+        long long state_offset =
+            state_matrix_base
+            + static_cast<long long>(key_index) * value_dim
+            + value_index;
+
+        float old_state = state_pool[state_offset];
+        float decayed_state = old_state * shared_decay;
+        float updated_state = decayed_state + shared_key[key_index] * delta;
+
+        state_pool[state_offset] = updated_state;
+        result += shared_query[key_index] * updated_state;
+    }
+
+    output[value_offset] = result;
+}
+
+/*
+CPU Reference 使用相同的数学过程。
+
+它的作用不是加速，而是提供正确答案，
+验证 CUDA Kernel 的状态更新和输出。
+*/
+void gdn_state_pool_reference(
+    const std::vector<float>& q,
+    const std::vector<float>& k,
+    const std::vector<float>& v,
+    const std::vector<float>& g,
+    const std::vector<float>& beta,
+    const std::vector<int>& state_slot_ids,
+    std::vector<float>& state_pool,
+    std::vector<float>& output,
+    int batch_size,
+    int num_layers,
+    int num_heads,
+    int key_dim,
+    int value_dim,
+    int gdn_index)
+    {
+    for (int batch_index = 0; batch_index < batch_size; ++batch_index) {
+        int state_slot = state_slot_ids[batch_index];
+
+        for (int head_index = 0; head_index < num_heads; ++head_index) {
+            long long qk_base =
+                static_cast<long long>(batch_index * num_heads + head_index)
+                * key_dim;
+            float query_squared_sum = 0.0f;
+            float key_squared_sum = 0.0f;
+
+            for (int key_index = 0; key_index < key_dim; ++key_index) {
+                float query_value = q[qk_base + key_index];
+                float key_value = k[qk_base + key_index];
+
+                query_squared_sum += query_value * query_value;
+                key_squared_sum += key_value * key_value;
+            }
+
+            const float epsilon = 1e-6f;
+
+            float query_inverse_norm = 1.0f / std::sqrt(query_squared_sum + epsilon);
+            float key_inverse_norm = 1.0f / std::sqrt(key_squared_sum + epsilon);
+            float query_scale = 1.0f / std::sqrt(static_cast<float>(key_dim));
+
+            int gate_offset = batch_index * num_heads + head_index;
+
+            long long state_matrix_base =
+                static_cast<long long>(state_slot) * num_layers * num_heads * key_dim * value_dim
+                + static_cast<long long>(gdn_index) * num_heads * key_dim * value_dim
+                + static_cast<long long>(head_index) * key_dim * value_dim;
+
+            float decay = std::exp(g[gate_offset]);
+
+            for (int value_index = 0; value_index < value_dim; ++value_index) {
+                long long value_offset =
+                    static_cast<long long>(batch_index * num_heads + head_index)
+                    * value_dim
+                    + value_index;
+
+                float remembered_value = 0.0f;
+
+                for (int key_index = 0; key_index < key_dim; ++key_index) {
+                    long long state_offset =
+                        state_matrix_base
+                        + static_cast<long long>(key_index) * value_dim
+                        + value_index;
+
+                    float decayed_state = state_pool[state_offset] * decay;
+
+                    state_pool[state_offset] = decayed_state;
+                    float normalized_key = k[qk_base + key_index] * key_inverse_norm;
+                    remembered_value += normalized_key * decayed_state;
+                }
+
+                float delta = beta[gate_offset] * (v[value_offset] - remembered_value);
+                float result = 0.0f;
+
+                for (int key_index = 0; key_index < key_dim; ++key_index) {
+                    long long state_offset = state_matrix_base + static_cast<long long>(key_index) * value_dim + value_index;
+
+                    float normalized_key = k[qk_base + key_index] * key_inverse_norm;
+                    float normalized_query = q[qk_base + key_index] * query_inverse_norm * query_scale;
+                    float updated_state = state_pool[state_offset] + normalized_key * delta;
+
+                    state_pool[state_offset] = updated_state;
+                    result += normalized_query * updated_state;
+                }
+
+                output[value_offset] = result;
+            }
+        }
+    }
+}
+
+
+int main()
+{
+    /*
+    小尺寸验证：
+
+        B = 2
+        num_slots = 4
+        num_layers = 2
+        H = 2
+        Dk = 2
+        Dv = 3
+
+    本次只更新 gdn_index = 1。
+    */
+    const int batch_size = 2;
+    const int num_slots = 4;
+    const int num_layers = 2;
+    const int num_heads = 2;
+    const int key_dim = 2;
+    const int value_dim = 3;
+    const int gdn_index = 1;
+
+    /*
+    batch row 0 使用物理 slot 3。
+    batch row 1 使用物理 slot 1。
+
+    因此 slot 0 和 slot 2 不应被修改。
+    */
+    std::vector<int> h_state_slot_ids = {3, 1};
+
+    /*
+    q、k 是模型产生的原始数据。
+
+    Kernel 和 CPU Reference 都会在内部完成：
+        Q L2Norm
+        K L2Norm
+        Q scale = 1 / sqrt(Dk)
+    */
+    std::vector<float> h_q = {
+        1.0f, 1.0f,
+        3.0f, 4.0f,
+        -2.0f, 1.0f,
+        1.0f, -3.0f,
+    };
+
+    std::vector<float> h_k = {
+        2.0f, 0.0f,
+        3.0f, 4.0f,
+        1.0f, -2.0f,
+        -4.0f, 3.0f,
+    };
+
+    /*
+    v 的逻辑形状是 [2, 2, 3]。
+    */
+    std::vector<float> h_v = {
+        3.0f, 2.0f, 7.0f,
+        4.0f, 6.0f, 8.0f,
+
+        5.0f, 1.0f, 9.0f,
+        2.0f, 8.0f, 4.0f,
+    };
+
+    std::vector<float> h_g(
+        batch_size * num_heads,
+        std::log(0.5f)
+    );
+
+    std::vector<float> h_beta(
+        batch_size * num_heads,
+        0.5f
+    );
+
+    int state_element_count =
+        num_slots * num_layers * num_heads * key_dim * value_dim;
+
+    std::vector<float> h_initial_state(state_element_count);
+
+    /*
+    为状态池填入可区分的数据。
+
+    这样如果地址公式写错，通常会明显影响结果。
+    */
+    for (int index = 0; index < state_element_count; ++index) {
+        h_initial_state[index] = 0.01f * static_cast<float>(index + 1);
+    }
+
+    std::vector<float> h_cuda_state = h_initial_state;
+    std::vector<float> h_reference_state = h_initial_state;
+
+    int output_element_count = batch_size * num_heads * value_dim;
+
+    std::vector<float> h_cuda_output(output_element_count, 0.0f);
+    std::vector<float> h_reference_output(output_element_count, 0.0f);
+
+    /*
+    先在 CPU 上计算正确答案。
+    */
+    gdn_state_pool_reference(
+        h_q,
+        h_k,
+        h_v,
+        h_g,
+        h_beta,
+        h_state_slot_ids,
+        h_reference_state,
+        h_reference_output,
+        batch_size,
+        num_layers,
+        num_heads,
+        key_dim,
+        value_dim,
+        gdn_index
+    );
+
+    size_t qk_bytes = h_q.size() * sizeof(float);
+    size_t value_bytes = h_v.size() * sizeof(float);
+    size_t gate_bytes = h_g.size() * sizeof(float);
+    size_t slot_bytes = h_state_slot_ids.size() * sizeof(int);
+    size_t state_bytes = h_cuda_state.size() * sizeof(float);
+    size_t output_bytes = h_cuda_output.size() * sizeof(float);
+
+    float* d_q = nullptr;
+    float* d_k = nullptr;
+    float* d_v = nullptr;
+    float* d_g = nullptr;
+    float* d_beta = nullptr;
+    float* d_state_pool = nullptr;
+    float* d_output = nullptr;
+    int* d_state_slot_ids = nullptr;
+
+    check_cuda(cudaMalloc(&d_q, qk_bytes));
+    check_cuda(cudaMalloc(&d_k, qk_bytes));
+    check_cuda(cudaMalloc(&d_v, value_bytes));
+    check_cuda(cudaMalloc(&d_g, gate_bytes));
+    check_cuda(cudaMalloc(&d_beta, gate_bytes));
+    check_cuda(cudaMalloc(&d_state_slot_ids, slot_bytes));
+    check_cuda(cudaMalloc(&d_state_pool, state_bytes));
+    check_cuda(cudaMalloc(&d_output, output_bytes));
+
+    check_cuda(cudaMemcpy(d_q, h_q.data(), qk_bytes, cudaMemcpyHostToDevice));
+    check_cuda(cudaMemcpy(d_k, h_k.data(), qk_bytes, cudaMemcpyHostToDevice));
+    check_cuda(cudaMemcpy(d_v, h_v.data(), value_bytes, cudaMemcpyHostToDevice));
+    check_cuda(cudaMemcpy(d_g, h_g.data(), gate_bytes, cudaMemcpyHostToDevice));
+    check_cuda(cudaMemcpy(d_beta, h_beta.data(), gate_bytes, cudaMemcpyHostToDevice));
+    check_cuda(cudaMemcpy(d_state_slot_ids, h_state_slot_ids.data(), slot_bytes, cudaMemcpyHostToDevice));
+    check_cuda(cudaMemcpy(d_state_pool, h_cuda_state.data(), state_bytes, cudaMemcpyHostToDevice));
+
+    int threads = 128;
+    int blocks = batch_size * num_heads;
+
+    gdn_state_pool_decode_fp32<<<blocks, threads>>>(
+        d_q,
+        d_k,
+        d_v,
+        d_g,
+        d_beta,
+        d_state_slot_ids,
+        d_state_pool,
+        d_output,
+        batch_size,
+        num_layers,
+        num_heads,
+        key_dim,
+        value_dim,
+        gdn_index
+    );
+
+    check_cuda(cudaGetLastError());
+    check_cuda(cudaDeviceSynchronize());
+
+    check_cuda(cudaMemcpy(h_cuda_output.data(), d_output, output_bytes, cudaMemcpyDeviceToHost));
+    check_cuda(cudaMemcpy(h_cuda_state.data(), d_state_pool, state_bytes, cudaMemcpyDeviceToHost));
+
+    float max_output_error = 0.0f;
+    float max_state_error = 0.0f;
+
+    for (int index = 0; index < output_element_count; ++index) {
+        float error = std::fabs(h_cuda_output[index] - h_reference_output[index]);
+        max_output_error = std::max(max_output_error, error);
+    }
+
+    for (int index = 0; index < state_element_count; ++index) {
+        float error = std::fabs(h_cuda_state[index] - h_reference_state[index]);
+        max_state_error = std::max(max_state_error, error);
+    }
+
+    bool passed = max_output_error <= 1e-5f && max_state_error <= 1e-5f;
+
+    std::printf("Batch to slot mapping:\n");
+
+    for (int batch_index = 0; batch_index < batch_size; ++batch_index) {
+        std::printf(
+            "batch %d -> state slot %d\n",
+            batch_index,
+            h_state_slot_ids[batch_index]
+        );
+    }
+
+    std::printf("\nCUDA output:\n");
+
+    for (int batch_index = 0; batch_index < batch_size; ++batch_index) {
+        for (int head_index = 0; head_index < num_heads; ++head_index) {
+            std::printf("batch=%d head=%d: [", batch_index, head_index);
+
+            for (int value_index = 0; value_index < value_dim; ++value_index) {
+                int output_offset =
+                    (batch_index * num_heads + head_index)
+                    * value_dim
+                    + value_index;
+
+                const char* separator = value_index + 1 == value_dim ? "" : ", ";
+                std::printf("%.6f%s", h_cuda_output[output_offset], separator);
+            }
+
+            std::printf("]\n");
+        }
+    }
+
+    std::printf("\nMax output error: %.9f\n", max_output_error);
+    std::printf("Max state error:  %.9f\n", max_state_error);
+    std::printf("Verification: %s\n", passed ? "PASSED" : "FAILED");
+
+    check_cuda(cudaFree(d_q));
+    check_cuda(cudaFree(d_k));
+    check_cuda(cudaFree(d_v));
+    check_cuda(cudaFree(d_g));
+    check_cuda(cudaFree(d_beta));
+    check_cuda(cudaFree(d_state_slot_ids));
+    check_cuda(cudaFree(d_state_pool));
+    check_cuda(cudaFree(d_output));
+
+    return passed ? EXIT_SUCCESS : EXIT_FAILURE;
+}
