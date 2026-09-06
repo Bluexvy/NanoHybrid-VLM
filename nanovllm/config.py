@@ -26,6 +26,18 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    
+    # Qwen3.5 Decode 的 GDN recurrent backend。
+    #
+    # fla：
+    #     原始 Gather -> FLA -> Scatter 路径。
+    #
+    # state_aware_triton：
+    #     causal-conv1d 仍使用官方高性能实现，
+    #     recurrent Gated Delta Rule 直接读写
+    #     HybridStateManager 的状态池。
+    gdn_decode_backend: str = "fla"
+    
     # Qwen3.5 Hybrid Decode 需要捕获的固定 batch size。
     #
     # 首版只捕获 B=1，控制静态 GDN Workspace
@@ -147,6 +159,21 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         
+        supported_gdn_decode_backends = {
+            "fla",
+            "state_aware_triton",
+        }
+
+        if (
+            self.gdn_decode_backend
+            not in supported_gdn_decode_backends
+        ):
+            raise ValueError(
+                "gdn_decode_backend must be one of "
+                f"{sorted(supported_gdn_decode_backends)}, "
+                f"got {self.gdn_decode_backend!r}"
+            )
+            
         graph_batch_sizes = (
             self.hybrid_cuda_graph_batch_sizes
         )

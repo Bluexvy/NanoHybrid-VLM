@@ -20,6 +20,12 @@ try:
 except ImportError:
     chunk_gated_delta_rule = None
     fused_recurrent_gated_delta_rule = None
+    
+from nanovllm.utils.context import get_context
+
+from nanovllm.kernels.state_aware_gdn import (
+    state_aware_gdn_decode_triton,
+)
 
 
 """Q、K 的 L2 归一化"""
@@ -490,6 +496,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.backend = backend
 
         self.layer_idx = layer_idx
+        
+        # global Decoder layer -> compact GDN layer。
+        #
+        # 例如 layer_types：
+        #
+        # [
+        #   GDN, GDN, GDN, Attention,
+        #   GDN, GDN, GDN, Attention,
+        # ]
+        #
+        # global layer 4 对应 compact gdn_index=3。
+        self.gdn_index = sum(
+            layer_type == "linear_attention"
+            for layer_type in config.layer_types[
+                :layer_idx
+            ]
+        )
         self.hidden_size = config.hidden_size
 
         self.num_k_heads = (
@@ -1413,7 +1436,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor,
+        torch.Tensor | None,
     ]:
         if hidden_states.ndim != 3:
             raise ValueError(
@@ -1528,20 +1551,91 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 dim=2,
             )
 
-        (
-            core_output,
-            new_recurrent_state,
-        ) = self._run_gated_delta_rule(
-            query=query,
-            key=key,
-            value=value,
-            g=g,
-            beta=beta,
-            recurrent_state=recurrent_state,
-            prefill_seqlens=prefill_seqlens,
-            gdn_cu_seqlens=gdn_cu_seqlens,
+        context = get_context()
+
+        use_state_aware_decode = (
+            not context.is_prefill
+            and context.gdn_decode_backend
+            == "state_aware_triton"
         )
-        
+
+        if use_state_aware_decode:
+            # State-aware 路径不应该收到 Gather 出来的
+            # recurrent_state 临时量。
+            if recurrent_state is not None:
+                raise RuntimeError(
+                    "State-aware GDN Decode received "
+                    "a temporary recurrent_state"
+                )
+
+            if (
+                context.gdn_recurrent_state_pool
+                is None
+            ):
+                raise RuntimeError(
+                    "State-aware GDN Decode is missing "
+                    "recurrent_state_pool"
+                )
+
+            if context.gdn_state_slot_ids is None:
+                raise RuntimeError(
+                    "State-aware GDN Decode is missing "
+                    "state_slot_ids"
+                )
+
+            # 直接根据：
+            #
+            # state_slot_ids
+            # gdn_index
+            #
+            # 定位状态池中的物理状态。
+            core_output = (
+                state_aware_gdn_decode_triton(
+                    query=query,
+                    key=key,
+                    value=value,
+                    g=g,
+                    beta=beta,
+                    recurrent_state_pool=(
+                        context
+                        .gdn_recurrent_state_pool
+                    ),
+                    state_slot_ids=(
+                        context
+                        .gdn_state_slot_ids
+                    ),
+                    gdn_index=self.gdn_index,
+                    scale=(
+                        self.head_k_dim ** -0.5
+                    ),
+                    block_value=32,
+                )
+            )
+
+            # 状态已经被 Kernel 原地写入 State Pool。
+            #
+            # 不再创建和返回：
+            #
+            # final_state [B,H,Dk,Dv]
+            new_recurrent_state = None
+
+        else:
+            # Prefill，以及显式选择 FLA 的 Decode，
+            # 继续使用原有路径。
+            (
+                core_output,
+                new_recurrent_state,
+            ) = self._run_gated_delta_rule(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                recurrent_state=recurrent_state,
+                prefill_seqlens=prefill_seqlens,
+                gdn_cu_seqlens=gdn_cu_seqlens,
+            )
+            
         core_output = core_output.reshape(
             -1,
             self.head_v_dim,

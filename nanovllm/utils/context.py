@@ -28,6 +28,29 @@ class Context:
     #     FLA 使用的累积序列边界。
     prefill_seqlens: tuple[int, ...] | None = None
     gdn_cu_seqlens: torch.Tensor | None = None
+    
+    # Decode 阶段使用的 GDN recurrent backend。
+    gdn_decode_backend: str = "fla"
+
+    # 当前 Decode batch 中：
+    #
+    # batch row -> state pool slot
+    #
+    # shape:
+    # [B]
+    gdn_state_slot_ids: torch.Tensor | None = None
+
+    # HybridStateManager 持有的长期状态池。
+    #
+    # shape:
+    # [
+    #   num_slots,
+    #   num_gdn_layers,
+    #   H,
+    #   Dk,
+    #   Dv,
+    # ]
+    gdn_recurrent_state_pool: torch.Tensor | None = None
 
 
 _CONTEXT = Context()

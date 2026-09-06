@@ -893,6 +893,294 @@ class HybridStateManager:
         return states
 
     @torch.inference_mode()
+    def gather_batched_conv_states(
+        self,
+        slot_indices: torch.Tensor,
+    ) -> list[GDNLayerState | None]:
+        """
+        只 Gather 当前 Decode batch 的 conv_state。
+
+        不再 Gather recurrent_state，因为
+        State-aware Triton Kernel 会直接通过：
+
+            recurrent_state_pool
+            state_slot_ids
+            gdn_index
+
+        定位长期状态。
+        """
+
+        if slot_indices.ndim != 1:
+            raise ValueError(
+                "slot_indices must have shape [B]"
+            )
+
+        if slot_indices.numel() <= 0:
+            raise ValueError(
+                "slot_indices must not be empty"
+            )
+
+        if slot_indices.dtype != torch.long:
+            raise TypeError(
+                "slot_indices must use torch.long"
+            )
+
+        if slot_indices.device != self.device:
+            raise ValueError(
+                "slot_indices must be on the same "
+                "device as the state pool"
+            )
+
+        # conv_state_pool:
+        #
+        # [num_slots, num_gdn_layers, C, K]
+        #
+        # Gather 后：
+        #
+        # [B, num_gdn_layers, C, K]
+        batched_conv_states = torch.index_select(
+            self.conv_state_pool,
+            dim=0,
+            index=slot_indices,
+        )
+
+        states: list[
+            GDNLayerState | None
+        ] = [
+            None
+            for _ in range(
+                self.spec.num_hidden_layers
+            )
+        ]
+
+        for (
+            gdn_index,
+            global_layer_idx,
+        ) in enumerate(
+            self.spec.gdn_layer_indices
+        ):
+            states[global_layer_idx] = (
+                GDNLayerState(
+                    conv_state=(
+                        batched_conv_states[
+                            :,
+                            gdn_index,
+                        ]
+                    ),
+
+                    # recurrent_state 不再经过
+                    # Python 模型参数传递。
+                    recurrent_state=None,
+                )
+            )
+
+        return states
+
+
+    def read_batched_conv_states(
+        self,
+        slots: list[int],
+    ) -> tuple[
+        list[GDNLayerState | None],
+        torch.Tensor,
+    ]:
+        """
+        Eager Decode 使用的 conv-only Gather。
+
+        同时返回 GPU slot_indices，后续会把它传给
+        State-aware Triton Kernel。
+        """
+
+        (
+            normalized_slots,
+            slot_indices,
+        ) = self._prepare_slot_indices(slots)
+
+        if not all(
+            self.initialized_slots[slot]
+            for slot in normalized_slots
+        ):
+            raise RuntimeError(
+                "All Decode state slots must be "
+                "initialized before conv-only Gather"
+            )
+
+        states = self.gather_batched_conv_states(
+            slot_indices
+        )
+
+        return states, slot_indices
+
+
+    @torch.inference_mode()
+    def scatter_batched_conv_states(
+        self,
+        slot_indices: torch.Tensor,
+        states: list[
+            GDNLayerState | None
+        ],
+    ) -> None:
+        """
+        只把 causal convolution 更新后的 conv_state
+        写回状态池。
+
+        recurrent_state 已被 Triton Kernel 原地更新，
+        所以这里禁止再次收到或写回 recurrent_state。
+        """
+
+        if slot_indices.ndim != 1:
+            raise ValueError(
+                "slot_indices must have shape [B]"
+            )
+
+        if slot_indices.numel() <= 0:
+            raise ValueError(
+                "slot_indices must not be empty"
+            )
+
+        if slot_indices.dtype != torch.long:
+            raise TypeError(
+                "slot_indices must use torch.long"
+            )
+
+        if slot_indices.device != self.device:
+            raise ValueError(
+                "slot_indices must be on the same "
+                "device as the state pool"
+            )
+
+        batch_size = slot_indices.shape[0]
+
+        if (
+            len(states)
+            != self.spec.num_hidden_layers
+        ):
+            raise ValueError(
+                "states must contain one entry "
+                "per Decoder layer"
+            )
+
+        expected_conv_shape = (
+            batch_size,
+            self.spec.conv_dim,
+            self.spec.conv_kernel_size,
+        )
+
+        # Full Attention 层不能返回 GDN 状态。
+        for global_layer_idx in (
+            self.spec.full_attention_layer_indices
+        ):
+            if states[global_layer_idx] is not None:
+                raise ValueError(
+                    "Full Attention layer "
+                    f"{global_layer_idx} returned "
+                    "a GDN state"
+                )
+
+        validated_states: list[
+            tuple[int, GDNLayerState]
+        ] = []
+
+        # 先完成所有检查，再开始修改状态池。
+        for (
+            gdn_index,
+            global_layer_idx,
+        ) in enumerate(
+            self.spec.gdn_layer_indices
+        ):
+            state = states[global_layer_idx]
+
+            if (
+                state is None
+                or state.conv_state is None
+            ):
+                raise ValueError(
+                    "GDN layer "
+                    f"{global_layer_idx} did not "
+                    "return conv_state"
+                )
+
+            # 使用 State-aware Kernel 时，
+            # recurrent_state 不应作为临时量返回。
+            if state.recurrent_state is not None:
+                raise ValueError(
+                    "State-aware GDN Decode must not "
+                    "return a temporary recurrent_state"
+                )
+
+            if (
+                tuple(state.conv_state.shape)
+                != expected_conv_shape
+            ):
+                raise ValueError(
+                    "Invalid conv_state shape for "
+                    f"layer {global_layer_idx}: "
+                    f"{tuple(state.conv_state.shape)}"
+                )
+
+            if state.conv_state.device != self.device:
+                raise ValueError(
+                    "conv_state is on the wrong device"
+                )
+
+            if (
+                state.conv_state.dtype
+                != self.spec.conv_dtype
+            ):
+                raise TypeError(
+                    "conv_state has the wrong dtype"
+                )
+
+            validated_states.append(
+                (
+                    gdn_index,
+                    state,
+                )
+            )
+
+        # 每个 GDN 层只写回较小的 conv_state。
+        for gdn_index, state in validated_states:
+            self.conv_state_pool[
+                :,
+                gdn_index,
+            ].index_copy_(
+                dim=0,
+                index=slot_indices,
+                source=state.conv_state,
+            )
+
+
+    def write_batched_conv_states(
+        self,
+        slots: list[int],
+        states: list[
+            GDNLayerState | None
+        ],
+    ) -> None:
+        """
+        Eager Decode 使用的 conv-only Scatter。
+        """
+
+        (
+            normalized_slots,
+            slot_indices,
+        ) = self._prepare_slot_indices(slots)
+
+        if not all(
+            self.initialized_slots[slot]
+            for slot in normalized_slots
+        ):
+            raise RuntimeError(
+                "All Decode slots must remain "
+                "initialized during conv-only Scatter"
+            )
+
+        self.scatter_batched_conv_states(
+            slot_indices=slot_indices,
+            states=states,
+        )
+
+    @torch.inference_mode()
     def gather_batched_states_for_graph(
         self,
         slot_indices: torch.Tensor,

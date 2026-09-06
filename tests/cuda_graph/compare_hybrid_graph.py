@@ -242,6 +242,10 @@ def run_child(
         str(MODEL_PATH),
         enforce_eager=enforce_eager,
         tensor_parallel_size=1,
+
+        gdn_decode_backend=(
+            "state_aware_triton"
+        ),
         max_num_seqs=1,
         num_state_slots=1,
         max_model_len=512,

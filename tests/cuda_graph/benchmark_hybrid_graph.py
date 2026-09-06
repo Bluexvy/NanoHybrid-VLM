@@ -341,12 +341,21 @@ def run_child(
     output_path: Path,
     repeats: int,
     output_tokens: int,
+    gdn_backend: str,
 ) -> None:
     if mode not in {
         "eager",
         "graph",
     }:
         raise ValueError(mode)
+    if gdn_backend not in {
+        "fla",
+        "state_aware_triton",
+    }:
+        raise ValueError(
+            f"Unsupported GDN backend: "
+            f"{gdn_backend}"
+        )
 
     torch.manual_seed(2026)
     torch.cuda.manual_seed_all(2026)
@@ -371,6 +380,8 @@ def run_child(
             mode == "eager"
         ),
         tensor_parallel_size=1,
+
+        gdn_decode_backend=gdn_backend,
         max_model_len=512,
         max_num_batched_tokens=1024,
         # 最大 Decode Graph bucket 是 B=8，
@@ -433,7 +444,8 @@ def run_child(
             )
 
             print(
-                f"{mode} B={batch_size} "
+                f"{mode}/{gdn_backend} "
+                f"B={batch_size} "
                 f"repeat={repeat_index + 1}: "
                 f"{result['decode_tokens_per_second']:.2f} tok/s, "
                 f"TPOT={result['average_tpot_ms']:.3f} ms"
@@ -454,6 +466,7 @@ def run_child(
 
     payload = {
         "mode": mode,
+        "gdn_backend": gdn_backend,
         "batch_sizes": list(
             BATCH_SIZES
         ),
@@ -701,6 +714,14 @@ def parse_args() -> argparse.Namespace:
         ],
         default="all",
     )
+    parser.add_argument(
+        "--gdn-backend",
+        choices=[
+            "fla",
+            "state_aware_triton",
+        ],
+        default="fla",
+    )
 
     parser.add_argument(
         "--output",
@@ -745,6 +766,7 @@ def main() -> None:
         output_path=args.output,
         repeats=args.repeats,
         output_tokens=args.output_tokens,
+        gdn_backend=args.gdn_backend,
     )
 
 

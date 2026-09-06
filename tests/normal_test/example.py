@@ -13,6 +13,13 @@ def main():
         path,
         enforce_eager=True,
         tensor_parallel_size=1,
+
+        # 使用刚实现的 State-aware Triton
+        # recurrent GDN Decode Kernel。
+        gdn_decode_backend=(
+            "state_aware_triton"
+        ),
+
         max_model_len=1024,
         max_num_batched_tokens=1024,
         max_num_seqs=3,
@@ -20,7 +27,10 @@ def main():
         gpu_memory_utilization=0.9,
     )
     
-    sampling_params = SamplingParams(temperature=0.62, max_tokens=512)
+    sampling_params = SamplingParams(
+        temperature=0,
+        max_tokens=8,
+    )
     
     prompts = [
         "你好。",

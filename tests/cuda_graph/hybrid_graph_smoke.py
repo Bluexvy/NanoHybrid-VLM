@@ -28,21 +28,22 @@ def main() -> None:
     )
 
     llm = LLM(
-        MODEL_PATH,
-
-        # 关闭强制 Eager，启用 Graph。
-        enforce_eager=False,
-
+        str(MODEL_PATH),
+        enforce_eager=enforce_eager,
         tensor_parallel_size=1,
 
-        # 首次测试只允许 B=1。
+        gdn_decode_backend=(
+            "state_aware_triton"
+        ),
+        gdn_decode_backend=(
+            "state_aware_triton"
+        ),
+
         max_num_seqs=1,
         num_state_slots=1,
 
         max_model_len=512,
         max_num_batched_tokens=512,
-
-        # 给首次 Graph capture 留出较宽松显存。
         gpu_memory_utilization=0.80,
 
         hybrid_cuda_graph_batch_sizes=(

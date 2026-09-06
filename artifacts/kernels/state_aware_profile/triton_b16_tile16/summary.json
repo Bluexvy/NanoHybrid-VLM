@@ -1,0 +1,58 @@
+{
+  "backend": "triton",
+  "batch_size": 16,
+  "block_value": 16,
+  "num_slots": 32,
+  "gdn_layer_idx": 7,
+  "state_pool_shape": [
+    32,
+    24,
+    32,
+    128,
+    128
+  ],
+  "state_pool_dtype": "torch.float32",
+  "slot_ids": [
+    0,
+    2,
+    4,
+    6,
+    8,
+    10,
+    12,
+    14,
+    16,
+    18,
+    20,
+    22,
+    24,
+    26,
+    28,
+    30
+  ],
+  "event_benchmark": {
+    "benchmark_steps": 100,
+    "total_ms": 3.5521600246429443,
+    "mean_ms": 0.03552160024642945
+  },
+  "semantic_ranges": {
+    "nano::gdn_decode_step": {
+      "count": 8,
+      "cuda_total_us": 0.0,
+      "cuda_mean_us": 0.0
+    },
+    "nano::state_aware_triton": {
+      "count": 8,
+      "cuda_total_us": 137.0019999999999,
+      "cuda_mean_us": 17.125249999999987
+    }
+  },
+  "top_cuda_events": [
+    {
+      "name": "_state_aware_gdn_decode_kernel",
+      "count": 8,
+      "self_cuda_total_us": 137.0019999999999,
+      "self_cuda_mean_us": 17.125249999999987
+    }
+  ]
+}

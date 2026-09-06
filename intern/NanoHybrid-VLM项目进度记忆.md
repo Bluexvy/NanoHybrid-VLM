@@ -1,11 +1,13 @@
 # NanoHybrid-VLM 项目进度记忆
 
-> 更新时间：2026-09-03
+> 更新时间：2026-09-06
 > 当前分支：`main`  
-> 最近提交：`c411cf5 fully achieved partial cuda graph`
+> 历史核对提交（2026-09-02）：`c411cf5 fully achieved partial cuda graph`，不代表当前 HEAD。
 > 用途：记录实际完成、已经验证、当前断点和下一步。  
 > V1 完成度：约 90%～95%；文本/单图 Hybrid Runtime 已接通。
-> 扩展后总体完成度：约 85%～90%；V2 纯文本 GDN-aware Prefix State Cache 已完成；V3 Hybrid Decode CUDA Graph 已完成定义内的 Decode-only、精确 batch bucket、Graph 内 GDN Gather/Scatter、Eager fallback、正确性矩阵和性能实验；下一步进入 V4 状态感知 GDN Decode 算子。
+> 当前阶段：V2/V3 与 Triton recurrent 已有成果保持；2026-09-06 用户决定将当前算子实现为 CUDA C++，作为最后一个开发大 Part。最新断点为第 13 节 C1 待开始；完整路线见实施方案第 28 节。CUDA 后端尚未实现，完成后转入复盘与八股。
+
+> 协作约定：源码与测试由用户亲自修改、保存和运行；助手在聊天框给出替换位置、代码及解释，不直接修改代码文件。用户明确要求时可编辑方案/记忆。2026-09-06 已决定开展 CUDA C++ 最终教学阶段，但不授权助手代改源码。
 
 ## 1. 项目目标与边界
 
@@ -35,7 +37,7 @@ V1 范围：RTX 5090、BF16、TP=1、Eager；每个请求最多一张本地 PIL 
 V1：Qwen3.5-9B 文本/单图 Hybrid Runtime（当前主要功能已完成）
 V2：纯文本 GDN-aware Prefix State Cache（已完成并通过回归与性能实验）
 V3：Qwen3.5 Hybrid Decode-only CUDA Graph（已完成并通过正确性与性能实验）
-V4：状态感知 GDN Decode 融合算子（已进入 Part 1：真实 Decode Profile；Kernel 尚未实现）
+V4：状态感知 GDN Decode 融合算子（recurrent Triton 已实现并接入 Eager/Graph，详情见第 12 节）
 ```
 
 MTP、MoE、TP>1、多图、视频、图文 Prefix Cache、Prefill CUDA Graph、LM Head/Sampling CUDA Graph 和完整 Chunk Gated Delta Rule 自研 Kernel 仍不在当前正式范围内。
@@ -1162,7 +1164,9 @@ artifacts/cuda_graph/benchmark/eager_before_graph_gdn_io.json
 artifacts/cuda_graph/benchmark/graph_before_graph_gdn_io.json
 ~~~
 
-## 6. V4：状态感知 GDN Decode 融合算子（已纳入，未实现）
+## 6. V4：状态感知 GDN Decode 融合算子（原规划；实际进度见第 12 节）
+
+本节保留原范围：目前已完成 recurrent Kernel、状态池接入及所述验证，尚未实现独立 state-aware causal-conv Kernel。第 6.3 节清单为原规划，不再按全部未实现解读；实际外部输入包含 T=1 维度，见第 12.2 节。
 
 ### 6.1 项目定位
 
@@ -1232,7 +1236,7 @@ Kernel 必须通过 `state_slot_ids[row]` 直接定位真实状态池并原地�
 - 同时报告 Kernel latency、HBM/L2/occupancy 与 TPOT/Decode 吞吐，不能把微基准加速直接写成端到端收益。
 - 如果 custom 未超过 FLA，如实记录原因和适用边界，不宣称优化成功。
 
-## 7. 当前开发断点：V3 CUDA Graph 已完成，下一步进入 V4 GDN 算子
+## 7. V3 完成时的历史开发断点（当前断点见第 12.7 节）
 
 ### 7.1 V3 最终完成状态
 
@@ -1303,9 +1307,11 @@ python tests/cuda_graph/benchmark_hybrid_graph.py
 5. 建立 torch/fla/custom 的状态级正确性和微基准框架。
 6. 自定义算子必须继续兼容 Prefix restore、slot 复用、Continuous Batching 和 CUDA Graph replay。
 
-当前不能提前声称自研 GDN Kernel 已完成或性能超过 FLA；必须以 Profile、状态对齐、Kernel microbenchmark 和端到端 TPOT 数据为依据。
+以上为 V3 完成时的历史规划。现已获得第 12 节列出的 recurrent Kernel、状态对齐与性能证据，恢复开发不要重新从零实现。
 
-## 8. 剩余 Part
+## 8. V3 完成时的剩余 Part 估算（历史记录，已过期）
+
+本节“12 个 Part”是旧估算，不是当前剩余量；实际未完成工作见第 12.7 节。
 
 V2 Prefix Cache 和 V3 Hybrid Decode CUDA Graph 的核心实现与实验已经结束。剩余工作：
 
@@ -1364,7 +1370,7 @@ MTP、MoE、TP>1、多图、视频、图文 Prefix Cache、Prefill Graph 和完�
 - 已支持图文 Prefix Cache；当前 V2 只支持纯文本，图片身份、processor/mRoPE layout 和视觉状态尚未纳入 Key。
 - 已将完整请求链都 CUDA Graph 化；当前只 capture Hybrid Decoder Decode 主干，Vision/Prefill/LM Head/Sampling 仍是 Eager。
 - 任意 B≤16 都走 Graph；当前只有 B=1/2/4/8/16 精确命中，其他 batch 回退 Eager。
-- 已实现自研 GDN Decode Kernel；当前高性能路径仍使用 FLA/causal-conv1d，V4 才会根据真实 Profile 开发状态感知算子。
+- 已自研全部 GDN Kernel、state-aware causal-conv 或 CUDA C++ Kernel；当前已实现的是 Triton recurrent Decode，短卷积与 Prefill 仍沿用现有高性能路径。
 - 已实现 MTP 或 MoE。
 - 已支持多图、视频或 TP>1。
 - 已达到生产级 vLLM 的完整功能、稳定性和通用性能。
@@ -1372,7 +1378,7 @@ MTP、MoE、TP>1、多图、视频、图文 Prefix Cache、Prefill Graph 和完�
 - BF16 snapshot 在所有 Prompt 上与 FP32 严格逐 token 等价。
 - CUDA Graph 在所有并发和负载上都有 44.41% 提升；44.41% 是当前 B=1 benchmark，收益随 batch 增大而下降。
 
-完成 V4 后才可以增加：
+原规划中完成完整 V4 后的表述（尚不能整体使用，因 causal-conv 自研与 Nsight 证据未完成；当前可用表述见第 12.6 节）：
 
 > 基于 Nsight 定位 Qwen3.5 Decode 的 GDN 状态访问热点，实现支持离散 state_slot_ids 的状态感知融合 Kernel，原地更新 causal-conv state 与 FP32 recurrent state，并与 FLA 完成状态级对齐；性能数字同时报告微基准和端到端实测结果。
 
@@ -1434,7 +1440,7 @@ V4 预计主要修改/新增：
 nanovllm/layers/gated_delta_net.py   torch/fla/custom backend 和调用边界
 nanovllm/engine/hybrid_state.py      state pool 直接访问接口与 slot 校验
 nanovllm/engine/model_runner.py      custom backend、Graph capture 和 fallback
-nanovllm/kernels/                    state-aware conv/recurrent CUDA 扩展
+nanovllm/kernels/state_aware_gdn.py  已实现 PyTorch reference 与 Triton recurrent Kernel；不是 CUDA C++ 扩展
 tests/                               状态级对齐、动态 slot、微基准和端到端 Benchmark
 ~~~
 
@@ -1458,4 +1464,161 @@ git status --short
 4. 模型权重、大型 profiler、临时 “*.pt” dump 和无关环境文件不要提交。
 5. 使用 “git diff --check” 检查空白错误，再分别暂存源码、测试、文档和必要结果。
 
-恢复开发时从本文第 7.3 节开始：保持 V2 Prefix Cache 与 V3 CUDA Graph 的回归基线，先对 Eager/Graph Decode 做 Profile，再根据真实热点冻结 V4 状态感知 GDN 算子边界。
+恢复开发时从第 13 节 C1 开始，第 12 节为 Triton 已有基线；第 7.3 节为历史规划。
+
+## 12. 2026-09-05 最新进度：State-aware recurrent Triton 与 Profile
+
+本节保留 Triton 实现与实测基线；第 12.7 节关于 CUDA“尚未决定”的描述是 2026-09-05 历史状态，已由第 13 节用户决定取代。
+
+### 12.1 已实现的算子边界
+
+通过 PyTorch Profiler 定位 recurrent 状态搬运开销，实现按离散 slot 直接访问 FP32 pool 的 recurrent Decode Kernel。Prefill 继续走原路径；短卷积仍有 conv state Gather/Scatter，不声称整个 GDN 都已无中间状态。
+
+~~~text
+旧：Pool → Gather → batched_state → FLA → final_state → Scatter → Pool
+新：state_slot_ids + gdn_index → 一个 Triton Kernel 直接读写 Pool → output
+~~~
+
+融合顺序：Q/K L2 normalization → Q scale → 读取真实 slot → S_decay=exp(g)*S → prediction=k^T*S_decay → delta=beta*(v-prediction) → S_new=S_decay+k⊗delta → output=q^T*S_new → 原地写回状态。消除 recurrent 中间搬运，不是消除状态本身的读写。
+
+### 12.2 关键变量和接口
+
+| 变量/函数 | 当前作用及约束 |
+|---|---|
+| `state_aware_gdn_decode_reference` | PyTorch pool 直接访问参考实现，用于状态验证 |
+| `state_aware_gdn_decode_triton` | 校验输入并启动 `_state_aware_gdn_decode_kernel` |
+| `query/key` | `[B,1,H,Dk]`，当前 BF16；T=1 必须位于轴 1 |
+| `value/output` | `[B,1,H,Dv]`，二者形状及 dtype 相同，当前 BF16 |
+| `g/beta` | `[B,1,H]`，分别控制衰减与误差写入；微基准两者 FP32，不代表所有运行时 gate 必须 FP32 |
+| `recurrent_state_pool` | `[num_slots,num_gdn_layers,H,Dk,Dv]` FP32；9B 为 24 GDN 层，H=32，Dk=Dv=128 |
+| `state_slot_ids` | GPU `torch.long` 的 `[B]`；通过 `state_slot_ids[b]` 找到请求实际 slot，活跃写入 slot 必须互异 |
+| `gdn_index` | 紧凑 GDN 层编号，不是包含 Full Attention 的原始 Decoder 层号 |
+| `scale` | `Dk ** -0.5`，作用于归一化后的 Q |
+| `block_value` | 支持 16/32/64，运行时保留 32 |
+| `BLOCK_KEY` | `triton.next_power_of_2(Dk)`，当前 128 |
+| `grid` | `(B,H,ceil(Dv/block_value))` |
+| `num_warps/num_stages` | 当前为 8/1 |
+| `Config.gdn_decode_backend` | 默认 `fla`，可显式选择 `state_aware_triton` |
+| `Context.gdn_decode_backend/gdn_state_slot_ids/gdn_recurrent_state_pool` | 将路由、slot Tensor、实际 pool 传入模型层 |
+| `gather_batched_conv_states/scatter_batched_conv_states` | HybridStateManager 的 conv-only 批处理，不再搬运 recurrent state |
+| `use_state_aware_decode` | GDN 层判断非 Prefill 且选中新后端 |
+| `new_recurrent_state=None` | 新 Kernel 已写 pool，无需返回 final_state 给 Scatter |
+
+ModelRunner 接入 Eager 与 Graph。Graph 通过固定地址的 slot-ID Tensor 承载每轮变化的 slot 值；保留可显式选择的 FLA 基线，不声称所有 custom 错误均可自动 fallback。
+
+### 12.3 已有正确性证据
+
+以下来自此前本会话通过的测试记录，本次更新没有重新跑 GPU 测试：
+
+- `tests/kernels/test_state_aware_gdn_reference.py` 和 `test_state_aware_gdn_triton.py` 验证状态访问及 FLA 对齐；Triton 测试覆盖 B=1/4/16、8 次递推，B=16 最大 output 误差约 1.220703e-04，state 误差约 1.788139e-07。
+- custom Eager/Graph compare 已报告生成 token、conv state、recurrent state、逻辑 KV 完全一致。
+- B=1 smoke 的输出 8 tokens 对应 Prefill 首 token + 7 次 Graph Decode replay。
+- 四路径性能 JSON 中 Graph 各 B 有 189 次 replay、0 次 Eager fallback；性能记录不替代正确性断言。
+- V2/V3 原 FLA 后端通过的全部 Prefix、抢占、动态 slot 测试，不能未经核对就计作 custom 后端已覆盖；本轮 Tile profile 也不含独立逐 Tile 数值断言。
+
+### 12.4 完整模型四路径性能实验
+
+结果目录：`artifacts/kernels/state_aware_runtime/`，包含 `fla_eager.json`、`fla_graph.json`、`triton_eager.json`、`triton_graph.json`。项目 Qwen3.5-9B/RTX 5090、TP=1 环境，输出 64 tokens、重复 3 次；比较相同 Graph 模式，隔离算子收益。
+
+| B | FLA Graph tok/s | Triton Graph tok/s | 吞吐提升 | FLA TPOT ms | Triton TPOT ms |
+|---|---:|---:|---:|---:|---:|
+| 1 | 78.64 | 80.28 | 2.10% | 12.717 | 12.456 |
+| 2 | 140.88 | 145.05 | 2.96% | 14.197 | 13.789 |
+| 4 | 264.77 | 278.80 | 5.30% | 15.107 | 14.347 |
+| 8 | 488.86 | 539.76 | 10.41% | 16.365 | 14.821 |
+| 16 | 920.80 | 1086.47 | 17.99% | 17.376 | 14.727 |
+
+B=16 Graph TPOT 降低 15.25%；Eager B=16 吞吐約 800.38→874.90 tok/s，提升 9.31%。这是完整模型 Decode 指标，不代表 E2E 同比例改善。
+
+四路径实验记录：Eager peak allocated 减少约 758.65 MiB；Graph peak allocated 基本相同而 reserved 减少约 1568 MiB。allocator reserved 与活跃分配峰值必须区分。
+
+### 12.5 单层 Profile、Tile 选择与计时限制
+
+脚本：`tests/kernels/profile_state_aware_gdn.py`；结果目录：`artifacts/kernels/state_aware_profile/`。B=16，gdn_layer_idx=7，pool `[32,24,32,128,128]`，slot `[0,2,...,30]`。只执行一个 GDN 层，不能因为 pool 有 24 层就解释为整个模型前向。Profiler wait=1/warmup=2/active=8；Event 另计 100 次调用均值。
+
+| 路径 | Event 平均 μs | 相对旧路径加速 | Profiler Kernel 平均 μs |
+|---|---:|---:|---:|
+| Gather + FLA + Scatter | 78.809 | 1.00× | 60.180（三个 Kernel 合计） |
+| Triton Tile=16 | 35.522 | 2.219× | 17.125 |
+| Triton Tile=32 | 34.946 | 2.255× | 15.011 |
+| Triton Tile=64 | 35.261 | 2.235× | 17.465 |
+
+旧路径 Gather=19.605 μs、FLA=23.625 μs、Scatter=16.950 μs，搬运占此组 Kernel 时间 60.74%。新路径只出现 `_state_aware_gdn_decode_kernel`，证实独立 recurrent Gather/Scatter 已移除。Tile=32 延迟降低 55.66%，约 2.26× 加速，仅限本单层微基准。
+
+Tile=16/32/64 每个 program 分别处理 `[128,16/32/64]`，在 B=16/H=32/Dv=128 时启动 4096/2048/1024 个 program。32 本轮两种口径均最快，保留 32；Event 比 16/64 仅低 1.62%/0.89%，没有多轮独立重复或全 B Tile 矩阵，不宣称全局最优。寄存器压力、spill、occupancy 是待验证因素。
+
+计时陷阱：
+
+- Event 包围 Python 提交循环，可能包含 CPU 提交不及时产生的 GPU 空闲；不是纯 Kernel busy time。Profiler 与 Event 是不同测量阶段，不能相减得到精确 CPU 开销。
+- `top_cuda_events` 混合 CPU 算子归属时间与 CUDA Kernel 时间。`aten::index_select` 和其真实 indexSelect Kernel 是同一次工作，不能全表相加。
+- custom 外层 `nano::gdn_decode_step.cuda_total_us=0` 是时间归属未正确反映，不是零耗时；实际 Tile=32 Kernel 8 次合计 120.085 μs。
+- 单层循环重复同一组状态，缓存/提交方式与完整模型不同，不直接乘 24 推断整模型时间。
+
+### 12.6 排障记录与可用于面试的表述
+
+Profile 初稿由助手提供，存在接口对齐错误；用户按聊天框指导修正，四组已跑通：
+
+1. FLA `unsqueeze(2)` 将输入变成 `[B,H,1,D]`，误把 H 当 T；修正为 `unsqueeze(1)` 得到 `[B,1,H,D]`。不能 reshape 错误 final_state 来掩盖输入语义错误。
+2. custom 关键字应为 `query/key/value/gdn_index`；字典键可保留 q/k/v，如 `query=tensors["q"].unsqueeze(1)`。
+3. slot IDs 改 `torch.long`；`output=torch.empty_like(v.unsqueeze(1))`，输出 `[B,1,H,Dv]` BF16；pool 仍为 FP32。
+4. 两条路径显式使用 `scale=DK ** -0.5`；父进程 CalledProcessError 是子进程失败传播，应找最先发生的接口错误。
+
+当前可表述：
+
+> 基于 PyTorch Profiler 定位 GDN 状态搬运热点，以 Triton 实现支持离散 state_slot_ids 的 recurrent Decode Kernel，融合 Q/K normalization、状态衰减、delta update 和输出读取，直接原地更新 FP32 state pool，移除独立 recurrent Gather/Scatter。接入 Eager/CUDA Graph 并完成所述状态级与 Graph 对齐。B=16 单层微基准延迟由 78.81 μs 降至 34.95 μs（2.26×）；同模式完整模型 Graph benchmark 的 B=16 Decode 吞吐提升约 17.99%，TPOT 降低约 15.25%。
+
+不能宣称 CUDA C++ 已实现、短卷积已自研融合、微基准 2.26× 等于整模型加速、已有 Nsight Compute 的 HBM/L2/occupancy 证据，或所有 Prefix/抢占组合均已通过 custom 回归。
+
+### 12.7 下一步与用户约定
+
+1. 下一步分析新后端的完整模型 Profile：投影 GEMM、短卷积及 conv Gather/Scatter、Full Attention、norm/gate、LM Head/Sampling 的剩余占比，再决定优化对象。
+2. 必要时针对 Tile/warp 做重复计时和正确性检查，并补寄存器/spill/occupancy 证据；不重复从头实现已有 recurrent Kernel。
+3. 核对尚未明确覆盖的新后端 Prefix restore、抢占重算、slot 复用和动态 batch 测试配置，再完成报告与项目复盘。
+4. 用户询问能否用 CUDA C++：可以保持相同状态契约与数学递推，改写线程/warp 映射、归约、访存、同步并接入 PyTorch/current stream/Graph；尚未决定迁移，也不保证手写 CUDA 比 Triton 更快。
+5. 助手只在聊天框提供源码与测试修改步骤，由用户操作；仅在明确授权时更新记忆。本次只编辑本记忆文档，未改源码、测试、实施方案，未 commit，未重新运行 GPU 实验。
+
+## 13. 2026-09-06 最新决定：CUDA C++ 最后一个开发 Part
+
+### 13.1 用户决定与边界
+
+用户明确要求把当前 Triton State-aware GDN recurrent Decode 用 CUDA C++ 实现，从 CUDA 零基础一步步教学。此为最后一个开发大 Part，完成集成、验证与必要性能分析后，只做项目细节复盘、八股复习与简历整理，不自动开启新功能。
+
+当前仅完成方案登记，未创建或修改 CUDA/Python/C++ 源码与测试，未编译 CUDA 扩展，未迁移后端，未运行新实验。Triton/FLA/已有 reference 继续作为数值与性能基线；不能将既有 2.26× 或 17.99% 写成 CUDA 实测收益。
+
+范围锁定：L=1 recurrent Decode，query/key/value/output BF16，pool FP32，GPU int64 state_slot_ids，紧凑 gdn_index，原地衰减/Delta Rule/输出读取。g/beta 支持的 dtype 按实际接口核对。首个特化目标 H=32、Dk=Dv=128、B=1/2/4/8/16。短卷积、Prefill 仍用现有实现，自研 causal-conv 从最终必做清单移出；不新增 MTP/MoE、多卡、量化或通用 GEMM 项目。
+
+### 13.2 八个连续小节及状态
+
+| 小节 | 核心内容 | 当前状态 |
+|---|---|---|
+| C1 | 必要 C++、Host/Device、grid/block/thread、指针及第一个最小 Kernel | 待开始，当前恢复入口 |
+| C2 | .py/.cpp/.cu 扩展调用、Tensor 参数、device/current stream | 未开始 |
+| C3 | 五维 pool 的 stride 地址、slot/layer 映射和写入所有权 | 未开始 |
+| C4 | Q/K norm、kᵀS 所需的 warp/block 归约、shared memory 与同步 | 未开始 |
+| C5 | 完整正确版 state-aware recurrent CUDA Kernel，多步状态对齐 | 未开始 |
+| C6 | 合并访存、tile/线程布局、有界调优、Event/Profiler 指标 | 未开始 |
+| C7 | 拟定 state_aware_cuda 后端接入 Eager/已有 CUDA Graph | 未开始 |
+| C8 | 集中回归、同条件性能对比、报告与最终收尾 | 未开始 |
+
+一个大 Part 内八节，不代表八次对话就必须结束。基础知识结合当前代码讲，不先堆完整 CUDA 理论。每节给准确文件位置、代码、变量/shape、线程例子和必要检查；测试不再拆成大量单独小 Part。
+
+### 13.3 实现要持续记住的契约
+
+- `slot=state_slot_ids[b]`；pool offset 为 `slot*stride_slot + gdn_index*stride_layer + h*stride_head + k*stride_key + v*stride_value`，步长单位为元素，地址使用 64 位偏移。
+- 不复制整个 recurrent pool 或构造 batched_state/final_state；每个目标状态元素只有一个写入者；未选 slot/层必须不变。
+- CUDA 算法保持 Q/K normalization、scale、exp(g) 衰减、prediction、delta、S_new、Q 读取顺序，FP32 state 不降精度。先对齐再决定 fast math，不能以相似文本替代状态正确性。
+- 编译和预热在 capture 前完成，launcher 使用 PyTorch 当前 device/stream；Graph slot Tensor 地址不变、内容可变。路由必须在任何状态写入前决定，不能失败后重算导致状态更新两次。
+- 接口和构建方式到 C2 核对本地 PyTorch/Toolkit，不盲套新版本教程；若注册算子要正确声明 mutation。
+- 各后端比较要用相同初始状态的独立副本；计时重置放区间外，分清 Kernel busy time、CPU 提交跨度、Graph replay 和完整模型指标。
+
+### 13.4 验收、时间边界与复习入口
+
+详细验收见实施方案第 28.5～28.6 节：状态级及多步验证、离散/乱序 slot、Prefix 恢复与抢占、连续批处理和 Graph buckets、已有文本/单图路径、资源释放；独立 Kernel 与完整模型性能均需记录。使用 Compute Sanitizer 等工具检查适用的内存/同步问题，工具不可用须如实说明，不能声称验证过。
+
+CUDA 超过 Triton 是目标而不是预设完成事实。先完成正确实现，再做两轮有依据的布局/launch 调优及一次集成性能分析；如性能未超出，记录原因与限制，保留更合适的默认后端，不无限追加功能。正确性错误必须修复后才算完成。
+
+结束后复盘顺序：请求生命周期 → 模型/状态 → 调度 → Prefix → CUDA Graph → Triton/CUDA → Profile/Benchmark；穿插变量、地址、数值和面试追问。原“下一步新后端完整模型 Profile”并入 C6/C8，不再另开开发大 Part。
+
+### 13.5 文档与协作记录
+
+本次只更新 `intern/NanoHybrid-VLM项目实施方案.md` 和本进度记忆，未改任何源码/测试或提交 Git。助手提供聊天框代码，用户修改与运行的约定继续有效。恢复时先读方案第 28 节与本节，从 C1 起讲，不重新运行已完成的 Triton Tile 实验，不把方案中的拟定文件当成已创建。
