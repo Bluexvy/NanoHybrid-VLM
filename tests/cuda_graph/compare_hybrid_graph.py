@@ -19,10 +19,13 @@ MODEL_PATH = Path(
     "/workspace/models/Qwen3.5-9B"
 )
 
+GDN_BACKEND = "state_aware_cuda"
+
 ARTIFACT_DIR = (
     REPO_ROOT
     / "artifacts"
     / "cuda_graph"
+    / GDN_BACKEND
 )
 
 EAGER_DUMP_PATH = (
@@ -244,7 +247,7 @@ def run_child(
         tensor_parallel_size=1,
 
         gdn_decode_backend=(
-            "state_aware_triton"
+            GDN_BACKEND
         ),
         max_num_seqs=1,
         num_state_slots=1,
@@ -575,9 +578,9 @@ def compare_dumps() -> None:
         )
 
     print(
-        "\nPart 5A passed:"
+        "\nPart CUDA Graph Extension passed:"
     )
-
+    
     print(
         "- generated token IDs are exact"
     )

@@ -29,13 +29,6 @@ OUTPUT_DIR = (
     / "benchmark"
 )
 
-EAGER_PATH = (
-    OUTPUT_DIR / "eager.json"
-)
-
-GRAPH_PATH = (
-    OUTPUT_DIR / "graph.json"
-)
 BATCH_SIZES = (
     1,
     2,
@@ -348,10 +341,8 @@ def run_child(
         "graph",
     }:
         raise ValueError(mode)
-    if gdn_backend not in {
-        "fla",
-        "state_aware_triton",
-    }:
+    
+    if gdn_backend not in {"fla", "state_aware_triton", "state_aware_cuda"}:
         raise ValueError(
             f"Unsupported GDN backend: "
             f"{gdn_backend}"
@@ -527,15 +518,11 @@ def run_child(
     )
 
 
-def compare_results() -> None:
-    with EAGER_PATH.open(
-        encoding="utf-8",
-    ) as file:
+def compare_results(eager_path: Path, graph_path: Path) -> None:
+    with eager_path.open(encoding="utf-8") as file:
         eager = json.load(file)
 
-    with GRAPH_PATH.open(
-        encoding="utf-8",
-    ) as file:
+    with graph_path.open(encoding="utf-8") as file:
         graph = json.load(file)
 
     print(
@@ -658,28 +645,23 @@ def compare_results() -> None:
     )
 
 
-def run_all(
-    repeats: int,
-    output_tokens: int,
-) -> None:
-    script_path = Path(
-        __file__
-    ).resolve()
+def run_all(repeats: int, output_tokens: int, gdn_backend: str) -> None:
+    script_path = Path(__file__).resolve()
 
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    backend_output_dir = OUTPUT_DIR / gdn_backend
+    eager_path = backend_output_dir / "eager.json"
+    graph_path = backend_output_dir / "graph.json"
 
-    for mode, output_path in [
-        ("eager", EAGER_PATH),
-        ("graph", GRAPH_PATH),
-    ]:
+    backend_output_dir.mkdir(parents=True, exist_ok=True)
+
+    for mode, output_path in [("eager", eager_path), ("graph", graph_path)]:
         command = [
             sys.executable,
             str(script_path),
             "--mode",
             mode,
+            "--gdn-backend",
+            gdn_backend,
             "--output",
             str(output_path),
             "--repeats",
@@ -688,19 +670,11 @@ def run_all(
             str(output_tokens),
         ]
 
-        print(
-            "\nRunning:",
-            " ".join(command),
-        )
+        print("\nRunning:", " ".join(command))
 
-        subprocess.run(
-            command,
-            cwd=REPO_ROOT,
-            check=True,
-        )
+        subprocess.run(command, cwd=REPO_ROOT, check=True)
 
-    compare_results()
-
+    compare_results(eager_path, graph_path)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -716,11 +690,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gdn-backend",
-        choices=[
-            "fla",
-            "state_aware_triton",
-        ],
-        default="fla",
+        choices=["fla", "state_aware_triton", "state_aware_cuda"],
+        default="state_aware_cuda",
     )
 
     parser.add_argument(
@@ -749,9 +720,8 @@ def main() -> None:
     if args.mode == "all":
         run_all(
             repeats=args.repeats,
-            output_tokens=(
-                args.output_tokens
-            ),
+            output_tokens=args.output_tokens,
+            gdn_backend=args.gdn_backend,
         )
         return
 

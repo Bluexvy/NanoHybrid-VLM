@@ -1,0 +1,2 @@
+==ERROR== Could not open report file 'artifacts/kernels/splitk_float4_profile/splitk_b512.ncu-rep'.
+==ERROR== The file does not exist or is not a regular file.

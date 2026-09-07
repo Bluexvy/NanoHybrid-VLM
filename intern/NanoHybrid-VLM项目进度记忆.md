@@ -1343,7 +1343,7 @@ V2 Prefix Cache（已完成）
 
 MTP、MoE、TP>1、多图、视频、图文 Prefix Cache、Prefill Graph 和完整 Chunk Gated Delta Rule 自研 Kernel 不计入上述 12 个 Part。
 
-## 9. 当前可以和不能在面试中声称的内容
+## 9. V3 完成时可以和不能声称的内容（历史；最终口径见 13.16）
 
 可以准确表述 V1：
 
@@ -1464,11 +1464,11 @@ git status --short
 4. 模型权重、大型 profiler、临时 “*.pt” dump 和无关环境文件不要提交。
 5. 使用 “git diff --check” 检查空白错误，再分别暂存源码、测试、文档和必要结果。
 
-恢复开发时从第 13 节 C1 开始，第 12 节为 Triton 已有基线；第 7.3 节为历史规划。
+本段是旧恢复入口；当前恢复入口已经移动到 13.16，第 7.3 节和第 12 节只保留为历史规划与内部实验记录。
 
-## 12. 2026-09-05 最新进度：State-aware recurrent Triton 与 Profile
+## 12. 2026-09-05 内部历史原型与 Profile（不进入最终项目成果表述）
 
-本节保留 Triton 实现与实测基线；第 12.7 节关于 CUDA“尚未决定”的描述是 2026-09-05 历史状态，已由第 13 节用户决定取代。
+本节只保留早期内部原型和排障记录，不将该原型写入简历、最终项目总结或个人技术成果。第 12.7 节关于 CUDA“尚未决定”的描述是历史状态，已由第 13 节 CUDA C++ 实现取代；最终对外性能基线统一使用 FLA fused_recurrent_gated_delta_rule。
 
 ### 12.1 已实现的算子边界
 
@@ -1581,24 +1581,24 @@ Profile 初稿由助手提供，存在接口对齐错误；用户按聊天框指
 
 ### 13.1 用户决定与边界
 
-用户明确要求把当前 Triton State-aware GDN recurrent Decode 用 CUDA C++ 实现，从 CUDA 零基础一步步教学。此为最后一个开发大 Part，完成集成、验证与必要性能分析后，只做项目细节复盘、八股复习与简历整理，不自动开启新功能。
+用户明确要求实现 State-aware GDN recurrent Decode CUDA C++ 后端，并从 CUDA 零基础一步步掌握其实现。此为最后一个开发大 Part，完成集成、验证与必要性能分析后，只做项目细节复盘、八股复习与简历整理，不自动开启新功能。
 
-截至 2026-09-06，已完成 CUDA 编程模型入门和四个独立 GDN CUDA 正确性阶段：单 Head 递推、离散 State Pool 寻址、Kernel 内 Q/K normalization，以及 Block 级共享/归约优化。这些代码仍是独立 FP32 `.cu` 教学与验证程序，尚未实现 PyTorch C++/CUDA Extension、BF16 真实接口、真实尺寸性能基准或 Runtime 接入。Triton/FLA/已有 reference 继续作为数值与性能基线；不能将既有 2.26× 或 17.99% 写成 CUDA 实测收益。
+本段记录 2026-09-06 的历史中间状态：当时只完成 CUDA 编程模型入门和独立 FP32 GDN Kernel，尚未完成 Extension、BF16 或 Runtime；这些缺口现已由 13.13～13.16 完成，恢复项目时不得再从此旧断点开始。
 
 范围锁定：L=1 recurrent Decode，query/key/value/output BF16，pool FP32，GPU int64 state_slot_ids，紧凑 gdn_index，原地衰减/Delta Rule/输出读取。g/beta 支持的 dtype 按实际接口核对。首个特化目标 H=32、Dk=Dv=128、B=1/2/4/8/16。短卷积、Prefill 仍用现有实现，自研 causal-conv 从最终必做清单移出；不新增 MTP/MoE、多卡、量化或通用 GEMM 项目。
 
 ### 13.2 八个连续小节及状态
 
-| 小节 | 核心内容 | 当前状态 |
+| 小节 | 核心内容 | 最终状态 |
 |---|---|---|
 | C1 | 必要 C++、Host/Device、grid/block/thread、指针及第一个最小 Kernel | 已完成：CUDA 编程模型、内存、Warp/SIMT、合并访存、Occupancy、同步/原子操作和 `vector_add` |
-| C2 | .py/.cpp/.cu 扩展调用、Tensor 参数、device/current stream | 未开始 |
+| C2 | .py/.cpp/.cu 扩展调用、Tensor 参数、device/current stream | 已完成：PyTorch C++/CUDA Extension、current stream、可复用 output Workspace 和 capture 前预加载 |
 | C3 | 五维 pool 的 stride 地址、slot/layer 映射和写入所有权 | 已完成独立 FP32 版：`state_slot_ids[b]` 寻址，未选 slot/层保持不变 |
-| C4 | Q/K norm、kᵀS 所需的 warp/block 归约、shared memory 与同步 | 归约部分已完成：实现 Block Reduction、Hybrid Reduction 和 Full Warp Shuffle，最终采用 Full Warp Shuffle；二维 State Tile 未完成 |
-| C5 | 完整正确版 state-aware recurrent CUDA Kernel，多步状态对齐 | 部分完成：独立单步 FP32 数学与 CPU Reference 对齐；真实 shape、BF16 和多步待做 |
-| C6 | 合并访存、tile/线程布局、有界调优、Event/Profiler 指标 | 进行中：完成 Block 级 `(batch,head)` 映射、Q/K 共享、一次状态中间写回消除，以及 B=1～2048 的三种 Reduction CUDA Event 对比；下一步优化 State 访存 |
-| C7 | 拟定 state_aware_cuda 后端接入 Eager/已有 CUDA Graph | 未开始 |
-| C8 | 集中回归、同条件性能对比、报告与最终收尾 | 未开始 |
+| C4 | Q/K norm、kᵀS 所需的 warp/block 归约、shared memory 与同步 | 已完成：最终采用 Full Warp Shuffle；进一步完成四 Warp Split-K、跨 Warp partial remembered/output 合并和 float4 State Tile |
+| C5 | 完整正确版 state-aware recurrent CUDA Kernel，多步状态对齐 | 已完成：BF16 Q/K/V/Beta、FP32 G/State/累加、BF16 Output，B=1/2/4/8/16 连续 8 步 state/output 对齐 |
+| C6 | 合并访存、tile/线程布局、有界调优、Event/Profiler 指标 | Kernel 内部优化已收敛：State Staging、Thread Tile 2、Split-K+float4 均已公平对比；SASS 已确认 Global/Shared 128-bit 向量访问；硬件计数器受服务器权限限制 |
+| C7 | 拟定 state_aware_cuda 后端接入 Eager/已有 CUDA Graph | 已完成：Runtime 路由、非连续 stride、动态 slot、Eager 与 B=1/2/4/8/16 Graph bucket |
+| C8 | 集中回归、同条件性能对比、报告与最终收尾 | 已完成：多步状态、未选 slot、output Workspace、Graph replay、Continuous Batching 和 FLA 端到端性能对比 |
 
 一个大 Part 内八节，不代表八次对话就必须结束。基础知识结合当前代码讲，不先堆完整 CUDA 理论。每节给准确文件位置、代码、变量/shape、线程例子和必要检查；测试不再拆成大量单独小 Part。
 
@@ -1615,9 +1615,9 @@ Profile 初稿由助手提供，存在接口对齐错误；用户按聊天框指
 
 详细验收见实施方案第 28.5～28.6 节：状态级及多步验证、离散/乱序 slot、Prefix 恢复与抢占、连续批处理和 Graph buckets、已有文本/单图路径、资源释放；独立 Kernel 与完整模型性能均需记录。使用 Compute Sanitizer 等工具检查适用的内存/同步问题，工具不可用须如实说明，不能声称验证过。
 
-CUDA 超过 Triton 是目标而不是预设完成事实。先完成正确实现，再做两轮有依据的布局/launch 调优及一次集成性能分析；如性能未超出，记录原因与限制，保留更合适的默认后端，不无限追加功能。正确性错误必须修复后才算完成。
+CUDA 超过 FLA 高性能库基线是目标而不是预设完成事实。当前已经在受控 Eager/Graph 完整模型实验中验证收益；仍须按 13.15 的口径区分算子路径收益、Graph 收益和联合收益，不把联合收益写成纯 Kernel 加速。
 
-结束后复盘顺序：请求生命周期 → 模型/状态 → 调度 → Prefix → CUDA Graph → Triton/CUDA → Profile/Benchmark；穿插变量、地址、数值和面试追问。原“下一步新后端完整模型 Profile”并入 C6/C8，不再另开开发大 Part。
+结束后复盘顺序：请求生命周期 → 模型/状态 → 调度 → Prefix → CUDA Graph → FLA 基线/自研 CUDA → Profile/Benchmark；穿插变量、地址、数值和面试追问。原“下一步新后端完整模型 Profile”已经并入 C6/C8，不再另开开发大 Part。
 
 ### 13.5 文档与协作记录
 
@@ -1702,3 +1702,237 @@ Block 优化版的当前关键变量：
 - B=2048 的单层 FP32 State Pool 为 4 GiB。每个状态元素在当前公共尾部中为两次全局读和一次写，最低 State 流量约 12 GiB/launch；约 7.79 ms 延迟说明超大 B 已由 State 显存流量主导，归约差异被淹没。
 
 最终工程选择为 **Full Warp Shuffle 两级归约**。选择依据是小 Batch 下有稳定但有限的延迟收益，Shared Memory 从 2056 bytes 降到 1072 bytes，且 Warp 级归约结构更适合作为后续布局优化基础；不能表述为“大 Batch 显著超过 Block Reduction”。下一步不再继续调整 Norm Reduction，而是通过 Shared/Register State Staging 或其他布局手段评估能否消除 `S_old` 的第二次全局读取，并同时检查 Occupancy 与 spill。
+
+### 13.8 Full-State Shared Staging：收益边界与拒绝全局启用
+
+在 `tests/cuda_basics/gdn_warp_state_staging.cu` 中基于 Full Warp Shuffle 增加 `extern __shared__ float shared_state[]`，Shared Memory 逻辑布局为 `[Dk,Dv]`。第一遍 State 扫描将 `S_decay=exp(g)*S_old` 写入 Shared Memory 并计算 `remembered`；第二遍直接读取 Shared 中的 `S_decay`，更新最终 `S_new` 并只向 Global State Pool 写回一次。动态 Shared Memory 为 `128*128*4=65536 bytes/block`，另有约 1072 bytes 静态 Shared。
+
+关键变量与调用：
+
+- `shared_state_index=key_index*value_dim+value_index`：当前线程负责的 Shared State 元素。
+- `shared_state_bytes=key_dim*value_dim*sizeof(float)`：当前真实 shape 为 64 KiB。
+- `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize, 65536)`：允许 Kernel 使用 64 KiB 动态 Shared。
+- `gdn_index`：24 层循环中真实变化的紧凑 GDN 层号，避免只重复访问第 0 层造成缓存偏差。
+- 每个线程仍独占一个 `value_index` 列；两遍循环之间该线程只读取自己写入的 Shared 元素，不需要额外跨线程通信。
+
+单层重复同一状态容易被缓存影响，因此最终采用 `tests/cuda_basics/gdn_warp_state_staging_24layer_benchmark.cu` 循环 24 个 GDN 层。相对 Full Warp 的 24 层中位数结果：B=1/2/4 分别为约 1.734×/1.433×/1.157×；B=8/16 退化为 0.864×/0.569×。对应平均层延迟：B=1 为 16.383→9.451 μs，B=2 为 18.427→12.861 μs，B=4 为 24.000→20.751 μs，B=8 为 33.990→39.352 μs，B=16 为 43.028→75.567 μs；最大误差不超过约 1.63e-9。
+
+结论：State Staging 能在 B≤4 减少第二遍 Global State 读取，但 64 KiB 动态 Shared 显著限制大 Batch 下 Block 驻留和并发波次，不能全局启用。该实验说明“减少一次源码级 Global Load”不等于一定更快；必须同时评估 Shared 容量、Occupancy 和工作集缓存行为。
+
+### 13.9 Thread Tile 2：失败实验与并行度结论
+
+`tests/cuda_basics/gdn_thread_tile2_benchmark.cu` 将每个 `(batch,head)` 的 Block 从 128 线程改为 64 线程，每线程处理两个 Value 列：`first_value_index=thread_index`、`second_value_index=thread_index+64`。每线程维护两套 `remembered/delta/result`，两组 Warp 访问分别仍为连续地址，因此 Global 访问保持合并；但每个 Head 的 Warp 数由 4 降为 2，总 State 流量没有减少。
+
+24 层 B=1/2/4/8/16 测试中，Tile 2 分别比 Full Warp 慢 38.28%/42.03%/40.82%/13.62%/9.49%；单层大 Batch B=512/1024/2048 仍分别慢 9.93%/10.65%/11.46%。两者均为 40 registers/thread、约 1 KiB Shared、0 spill，排除了寄存器溢出和 Shared 容量原因。
+
+结论：Tile 2 把相同 State 工作压缩到一半 Warp，降低了 Memory-Level Parallelism 和隐藏访存延迟的能力；即使 B 增至 2048 也未反转，因此不进入任何 Runtime Dispatch，只保留为负向实验和设计依据。
+
+### 13.10 最终 FP32 Kernel：Warp-level Split-K + float4
+
+`tests/cuda_basics/gdn_splitk_float4_benchmark.cu` 保留一个 `(batch,head)` 对应 128 线程/4 Warp，不再降低 Warp 数；将 Reduction 维 Dk 分给 4 个 Warp，并让每个 lane 通过 float4 负责 4 个连续 Dv 元素：
+
+~~~text
+warp_index=0/1/2/3 -> key_begin=warp_index*32，分别负责 Dk 的 0:32/32:64/64:96/96:128
+lane_index=0..31   -> value_base=lane_index*4，分别负责 Dv 的 4 个连续元素
+一个线程 Tile      -> 32 个 Dk 行 × 4 个 Dv 列
+一个 Block         -> 4 Warp × 32 行 × 32 lane × 4 列 = 完整 128×128 State
+~~~
+
+关键变量与 Shared 结构：
+
+| 变量 | 作用 |
+|---|---|
+| `key_begin/key_end` | 当前 Warp 独占的 32 行 Dk 范围；不同 Warp 更新不同 State 行，不需要 atomic |
+| `value_base` | 当前 lane 负责的 4 个连续 Dv 起点，满足 16B 对齐的 float4 访问 |
+| `remembered_x/y/z/w` | 当前 Warp 对四个 Value 列计算的局部 `k^T*S_decay`，保存在寄存器中 |
+| `shared_remembered[4][128]` | 四个 Warp 的 partial remembered；Warp 0 合并后生成完整 remembered |
+| `shared_delta[128]` | `beta*(v-remembered)`；由 Warp 0 计算并广播给全部 Warp |
+| `output_x/y/z/w` | 当前 Warp 对四个 Value 列计算的局部 `q^T*S_new` |
+| `shared_output[4][128]` | 四个 Dk 分块的 partial output；Warp 0 合并并 float4 写回 |
+| `state_row[lane_index]` | 对齐的 float4 Global State Load/Store，一次处理 16 bytes |
+
+计算路径：Q/K Full Warp normalization → 四 Warp 各扫描 32 行并得到 partial remembered → Shared 合并 → Warp 0 计算 delta → 四 Warp 各自原地更新不相交的 State 行并得到 partial output → Shared 合并 → float4 写回 output。每个 State 元素仍为两读一写，但循环控制、地址计算和 Global 访存指令数减少，同时保留 4 Warp 并行度。
+
+24 层真实工作集结果：B=1/2/4/8/16 相对 Full Warp 分别为 1.834×/1.565×/1.447×/1.686×/1.012×；对应 Split-K 平均层延迟 8.878/11.723/16.485/20.096/42.475 μs。单层大工作集结果：B=64/128/256/512/1024/2048 分别为 1.131×/1.127×/1.096×/1.083×/1.083×/1.082×；B=32 单点为 0.975×，处于缓存/调度临界区且只有轻微差异，不单独据此增加 Dispatch 分支。
+
+大 Batch 测试将 `num_layers=1`，因为每请求每层 State 为 2 MiB；B=2048 单个 Pool 为 4 GiB，两个正确性 Pool 为 8 GiB，而 24 层单 Pool 将达到 96 GiB，不能在单张 5090 上运行。单层与 24 层缓存工作集不同，不能用单层 B=16 的 1.388×替代 24 层 B=16 的 1.012×。
+
+正确性从冷启动单步加强为连续 8 次 recurrent update：`S0→S1→...→S8`。B=16～2048 的 state/output 最大误差均不超过约 7.45e-9，验证不同 partial reduction 顺序只产生极小 FP32 舍入差异。
+
+### 13.11 编译资源、SASS 和 Profile 限制
+
+ptxas 静态资源：Full Warp 为 40 registers/thread、1072 bytes Shared、0 spill；Split-K+float4 为 54 registers/thread、5680 bytes Shared、0 spill。Split-K 多出的寄存器保存四组 remembered/delta/output，多出的 Shared 保存跨 Warp partial 与 delta；没有 Local Memory 溢出。
+
+`cuobjdump --dump-sass` 在 Split-K 函数作用域内确认大量 `LDG.E.128/STG.E.128`，而 Full Warp State 路径主要为标量 `LDG.E/STG.E`，证明源码 float4 真实生成 128-bit Global Load/Store。进一步检查 Shared 路径发现编译器也将连续 x/y/z/w 访问合并成 `LDS.128/STS.128`；读取四个 Warp partial 时出现间隔 0x200 bytes 的四组 LDS.128，恰好对应每个 `[128]` float Warp 切片。
+
+因此此前仅按标量地址 `value_base=lane*4` 推测的 4 路 Shared Bank Conflict 不适用于最终机器码。当前每 lane 的 16B 访问已被编译器合并，硬件按子事务处理连续地址；将布局强行改为 `[warp][component][lane]` 可能把一条 LDS.128 拆成四条标量指令，不能视为必然优化。最终不新增所谓 Bank-Free 版本，Kernel 内部优化在 SASS 核实后收敛。
+
+Profile 限制与排障：
+
+- Nsight Compute 2025.1.1 返回 `ERR_NVGPUCTRPERM`，共享服务器未向普通用户开放 GPU Performance Counters；无 sudo 时不能自行获取 DRAM/L2/Achieved Occupancy/Warp Stall 指标。
+- Nsight Systems 2024.6.2 与 Toolkit 内 2025.1.1 均能采集 CUDA 事件并生成 `.qdstrm`，但两套 `QdstrmImporter` 在生成 `.nsys-rep` 时均以 exit code 134 异常退出；直接 SQLite 导出同样失败。因此没有可用的 Nsys 统计表，不能声称已测硬件计数器。
+- Nsys 采集期间 CUDA Event 仍稳定复现 B=512：Full Warp 约 1.984～1.991 ms，Split-K 约 1.821～1.837 ms，三次约 1.081×～1.090×；结合原始 1.083×结果排除了单次频率波动。
+
+当前可准确表述：已通过 CUDA Event 确认多 Shape 收益，通过连续 8 步验证 State/Output，通过 ptxas 确认无 spill，通过 SASS 确认 Global 与 Shared 128-bit 向量访问；实际 DRAM 吞吐、Cache 命中率、Achieved Occupancy 和 Warp Stall 仍缺少硬件计数器证据。
+
+### 13.12 当前边界与下一恢复点
+
+截至 2026-09-07，独立 FP32 State-aware CUDA Kernel 的内部算法优化已完成，不再继续盲目添加 Thread Tile、Shared 转置、cp.async 或双缓冲。当前最终候选为 **Warp-level Split-K + float4**；State Staging 和 Full Warp 保留为对照/可能的 Shape 候选，Thread Tile 2 明确拒绝。
+
+尚未完成且不能声称：真实 BF16 Q/K/V 接口、FP32 State/累加混合精度、PyTorch C++/CUDA Extension、current stream、`state_aware_cuda` Runtime 路由、CUDA Graph capture/replay、Prefix/抢占/动态 slot 回归，以及完整模型相对 Triton 的端到端收益。
+
+下一恢复点固定为：实现并验证 **BF16 query/key/value 输入 + FP32 normalization/recurrent state/累加 + 与模型接口一致的输出 dtype**。先建立独立 BF16 CUDA 正确性和多步数值测试，再做 PyTorch Extension；不从已完成的 Reduction、State Staging、Tile 2 或 Split-K 实验重来。
+
+### 13.13 2026-09-07 最终 CUDA C++/PyTorch Extension 状态（取代 13.12 的旧断点）
+
+本节及其后内容是当前恢复入口，取代 13.12 中“BF16、Extension、Runtime 尚未完成”的历史断点。C2、C5、C7、C8 均已完成；CUDA C++ 是本项目最后一个开发 Part，后续默认进入全项目复盘、面试问答和简历整理，不自动增加新功能。
+
+最终代码链路：
+
+~~~text
+GatedDeltaNet.forward()
+→ state_aware_gdn_decode_cuda()
+→ PyTorch C++ Binding
+→ CUDA Launcher（PyTorch current stream）
+→ State-aware GDN CUDA Kernel
+→ recurrent_state_pool 原位更新 + BF16 output
+~~~
+
+核心文件：
+
+| 文件 | 作用 |
+|---|---|
+| nanovllm/kernels/cuda/state_aware_gdn_kernel.cu | 最终 CUDA Kernel、Tensor/stride 检查、current-stream launch |
+| nanovllm/kernels/cuda/state_aware_gdn_binding.cpp | PyBind 函数声明与 Python 可调用接口 |
+| nanovllm/kernels/state_aware_gdn_cuda.py | Extension JIT/load cache、CUDA 12.8 环境、Python 包装和 output Workspace |
+| nanovllm/layers/gated_delta_net.py | 在单 token Decode 中路由 state_aware_cuda；Prefill 保持原路径 |
+| nanovllm/engine/model_runner.py | capture 前预加载 Extension，并把 pool、slot IDs 和 gdn_index 放入运行上下文 |
+| tests/kernels/test_state_aware_gdn_cuda_extension.py | 非连续真实输入、多 Batch、多步递推、未选状态和 output 地址复用测试 |
+| tests/cuda_graph/compare_hybrid_graph.py | Eager/Graph 的 token、KV、conv/recurrent state 对齐 |
+| tests/cuda_graph/test_hybrid_graph_bucket_matrix.py | B=16→1 Continuous Batching、Graph bucket/fallback、状态隔离和资源释放 |
+
+最终 dtype、shape 与副作用契约：
+
+| 变量 | dtype / shape | 技术含义 |
+|---|---|---|
+| query、key | BF16，[B,1,32,128] | 当前 token 的归一化前 Q/K；Kernel 内用 FP32 累加求 L2 norm |
+| value | BF16，[B,1,32,128] | 当前 token 的 V |
+| g | FP32，[B,1,32] | 遗忘门对数；Kernel 使用 exp(g) 衰减旧状态 |
+| beta | BF16，[B,1,32] | Delta Rule 写入门 |
+| recurrent_state_pool | FP32，[num_slots,24,32,128,128] | 全局活跃 GDN 状态池；被算子原位修改 |
+| state_slot_ids | INT64，[B] | batch 行到物理 state slot 的离散映射 |
+| gdn_index | int64 标量 | 24 个紧凑 GDN 层中的当前层编号，不是原始 Decoder layer index |
+| scale | double 标量 | 通常为 Dk 的负二分之一次方 |
+| output | BF16，[B,1,32,128] | 可由 CUDA Graph 传入固定地址 Workspace；Kernel 原位写入并返回同一 Tensor |
+
+状态地址仍遵守：
+
+~~~text
+slot = state_slot_ids[batch_index]
+
+state offset =
+    slot * stride_slot
+  + gdn_index * stride_layer
+  + head_index * stride_head
+  + key_index * stride_key
+  + value_index
+~~~
+
+最终 Kernel 使用一个 Block 对应一个 batch/head，128 个线程组成 4 个 Warp。warp_index 将 Dk=128 切成四段，每个 lane 的 value_base=lane_index*4，通过 float4 处理四个连续 Dv 元素；四个 Warp 的 remembered/output partial 经 Shared Memory 合并。每个 Warp 更新互不重叠的 Dk 行，因此不需要 atomic。
+
+真实 mixed_qkv 经过 split 后不是连续 Tensor。最终接口不调用 contiguous，而显式传递 query/key/value、g、beta 和 output 的 batch/head stride；只要求最后一个向量维连续。实测 query shape 为（2,1,32,128），stride 为（12288,4096,128,1），is_contiguous=False，验证 Kernel 没有把 batch stride 错当成紧凑 Q 大小。
+
+Extension Loader 使用 _extension 缓存动态库，build_directory 固定在项目 .cache 下；CUDA_HOME=/workspace/cuda-12.8、TORCH_CUDA_ARCH_LIST=12.0、MAX_JOBS=1。ModelRunner 仅在 gdn_decode_backend=state_aware_cuda 时于 CUDA Graph capture 前预加载，避免首次 JIT 编译进入 capture。Launcher 使用 PyTorch 当前 CUDA stream，不做内部 synchronize，因而能保持异步执行并被现有 Graph 捕获。
+
+### 13.14 最终正确性与 Graph 验收
+
+独立 BF16 Kernel 使用 BF16 Q/K/V/Beta、FP32 G、FP32 State/累加和 BF16 Output；B=2、slot=[3,1]、gdn_index=1、连续 8 步递推下，最大 State 误差约 8.38e-9，Output 误差为 0，未选择 State 误差为 0。ptxas 报告 52 registers/thread、5680 bytes Shared、0 spill。
+
+PyTorch Extension 测试覆盖 B=1/2/4/8/16 和连续 8 步。最新非连续 stride 测试中最大 State 误差约 5.59e-9，最大 Output 误差约 1.91e-6，未选 slot/layer 误差始终为 0；显式传入 output 时 data_ptr 保持不变，验证 CUDA Graph 静态输出 Workspace 可复用。
+
+完整模型 Eager 验证已覆盖 B=1/4/8 的 64-token greedy 生成，生成 token 一致。CUDA Graph 对比已验证生成 token、conv state、recurrent state 和逻辑 KV Cache 一致，并确认 Graph replay 实际发生。
+
+Bucket Matrix 已覆盖捕获 bucket B=1/2/4/8/16，以及 Continuous Batching 的实际 batch 变化 16→15→…→1：精确 bucket 使用 Graph，未捕获的 15/14/…/3 安全回退 Eager；每条请求最终 token 与 KV/GDN fingerprint 一致，结束后 KV blocks 和 state slots 均释放。
+
+当前仍需保持的回归边界：任何 State Pool 布局、stride、Graph Workspace 或 Kernel 写回顺序修改，都必须重新验证非连续 mixed_qkv、乱序 slot、连续多步、未选状态、Eager/Graph 对齐、动态 batch 和资源释放。
+
+### 13.15 正式性能结论：FLA 基线与自研 CUDA
+
+最终对外基线使用项目依赖的 FLA 高性能库。单 token Decode 中 FLA 路径调用 fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule；多 token Prefill 仍调用 chunk_gated_delta_rule。早期内部原型不写入简历、最终项目总结或个人成果，也不使用其性能数字。
+
+正式实验条件：
+
+- GPU：NVIDIA GeForce RTX 5090。
+- 模型：Qwen3.5-9B，TP=1。
+- Batch：B=1/2/4/8/16。
+- 每请求输出 256 tokens，temperature=0、ignore_eos=True。
+- 每个 Batch 预热后重复 5 次；每次 Prefill 产生第一个 token，随后执行 255 个 Decode steps。
+- Eager 与 Graph 分别在独立进程运行；Extension 已命中构建缓存，稳态 Decode 指标不包含编译时间。
+- 结果目录：artifacts/cuda_graph/benchmark/fla/ 与 artifacts/cuda_graph/benchmark/state_aware_cuda/。
+
+完整模型 Decode 吞吐（tokens/s）：
+
+| B | FLA Eager | CUDA Eager | FLA Graph | CUDA Graph |
+|---:|---:|---:|---:|---:|
+| 1 | 54.58 | 64.85 | 78.45 | 79.68 |
+| 2 | 104.41 | 126.25 | 140.58 | 144.22 |
+| 4 | 209.28 | 252.20 | 264.26 | 277.47 |
+| 8 | 413.36 | 505.44 | 487.97 | 536.25 |
+| 16 | 800.21 | 1001.01 | 918.07 | 1070.18 |
+
+同为 Eager 时，CUDA 相对 FLA 的独立系统路径收益：
+
+| B | 吞吐提升 | TPOT 降低 |
+|---:|---:|---:|
+| 1 | +18.83% | -15.84% |
+| 2 | +20.91% | -17.30% |
+| 4 | +20.51% | -17.02% |
+| 8 | +22.28% | -18.22% |
+| 16 | +25.09% | -20.06% |
+
+双方均启用 CUDA Graph 后，CUDA 相对 FLA 的生产路径收益：
+
+| B | 吞吐提升 | TPOT 降低 |
+|---:|---:|---:|
+| 1 | +1.56% | -1.53% |
+| 2 | +2.59% | -2.53% |
+| 4 | +5.00% | -4.76% |
+| 8 | +9.89% | -9.00% |
+| 16 | +16.57% | -14.21% |
+
+最终 CUDA+Graph 相对最初 FLA+Eager 的联合收益：
+
+| B | 吞吐提升 | TPOT 降低 |
+|---:|---:|---:|
+| 1 | +45.98% | -31.50% |
+| 2 | +38.13% | -27.60% |
+| 4 | +32.59% | -24.58% |
+| 8 | +29.73% | -22.92% |
+| 16 | +33.74% | -25.23% |
+
+Graph 模式 P99 step latency 也持续改善：B=1/2/4/8/16 的 FLA Graph P99 分别为 12.780/14.275/15.182/16.454/17.505 ms，自研 CUDA Graph 分别为 12.594/13.911/14.471/14.973/15.024 ms。B=16 的 P99 降幅约 14.18%。
+
+每组 Graph 正式测试均记录 1275 次 replay，等于 255 Decode steps×5 repeats，说明计时阶段实际走 Graph 而非静默 fallback。Graph current allocated 为 24279.75 MiB，Eager 为 24230.87 MiB；metadata/hidden Workspace 为 0.13 MiB，capture allocated delta 为 48.88 MiB。
+
+收益随 Batch 增大的原因与算子边界一致：FLA 基线需要 Pool→Gather→batched recurrent state→FLA→final_state→Scatter→Pool；Graph 能录制这些操作，但不能消除实际状态流量。每条 Sequence 的 24 层 FP32 recurrent state payload 约 48 MiB，B=16 时约 768 MiB。自研 Kernel 根据 state_slot_ids 和 gdn_index 直接访问并原位更新 pool，因而在 Graph 已消除 launch 开销后，仍随 Batch 增大获得 1.56%→16.57% 的收益。
+
+这些结果是“完整模型中自研算子与状态管理协同后的系统路径收益”，不能描述成孤立数学 Kernel 相对 FLA Kernel 的纯 kernel-time 加速；45.98% 还同时包含 CUDA Graph 收益，不能写成“CUDA Kernel 单独加速 45.98%”。
+
+### 13.16 最终项目口径、限制与复盘入口
+
+当前可准确表述：
+
+> 面向 Qwen3.5 Hybrid 模型的 GDN 单 token Decode，自研 State-aware CUDA Kernel，支持 BF16 Q/K/V 输入、FP32 recurrent state、非连续 Tensor stride、动态 state_slot_ids 寻址及状态池原位更新；采用 Warp-level Split-K、float4 128-bit 向量访存和 Warp Shuffle 归约，通过 PyTorch C++/CUDA Extension 接入 Continuous Batching 与 CUDA Graph。相较 FLA fused recurrent Gated Delta Rule 基线路径，RTX 5090 上完整模型 Eager Decode 吞吐提升 18.83%～25.09%，双方均启用 CUDA Graph 后提升 1.56%～16.57%，B=16 时 TPOT 降低 14.21%。
+
+最终项目材料只把 FLA 作为第三方高性能基线，只把本人实现和理解的 CUDA C++/PyTorch Extension 作为自研算子成果。第 12 节早期内部原型只用于保留开发历史，不进入简历或最终讲解主线。
+
+仍不能声称：
+
+- 自研了完整 GDN：当前只替换 recurrent Delta Rule 的 L=1 Decode；depthwise causal convolution 和 Prefill chunk 算子仍使用现有高性能实现。
+- 支持任意模型和任意 shape：当前 Kernel 特化 Qwen3.5-9B 的 H=32、Dk=Dv=128。
+- 45.98% 是纯 Kernel 加速：它是 CUDA 算子和 CUDA Graph 相对 FLA Eager 的联合端到端收益。
+- 已获得 DRAM bandwidth、L2 hit rate、Achieved Occupancy 或 Warp Stall 硬件计数器；服务器权限和 Nsys 导入器问题使这些数据不可用。
+- 已完成自研 causal-conv、Prefill CUDA、TP>1 custom Kernel、Prefix Cache CUDA Kernel 或跨 GPU 通用验证。
+- 已经证明所有真实在线负载都有同样收益；当前 benchmark 是固定 prompt、固定 Batch、greedy 256-token Decode 的受控实验。
+
+开发阶段至此收敛。下一恢复入口不再是新增源码功能，而是按以下顺序从头复盘：请求生命周期 → Qwen3.5 Hybrid 模型与状态 → Scheduler/Continuous Batching/Chunked Prefill → Vision/mRoPE → GDN-aware Prefix Cache → Hybrid CUDA Graph → FLA 基线与 State-aware CUDA → Profile/Benchmark → 简历表述和高频追问。

@@ -159,9 +159,14 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         
+        # state_aware_cuda：
+        #     使用自研 CUDA C++ Extension，
+        #     根据 state_slot_ids 直接原地读写
+        #     recurrent_state_pool。
         supported_gdn_decode_backends = {
             "fla",
             "state_aware_triton",
+            "state_aware_cuda",
         }
 
         if (

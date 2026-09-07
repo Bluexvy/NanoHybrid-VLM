@@ -20,6 +20,8 @@ MODEL_PATH = (
     "/workspace/models/Qwen3.5-9B"
 )
 
+GDN_BACKEND = "state_aware_cuda"
+
 ARTIFACT_DIR = (
     REPO_ROOT
     / "artifacts"
@@ -254,10 +256,9 @@ def run_child(
 
     llm = LLM(
         MODEL_PATH,
-        enforce_eager=(
-            mode == "eager"
-        ),
+        enforce_eager=(mode == "eager"),
         tensor_parallel_size=1,
+        gdn_decode_backend=GDN_BACKEND,
         max_model_len=512,
         max_num_batched_tokens=512,
         max_num_seqs=NUM_REQUESTS,

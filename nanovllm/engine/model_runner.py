@@ -18,6 +18,9 @@ from nanovllm.engine.hybrid_cuda_graph import (
     HybridDecodeGraphPolicy,
     HybridDecodeStaticWorkspace,
 )
+from nanovllm.kernels.state_aware_gdn_cuda import (
+    load_state_aware_gdn_cuda_extension,
+)
 
 class ModelRunner:
     
@@ -195,9 +198,17 @@ class ModelRunner:
             rank=rank,
         )
 
+
         torch.cuda.set_device(rank)
 
+        if (
+            self.config.gdn_decode_backend
+            == "state_aware_cuda"
+        ):
+            load_state_aware_gdn_cuda_extension()
+
         default_dtype = torch.get_default_dtype()
+
 
         torch.set_default_dtype(model_dtype)
         torch.set_default_device("cuda")
@@ -1742,8 +1753,10 @@ class ModelRunner:
                 ] = old_count + 1
 
                 use_state_aware_decode = (
-                    self.config.gdn_decode_backend
-                    == "state_aware_triton"
+                    self.config.gdn_decode_backend in {
+                        "state_aware_triton",
+                        "state_aware_cuda",
+                    }
                 )
 
                 if use_state_aware_decode:
@@ -1768,7 +1781,7 @@ class ModelRunner:
                     decode_context = get_context()
 
                     decode_context.gdn_decode_backend = (
-                        "state_aware_triton"
+                        self.config.gdn_decode_backend
                     )
 
                     decode_context.gdn_state_slot_ids = (
@@ -1963,8 +1976,10 @@ class ModelRunner:
         )
 
         use_state_aware_decode = (
-            self.config.gdn_decode_backend
-            == "state_aware_triton"
+            self.config.gdn_decode_backend in {
+                "state_aware_triton",
+                "state_aware_cuda",
+            }
         )
 
         if use_state_aware_decode:
@@ -1979,7 +1994,7 @@ class ModelRunner:
             graph_context = get_context()
 
             graph_context.gdn_decode_backend = (
-                "state_aware_triton"
+                self.config.gdn_decode_backend
             )
 
             # 地址固定的是 Workspace 中的 Tensor。

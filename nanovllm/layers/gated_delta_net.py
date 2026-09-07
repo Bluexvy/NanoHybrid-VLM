@@ -26,7 +26,9 @@ from nanovllm.utils.context import get_context
 from nanovllm.kernels.state_aware_gdn import (
     state_aware_gdn_decode_triton,
 )
-
+from nanovllm.kernels.state_aware_gdn_cuda import (
+    state_aware_gdn_decode_cuda,
+)
 
 """Q、K 的 L2 归一化"""
 # 最后一维度才是每个head的向量维度
@@ -1556,7 +1558,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         use_state_aware_decode = (
             not context.is_prefill
             and context.gdn_decode_backend
-            == "state_aware_triton"
+            in {
+                "state_aware_triton",
+                "state_aware_cuda",
+            }
         )
 
         if use_state_aware_decode:
@@ -1589,28 +1594,55 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # gdn_index
             #
             # 定位状态池中的物理状态。
-            core_output = (
-                state_aware_gdn_decode_triton(
-                    query=query,
-                    key=key,
-                    value=value,
-                    g=g,
-                    beta=beta,
-                    recurrent_state_pool=(
-                        context
-                        .gdn_recurrent_state_pool
-                    ),
-                    state_slot_ids=(
-                        context
-                        .gdn_state_slot_ids
-                    ),
-                    gdn_index=self.gdn_index,
-                    scale=(
-                        self.head_k_dim ** -0.5
-                    ),
-                    block_value=32,
+            if (
+                context.gdn_decode_backend
+                == "state_aware_cuda"
+            ):
+                core_output = (
+                    state_aware_gdn_decode_cuda(
+                        query=query,
+                        key=key,
+                        value=value,
+                        g=g,
+                        beta=beta,
+                        recurrent_state_pool=(
+                            context
+                            .gdn_recurrent_state_pool
+                        ),
+                        state_slot_ids=(
+                            context
+                            .gdn_state_slot_ids
+                        ),
+                        gdn_index=self.gdn_index,
+                        scale=(
+                            self.head_k_dim ** -0.5
+                        ),
+                    )
                 )
-            )
+
+            else:
+                core_output = (
+                    state_aware_gdn_decode_triton(
+                        query=query,
+                        key=key,
+                        value=value,
+                        g=g,
+                        beta=beta,
+                        recurrent_state_pool=(
+                            context
+                            .gdn_recurrent_state_pool
+                        ),
+                        state_slot_ids=(
+                            context
+                            .gdn_state_slot_ids
+                        ),
+                        gdn_index=self.gdn_index,
+                        scale=(
+                            self.head_k_dim ** -0.5
+                        ),
+                        block_value=32,
+                    )
+                )
 
             # 状态已经被 Kernel 原地写入 State Pool。
             #
