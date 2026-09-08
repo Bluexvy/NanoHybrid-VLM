@@ -71,7 +71,7 @@ __global__ void gdn_warp_state_staging_fp32(
     int key_dim,
     int value_dim,
     int gdn_index)
-{
+    {
     constexpr int block_size = 128;
     constexpr int warp_size = 32;
     constexpr int num_warps = block_size / warp_size;
@@ -380,7 +380,7 @@ void gdn_state_pool_reference(
 
 
 int main()
-{
+    {
     /*
     小尺寸验证：
 
