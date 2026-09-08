@@ -512,6 +512,27 @@ class HybridStateManager:
 
         return normalized_slots, slot_indices
 
+    def prepare_decode_slot_indices(
+        self,
+        slots: list[int],
+    ) -> torch.Tensor:
+        """
+        为State-aware CUDA Decode创建：
+
+            batch row -> physical state slot
+
+        不执行任何Conv/Recurrent State Gather。
+        """
+
+        normalized_slots, slot_indices = self._prepare_slot_indices(slots)
+
+        if not all(self.initialized_slots[slot] for slot in normalized_slots):
+            raise RuntimeError(
+                "All Decode state slots must be initialized"
+            )
+
+        return slot_indices
+
     def is_slot_initialized(
         self,
         slot: int,

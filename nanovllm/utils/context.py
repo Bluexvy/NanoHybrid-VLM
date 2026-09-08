@@ -40,6 +40,17 @@ class Context:
     # [B]
     gdn_state_slot_ids: torch.Tensor | None = None
 
+    # GDN短期卷积状态池。
+    #
+    # shape:
+    # [
+    #   num_slots,
+    #   num_gdn_layers,
+    #   conv_dim,
+    #   conv_kernel_size,
+    # ]
+    gdn_conv_state_pool: torch.Tensor | None = None
+
     # HybridStateManager 持有的长期状态池。
     #
     # shape:

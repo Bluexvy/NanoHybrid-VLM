@@ -29,14 +29,11 @@ def main() -> None:
 
     llm = LLM(
         str(MODEL_PATH),
-        enforce_eager=enforce_eager,
+        enforce_eager=False,
         tensor_parallel_size=1,
 
         gdn_decode_backend=(
-            "state_aware_triton"
-        ),
-        gdn_decode_backend=(
-            "state_aware_triton"
+            "state_aware_cuda"
         ),
 
         max_num_seqs=1,

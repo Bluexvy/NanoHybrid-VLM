@@ -135,3 +135,49 @@ def state_aware_gdn_decode_cuda(
         output,
         scale,
     )
+    
+@torch.inference_mode()
+def state_aware_causal_conv1d_cuda(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    conv_state_pool: torch.Tensor,
+    state_slot_ids: torch.Tensor,
+    gdn_index: int,
+    *,
+    output: torch.Tensor | None = None,
+    block_size: int = 256,
+) -> torch.Tensor:
+    """
+    State-aware Causal Conv Decode。
+
+    x:
+        [B, C, 1], BF16
+
+    weight:
+        [C, 4], BF16
+
+    conv_state_pool:
+        [num_slots, num_gdn_layers, C, 4], BF16
+
+    state_slot_ids:
+        [B], INT64
+    """
+
+    if output is None:
+        output = torch.empty(
+            x.shape,
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+    extension = _load_extension()
+
+    return extension.state_aware_causal_conv1d(
+        x,
+        weight,
+        conv_state_pool,
+        state_slot_ids,
+        gdn_index,
+        output,
+        block_size,
+    )

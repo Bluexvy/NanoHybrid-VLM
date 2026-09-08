@@ -26,6 +26,16 @@ torch::Tensor state_aware_gdn_cuda(
 );
 
 
+torch::Tensor state_aware_causal_conv1d_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    torch::Tensor conv_state_pool,
+    const torch::Tensor& state_slot_ids,
+    int64_t gdn_index,
+    torch::Tensor output,
+    int64_t block_size
+);
+
 /*
 TORCH_EXTENSION_NAME 由 PyTorch 编译系统自动替换成
 Extension 的模块名。
@@ -83,6 +93,38 @@ Inputs:
 Side effects:
     recurrent_state_pool is updated in place.
     output is written in place.
+
+Returns:
+    output
+)doc"
+    );
+        module.def(
+        "state_aware_causal_conv1d",
+        &state_aware_causal_conv1d_cuda,
+        R"doc(
+State-aware causal convolution Decode CUDA operator.
+
+Inputs:
+    x:
+        [B, C, 1], BF16
+
+    weight:
+        [C, 4], BF16
+
+    conv_state_pool:
+        [num_slots, num_gdn_layers, C, 4], BF16
+
+    state_slot_ids:
+        [B], INT64
+
+    gdn_index:
+        Compact GDN layer index.
+
+    output:
+        [B, C, 1], BF16
+
+Side effects:
+    The selected Conv State Pool rows are updated in place.
 
 Returns:
     output

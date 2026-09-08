@@ -334,6 +334,120 @@ __global__ void state_aware_gdn_bf16_kernel(
     }
 }
 
+constexpr int CONV_KERNEL_SIZE = 4;
+
+/*
+一个线程处理一个：
+
+    batch_index × channel_index
+
+状态地址：
+
+    conv_state_pool[
+        state_slot_ids[batch_index],
+        gdn_index,
+        channel_index,
+        0:4
+    ]
+*/
+__global__ void state_aware_causal_conv1d_bf16_kernel(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* weight,
+    const int64_t* state_slot_ids,
+    __nv_bfloat16* conv_state_pool,
+    __nv_bfloat16* output,
+    int batch_size,
+    int num_gdn_layers,
+    int num_channels,
+    int gdn_index,
+    int64_t x_batch_stride,
+    int64_t x_channel_stride,
+    int64_t output_batch_stride,
+    int64_t output_channel_stride)
+{
+    int work_index = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_work = batch_size * num_channels;
+
+    if (work_index >= total_work) {
+        return;
+    }
+
+    int batch_index = work_index / num_channels;
+    int channel_index = work_index % num_channels;
+
+    int64_t state_slot = state_slot_ids[batch_index];
+
+    int64_t state_base =
+        ((state_slot * num_gdn_layers + gdn_index) * num_channels + channel_index) * CONV_KERNEL_SIZE;
+
+    int64_t x_offset =
+        static_cast<int64_t>(batch_index) * x_batch_stride
+        + static_cast<int64_t>(channel_index) * x_channel_stride;
+
+    int64_t output_offset =
+        static_cast<int64_t>(batch_index) * output_batch_stride
+        + static_cast<int64_t>(channel_index) * output_channel_stride;
+
+    /*
+    K=4，每个元素是BF16：
+
+        4 × 2 bytes = 8 bytes
+
+    因此一个线程一次读取完整的4个历史状态。
+    */
+    BFloat16x4* state_vector = reinterpret_cast<BFloat16x4*>(conv_state_pool + state_base);
+    const BFloat16x4* weight_vector = reinterpret_cast<const BFloat16x4*>(weight + static_cast<int64_t>(channel_index) * CONV_KERNEL_SIZE);
+
+    BFloat16x4 packed_old_state = state_vector[0];
+    BFloat16x4 packed_weight = weight_vector[0];
+
+    float2 old_state_01 = __bfloat1622float2(packed_old_state.xy);
+    float2 old_state_23 = __bfloat1622float2(packed_old_state.zw);
+
+    float2 weight_01 = __bfloat1622float2(packed_weight.xy);
+    float2 weight_23 = __bfloat1622float2(packed_weight.zw);
+
+    float current_input = __bfloat162float(x[x_offset]);
+
+    /*
+    旧状态：
+
+        [s0, s1, s2, s3]
+
+    加入当前输入后：
+
+        [s1, s2, s3, x]
+    */
+    float new_state_0 = old_state_01.y;
+    float new_state_1 = old_state_23.x;
+    float new_state_2 = old_state_23.y;
+    float new_state_3 = current_input;
+
+    BFloat16x4 packed_new_state;
+    packed_new_state.xy = __floats2bfloat162_rn(new_state_0, new_state_1);
+    packed_new_state.zw = __floats2bfloat162_rn(new_state_2, new_state_3);
+
+    state_vector[0] = packed_new_state;
+
+    /*
+    Depthwise Causal Conv：
+
+        convolution =
+              new_state_0 * weight_0
+            + new_state_1 * weight_1
+            + new_state_2 * weight_2
+            + new_state_3 * weight_3
+    */
+    float convolution = 0.0f;
+    convolution = fmaf(new_state_0, weight_01.x, convolution);
+    convolution = fmaf(new_state_1, weight_01.y, convolution);
+    convolution = fmaf(new_state_2, weight_23.x, convolution);
+    convolution = fmaf(new_state_3, weight_23.y, convolution);
+
+    float activated = convolution / (1.0f + expf(-convolution));
+
+    output[output_offset] = __float2bfloat16_rn(activated);
+}
 
 /*
 PyTorch 调用的 CUDA Launcher。
@@ -487,6 +601,91 @@ torch::Tensor state_aware_gdn_cuda(
     /*
     只检查 Launch 错误，不进行 cudaDeviceSynchronize()。
     */
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return output;
+}
+
+torch::Tensor state_aware_causal_conv1d_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    torch::Tensor conv_state_pool,
+    const torch::Tensor& state_slot_ids,
+    int64_t gdn_index,
+    torch::Tensor output,
+    int64_t block_size)
+{
+    TORCH_CHECK(
+        x.is_cuda() && weight.is_cuda() && conv_state_pool.is_cuda()
+        && state_slot_ids.is_cuda() && output.is_cuda(),
+        "all inputs must be CUDA tensors"
+    );
+
+    TORCH_CHECK(
+        x.scalar_type() == at::kBFloat16 && weight.scalar_type() == at::kBFloat16
+        && conv_state_pool.scalar_type() == at::kBFloat16
+        && output.scalar_type() == at::kBFloat16
+        && state_slot_ids.scalar_type() == at::kLong,
+        "expected X/Weight/State/Output=BF16 and state_slot_ids=INT64"
+    );
+
+    int64_t batch_size = x.size(0);
+    int64_t num_channels = x.size(1);
+    int64_t num_gdn_layers = conv_state_pool.size(1);
+
+    TORCH_CHECK(
+        x.dim() == 3 && batch_size > 0 && num_channels > 0 && x.size(2) == 1
+        && weight.dim() == 2 && weight.size(0) == num_channels && weight.size(1) == CONV_KERNEL_SIZE
+        && conv_state_pool.dim() == 4 && conv_state_pool.size(0) > 0
+        && num_gdn_layers > 0 && conv_state_pool.size(2) == num_channels
+        && conv_state_pool.size(3) == CONV_KERNEL_SIZE
+        && state_slot_ids.dim() == 1 && state_slot_ids.size(0) == batch_size
+        && output.sizes() == x.sizes()
+        && gdn_index >= 0 && gdn_index < num_gdn_layers,
+        "invalid X, Weight, Conv State Pool, state_slot_ids, output or gdn_index"
+    );
+
+    TORCH_CHECK(
+        weight.is_contiguous() && conv_state_pool.is_contiguous() && state_slot_ids.is_contiguous(),
+        "weight, conv_state_pool and state_slot_ids must be contiguous"
+    );
+
+    TORCH_CHECK(
+        block_size == 64 || block_size == 128 || block_size == 256 || block_size == 512,
+        "block_size must be 64, 128, 256 or 512"
+    );
+
+    c10::cuda::CUDAGuard device_guard(x.device());
+
+    const __nv_bfloat16* x_pointer = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>());
+    const __nv_bfloat16* weight_pointer = reinterpret_cast<const __nv_bfloat16*>(weight.data_ptr<at::BFloat16>());
+    const int64_t* state_slot_ids_pointer = state_slot_ids.data_ptr<int64_t>();
+    __nv_bfloat16* state_pointer = reinterpret_cast<__nv_bfloat16*>(conv_state_pool.data_ptr<at::BFloat16>());
+    __nv_bfloat16* output_pointer = reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
+
+    int device_index = x.get_device();
+    cudaStream_t current_stream = c10::cuda::getCurrentCUDAStream(device_index);
+
+    int threads = static_cast<int>(block_size);
+    int total_work = static_cast<int>(batch_size * num_channels);
+    int blocks = (total_work + threads - 1) / threads;
+
+    state_aware_causal_conv1d_bf16_kernel<<<blocks, threads, 0, current_stream>>>(
+        x_pointer,
+        weight_pointer,
+        state_slot_ids_pointer,
+        state_pointer,
+        output_pointer,
+        static_cast<int>(batch_size),
+        static_cast<int>(num_gdn_layers),
+        static_cast<int>(num_channels),
+        static_cast<int>(gdn_index),
+        x.stride(0),
+        x.stride(1),
+        output.stride(0),
+        output.stride(1)
+    );
+
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return output;

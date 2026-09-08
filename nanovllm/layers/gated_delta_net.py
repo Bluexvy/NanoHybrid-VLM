@@ -27,6 +27,7 @@ from nanovllm.kernels.state_aware_gdn import (
     state_aware_gdn_decode_triton,
 )
 from nanovllm.kernels.state_aware_gdn_cuda import (
+    state_aware_causal_conv1d_cuda,
     state_aware_gdn_decode_cuda,
 )
 
@@ -968,7 +969,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         ) = None,
     ) -> tuple[
         torch.Tensor,
-        torch.Tensor,
+        torch.Tensor | None,
     ]:
         is_variable_length_prefill = (
             prefill_seqlens is not None
@@ -1029,6 +1030,44 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         weight = self.conv1d.weight.squeeze(1)
 
+        context = get_context()
+
+        use_state_aware_conv = (
+            not context.is_prefill
+            and context.gdn_decode_backend == "state_aware_cuda"
+        )
+
+        if use_state_aware_conv:
+            if sequence_length != 1:
+                raise RuntimeError(
+                    "State-aware Causal Conv only supports Decode with sequence_length=1"
+                )
+
+            if conv_state is not None:
+                raise RuntimeError(
+                    "State-aware Causal Conv received a temporary conv_state"
+                )
+
+            if context.gdn_conv_state_pool is None:
+                raise RuntimeError(
+                    "State-aware Causal Conv is missing gdn_conv_state_pool"
+                )
+
+            if context.gdn_state_slot_ids is None:
+                raise RuntimeError(
+                    "State-aware Causal Conv is missing gdn_state_slot_ids"
+                )
+
+            conv_output = state_aware_causal_conv1d_cuda(
+                x=mixed_qkv,
+                weight=weight,
+                conv_state_pool=context.gdn_conv_state_pool,
+                state_slot_ids=context.gdn_state_slot_ids,
+                gdn_index=self.gdn_index,
+                block_size=256,
+            )
+
+            return conv_output, None
         # 在这里判断是Prefill/Chunked Prefill/Decode 还是 新请求只有一个token
         # 通过两个条件判断 
         # 有没有旧 conv_state

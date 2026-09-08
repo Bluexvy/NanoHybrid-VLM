@@ -1752,62 +1752,58 @@ class ModelRunner:
                     route.reason
                 ] = old_count + 1
 
+                gdn_decode_backend = self.config.gdn_decode_backend
+
                 use_state_aware_decode = (
-                    self.config.gdn_decode_backend in {
+                    gdn_decode_backend in {
                         "state_aware_triton",
                         "state_aware_cuda",
                     }
                 )
 
+                use_direct_conv_state = (
+                    gdn_decode_backend == "state_aware_cuda"
+                )
+
                 if use_state_aware_decode:
-                    # 只 Gather 较小的 conv_state。
-                    #
-                    # recurrent_state 不再产生
-                    # [B,H,Dk,Dv] 临时 Tensor。
-                    (
-                        old_gdn_states,
-                        state_slot_ids,
-                    ) = (
-                        state_manager
-                        .read_batched_conv_states(
+                    if use_direct_conv_state:
+                        state_slot_ids = state_manager.prepare_decode_slot_indices(
                             state_slots
                         )
-                    )
 
-                    # prepare_decode() 已经建立了包含
-                    # Paged KV metadata 的 Context。
-                    #
-                    # 这里只补充 State-aware GDN 所需字段。
+                        # Conv和Recurrent状态都由CUDA Kernel直接访问，
+                        # 不再向模型传递任何临时GDN状态。
+                        old_gdn_states = None
+
+                    else:
+                        # 旧后端仍然只对Conv State执行Gather。
+                        old_gdn_states, state_slot_ids = (
+                            state_manager.read_batched_conv_states(
+                                state_slots
+                            )
+                        )
+
                     decode_context = get_context()
 
-                    decode_context.gdn_decode_backend = (
-                        self.config.gdn_decode_backend
-                    )
+                    decode_context.gdn_decode_backend = gdn_decode_backend
+                    decode_context.gdn_state_slot_ids = state_slot_ids
+                    decode_context.gdn_recurrent_state_pool = state_manager.recurrent_state_pool
 
-                    decode_context.gdn_state_slot_ids = (
-                        state_slot_ids
-                    )
+                    if use_direct_conv_state:
+                        decode_context.gdn_conv_state_pool = state_manager.conv_state_pool
 
-                    decode_context.gdn_recurrent_state_pool = (
-                        state_manager
-                        .recurrent_state_pool
-                    )
-
-                    (
-                        hidden_states,
-                        updated_gdn_states,
-                    ) = self.model(
+                    hidden_states, updated_gdn_states = self.model(
                         input_ids=input_ids,
                         positions=positions,
                         gdn_states=old_gdn_states,
                     )
 
-                    # recurrent state 已经原地更新。
-                    # 这里只写回 conv_state。
-                    state_manager.write_batched_conv_states(
-                        state_slots,
-                        updated_gdn_states,
-                    )
+                    # 只有未实现直接Conv State寻址的后端还需要写回。
+                    if not use_direct_conv_state:
+                        state_manager.write_batched_conv_states(
+                            state_slots,
+                            updated_gdn_states,
+                        )
 
                 else:
                     # 原始 FLA 路径保留，作为正确性基线。
@@ -1975,47 +1971,41 @@ class ModelRunner:
             ]
         )
 
+        gdn_decode_backend = self.config.gdn_decode_backend
+
         use_state_aware_decode = (
-            self.config.gdn_decode_backend in {
+            gdn_decode_backend in {
                 "state_aware_triton",
                 "state_aware_cuda",
             }
         )
 
-        if use_state_aware_decode:
-            # CUDA Graph 中只捕获 conv_state Gather。
-            input_states = (
-                state_manager
-                .gather_batched_conv_states(
-                    slot_indices
-                )
-            )
+        use_direct_conv_state = (
+            gdn_decode_backend == "state_aware_cuda"
+        )
 
+        if use_state_aware_decode:
             graph_context = get_context()
 
-            graph_context.gdn_decode_backend = (
-                self.config.gdn_decode_backend
-            )
+            graph_context.gdn_decode_backend = gdn_decode_backend
+            graph_context.gdn_state_slot_ids = slot_indices
+            graph_context.gdn_recurrent_state_pool = state_manager.recurrent_state_pool
 
-            # 地址固定的是 Workspace 中的 Tensor。
-            #
-            # Replay 前只修改其中的 slot ID 内容。
-            graph_context.gdn_state_slot_ids = (
-                slot_indices
-            )
+            if use_direct_conv_state:
+                graph_context.gdn_conv_state_pool = state_manager.conv_state_pool
 
-            # State Pool 在 ModelRunner 生命周期中
-            # 地址固定，适合被 CUDA Graph 捕获。
-            graph_context.gdn_recurrent_state_pool = (
-                state_manager.recurrent_state_pool
-            )
+                # 两类状态都通过固定地址State Pool访问，
+                # Graph中不再捕获任何GDN State Gather。
+                input_states = None
 
-        else:
-            input_states = (
-                state_manager
-                .gather_batched_states_for_graph(
+            else:
+                input_states = state_manager.gather_batched_conv_states(
                     slot_indices
                 )
+
+        else:
+            input_states = state_manager.gather_batched_states_for_graph(
+                slot_indices
             )
 
         (
@@ -2036,15 +2026,13 @@ class ModelRunner:
             gdn_states=input_states,
         )
 
-        if use_state_aware_decode:
-            # recurrent state 已由 Triton Kernel
-            # 直接原地写入状态池。
+        if gdn_decode_backend == "state_aware_triton":
             state_manager.scatter_batched_conv_states(
                 slot_indices=slot_indices,
                 states=updated_gdn_states,
             )
 
-        else:
+        elif not use_state_aware_decode:
             state_manager.scatter_batched_states_for_graph(
                 slot_indices,
                 updated_gdn_states,
