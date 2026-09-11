@@ -2214,3 +2214,17 @@ Nsight Systems看系统时间线：CPU/Python、CUDA API、Kernel、Memcpy、str
 最终统一回答结构：
 
 > 先说问题和结论 → 再说数据流/关键变量 → 给正确性与性能证据 → 主动交代边界。
+
+## 十二、图片补充八股复盘路线
+
+`intern/pic` 两张面试截图中的题目已纳入《NanoHybrid-VLM项目进度记忆》第 15 节。原图共能确认18题，编号为1～17、20；不补造图片中缺失的18、19。
+
+复盘顺序调整为：
+
+1. 原 Part 1～8：请求链路、调度、Paged KV/State Pool、多模态、联合 Prefix、CUDA Graph、State-Aware CUDA、Benchmark/Profile。
+2. Part 9：nano-vLLM/vLLM、SGLang Replay SSM、PD 分离及 Hybrid KV/GDN State 传输。
+3. Part 10：Dense/MoE、TP/DP/EP、TP+EP Device Mesh 与通信原语。
+4. Part 11：ViT/Decode 瓶颈、GEMM Profile、`torch.compile`、算子融合、host gap 与 HBM/DDR。
+5. Part 12：vLLM 常见优化和 Continuous Batching 综合压力面。
+
+新增题仍使用本文统一模板：30～60秒口述回答、原理/公式、项目联系、连续追问、证据、边界红线、一句话记忆点与闭卷巩固题。软件机制题（尤其 SGLang Replay SSM、vLLM 当前能力和 `torch.compile`）在正式展开时应优先核对届时官方文档/源码；不能把相邻八股写成本项目已完成功能。

@@ -1936,3 +1936,251 @@ Graph 模式 P99 step latency 也持续改善：B=1/2/4/8/16 的 FLA Graph P99 �
 - 已经证明所有真实在线负载都有同样收益；当前 benchmark 是固定 prompt、固定 Batch、greedy 256-token Decode 的受控实验。
 
 开发阶段至此收敛。下一恢复入口不再是新增源码功能，而是按以下顺序从头复盘：请求生命周期 → Qwen3.5 Hybrid 模型与状态 → Scheduler/Continuous Batching/Chunked Prefill → Vision/mRoPE → GDN-aware Prefix Cache → Hybrid CUDA Graph → FLA 基线与 State-aware CUDA → Profile/Benchmark → 简历表述和高频追问。
+
+
+## 14. 2026-09-08 State-Aware GDN CUDA 最终 Profile 与项目收尾
+
+本节取代第 13.15～13.16 节的旧性能数字与“尚未自研 causal-conv”边界。此前章节继续保留开发过程和历史基线，最终简历、项目讲解与面试口径以本节为准。
+
+### 14.1 最终算子边界与关键变量
+
+最终 `state_aware_cuda` 后端替换 Qwen3.5-9B Gated DeltaNet 单 token Decode 的两条有状态计算路径：
+
+1. State-Aware Recurrent CUDA Kernel：
+   - `query/key/value`：BF16，Decode shape 为 `[B,1,32,128]`；支持来自 `mixed_qkv` view 的非连续 Batch stride。
+   - `g`：FP32，状态衰减系数。
+   - `beta`：BF16，Delta Rule 更新系数。
+   - `state_slot_ids`：INT64 `[B]`，把当前 Batch 中的第 `batch_index` 条请求映射到全局状态槽。
+   - `gdn_index`：当前 GDN 层在 24 个 GDN 层中的索引。
+   - `recurrent_state_pool`：FP32 `[num_slots,24,32,128,128]`，Kernel 根据 `state_slot_ids` 与 `gdn_index` 直接寻址并原位更新。
+   - `output`：BF16 `[B,1,32,128]`，支持调用方显式传入固定地址 Workspace。
+   - 优化：Warp-level Split-K、Warp Shuffle 两级归约、`float4` 128-bit State 向量访存；FP32 State 与累加保持数值稳定。
+
+2. State-Aware Causal-Conv CUDA Kernel：
+   - `x`：BF16 `[B,8192,1]`，同样支持非连续 Tensor stride。
+   - `weight`：BF16 `[8192,4]`，对应 K=4 的 depthwise causal convolution。
+   - `conv_state_pool`：BF16 `[num_slots,24,8192,4]`。
+   - `state_slot_ids`/`gdn_index`：与 recurrent Kernel 共用同一动态请求到状态池的寻址语义。
+   - 每个 CUDA thread 负责一个 `(batch_index, channel_index)`，使用 BF16×4 的 64-bit 向量读写，融合旧状态读取、4 元素移位、新输入写入、4-tap 卷积、SiLU 与 State Pool 原位回写。
+   - Runtime 固定 `block_size=256`；B=1/2/4/8/16 连续 8 步验证中 State 和未选 slot/layer 误差均为 0，最大 Output 误差约 `7.63e-6`。
+
+ModelRunner 在 `gdn_decode_backend="state_aware_cuda"` 时不再构造任何临时 GDN batched state；Eager 和 CUDA Graph 都只向 Context 写入 `gdn_state_slot_ids`、`gdn_recurrent_state_pool` 与 `gdn_conv_state_pool`。两个 Kernel 均使用 PyTorch current CUDA stream，通过同一个 C++/CUDA Extension 接入，能够被既有 B=1/2/4/8/16 CUDA Graph capture/replay。
+
+### 14.2 最终 Profile 方法
+
+Profile 使用 `tests/kernels/profile_gdn_decode.py`，不修改推理源码，通过运行进程临时注入 `gdn_decode_backend` 分别测 `fla` 和 `state_aware_cuda`。关键设置：
+
+- GPU/模型：RTX 5090、Qwen3.5-9B、TP=1。
+- 模式：Eager Decode，B=16，关闭 Prefix Cache。
+- 外部预热 8 steps；Profiler schedule 为 `wait=1, warmup=1, active=8`。
+- `torch.profiler.ProfilerActivity.CPU/CUDA` 同时开启；`record_shapes=True`、`profile_memory=True`。
+- 用 `torch.profiler.record_function` 和 NVTX 标记 `nano::decode_step`、GDN Layer、Causal Conv、Delta Rule、State Gather/Scatter 边界。
+- 只累加叶子 Kernel/Op 的 `self_device_time_total`；父语义区间的 `cuda_total_us` 只用于定位边界，不能与子 Kernel 再次相加。
+- 8 个 active Decode steps、每步 24 个 GDN 层，因此两个自研 Kernel 的预期调用次数均为 `8 × 24 = 192`。
+
+最终产物：
+
+- FLA：`artifacts/kernels/gdn_decode_profile_final/fla/eager_b16/summary.json`、`operator_table.txt`、`trace.json`。
+- CUDA：`artifacts/kernels/gdn_decode_profile_final/cuda/eager_b16/summary.json`、`operator_table.txt`、`trace.json`。
+
+### 14.3 Profile 结果与瓶颈闭环
+
+FLA 基线路径在 8 个 active Decode steps 中观测到：
+
+| 项目 | 调用次数 | CUDA 总时间 | 单层平均 |
+|---|---:|---:|---:|
+| Recurrent State `index_select`，输入 `[16,32,128,128]` | 192 | 8.981 ms | 46.77 μs |
+| Conv State `index_select`，输入 `[16,8192,4]` | 192 | 1.852 ms | 9.65 μs |
+| Recurrent State `index_copy_` | 192 | 7.743 ms | 40.33 μs |
+| Conv State `index_copy_` | 192 | 0.788 ms | 4.10 μs |
+| Conv 临时状态 DtoD copy | 192 | 0.306 ms | 1.60 μs |
+| FLA fused recurrent kernel | 192 | 5.500 ms | 28.64 μs |
+| 官方 causal-conv update kernel | 192 | 0.565 ms | 2.95 μs |
+
+两类状态的 Gather、Scatter 与 Conv 临时 DtoD copy 合计约 19.669 ms，即 Profile 窗口内平均每个 Decode step 约 2.459 ms。这里的时间是受 Profiler 扰动的热点归因数据，不替代正式吞吐 Benchmark。
+
+最终 CUDA 路径观测到：
+
+| 项目 | 调用次数 | CUDA 总时间 | 单层平均 |
+|---|---:|---:|---:|
+| `state_aware_gdn_bf16_kernel` | 192 | 6.196 ms | 32.27 μs |
+| `state_aware_causal_conv1d_bf16_kernel` | 192 | 0.453 ms | 2.36 μs |
+| GDN State `index_select`/`index_copy_` | 0 | 0 | 0 |
+| Conv State DtoD copy | 0 | 0 | 0 |
+| FLA fused recurrent kernel | 0 | 0 | 0 |
+| 官方 causal-conv update kernel | 0 | 0 | 0 |
+
+结论：两个自研 Kernel 的调用次数精确等于 `active_steps × num_gdn_layers`，旧 Gather/Scatter、临时 Conv clone/copy、FLA recurrent 和官方 causal-conv kernel 均从最终 CUDA 路径消失。自研 recurrent 的孤立数学 Kernel 时间约 32.27 μs/层，实际上略慢于 FLA fused recurrent 的 28.64 μs/层；完整系统仍然更快，原因不是声称数学 Kernel 击败 FLA，而是改变 Kernel interface 和 State Pool 数据布局，消除了更大的状态搬运成本。自研 causal-conv 本体则从 2.95 μs/层降至 2.36 μs/层，约降低 19.8%，同时消除了外部 Conv State Gather/Scatter。
+
+Profiler 下 `nano::decode_step` 的可比 CUDA total 平均从约 16.987 ms/step 降至 13.792 ms/step，约降低 18.8%；正式性能结论仍以无 Profiler 的 CUDA Event/墙钟 Benchmark 为准。
+
+### 14.4 最终无 Profiler Benchmark
+
+正式结果目录为 `artifacts/cuda_graph/benchmark/final_conv/`。条件为 RTX 5090、Qwen3.5-9B、TP=1、B=1/2/4/8/16、每请求输出 128 tokens、每组预热后重复 5 次；每次 Prefill 产生首 token，随后 127 个 Decode steps。
+
+完整模型 Decode 吞吐（tokens/s）：
+
+| B | FLA Eager | CUDA Eager | FLA Graph | CUDA Graph |
+|---:|---:|---:|---:|---:|
+| 1 | 54.72 | 71.45 | 78.48 | 80.04 |
+| 2 | 104.91 | 138.62 | 140.65 | 145.70 |
+| 4 | 209.74 | 270.13 | 264.15 | 279.84 |
+| 8 | 414.26 | 525.54 | 488.24 | 542.57 |
+| 16 | 800.70 | 1048.69 | 919.05 | 1087.37 |
+
+最终对外性能口径：
+
+- 同为 Eager 时，自研 CUDA 相对 FLA 的完整模型 Decode 吞吐提升 26.86%～32.13%，TPOT 降低 21.17%～24.32%。
+- 双方均启用 CUDA Graph 后，自研 CUDA 相对 FLA 吞吐提升 1.99%～18.31%，TPOT 降低 1.95%～15.48%。
+- B=16 Graph P99 step latency 从 FLA 的 17.446 ms 降至 CUDA 的 14.748 ms，降低约 15.47%。
+- CUDA+Graph 相对 FLA+Eager 的联合吞吐提升为 30.97%～46.28%；它同时包含 Kernel/interface 与 Graph 收益，不能写成纯 Kernel 加速。
+- Eager peak allocated 从 FLA 的 25838.58 MiB 降至 CUDA 的 25079.93 MiB，观测减少 758.65 MiB（约 2.94%）。`reserved` 受 PyTorch allocator 影响，不用于简历主结论。
+- 独立完整 Conv 状态子路径基准中，原始 Gather + 24 次官方 update + Scatter 约 355 μs，自研直接寻址 CUDA 约 111 μs，约 3.21×、延迟降低约 68.8%。该数字只描述 Conv 状态子路径，不冒充完整模型加速。
+
+### 14.5 最终可声称与不可声称内容
+
+当前可准确表述：
+
+> 针对 Qwen3.5 Hybrid GDN 单 token Decode，自研 State-Aware Recurrent 与 Causal-Conv CUDA Kernel，使用动态 `state_slot_ids`/`gdn_index` 直接寻址 FP32 Recurrent 与 BF16 Conv State Pool，融合 Delta Rule、4-tap depthwise convolution、SiLU 与状态原位回写，消除连续 Batched State 所需的 Gather/Scatter；通过 Warp-level Split-K、Warp Shuffle、float4/BF16×4 向量访存及 PyTorch C++/CUDA Extension 接入 Continuous Batching 与 CUDA Graph。RTX 5090、Qwen3.5-9B、B=1～16 下，完整 CUDA Eager 相对 FLA Eager Decode 吞吐提升 26.86%～32.13%，双方启用 Graph 后提升 1.99%～18.31%。
+
+仍不能声称：
+
+- 自研了完整 GDN：当前只替换 L=1 Decode 的 recurrent Delta Rule 和 depthwise causal convolution；Prefill `chunk_gated_delta_rule` 仍使用现有高性能库。
+- 自研 recurrent 数学 Kernel 的纯 kernel-time 超过 FLA：Profile 显示其 32.27 μs/层略慢于 FLA 的 28.64 μs/层，优势来自消除状态搬运和中间状态生命周期。
+- 支持任意模型、任意 shape：recurrent 特化 H=32、Dk=Dv=128；causal-conv 特化 C=8192、K=4。
+- 46.28% 是纯 CUDA Kernel 加速：它是 CUDA 算子与 CUDA Graph 相对 FLA Eager 的联合系统收益。
+- 已完成 Prefill CUDA、TP>1 custom Kernel、Prefix Cache CUDA Kernel、跨 GPU 通用验证，或已获得 Nsight Compute 的 DRAM bandwidth/L2 hit rate/occupancy/warp stall 硬件计数器。
+
+### 14.6 项目开发收尾
+
+State-Aware GDN CUDA 算子开发至此结束，不再继续增加 Q/K `repeat_interleave`、Prefill Kernel、`cp.async` 或其他微架构优化 Part。后续只保留：
+
+1. 从请求生命周期开始完整复盘项目。
+2. 学习 PyTorch Profiler、Nsight Systems/Compute 和 SASS，能够解释本节数据如何采集与解读。
+3. 更新简历与面试 QA，严格区分子路径加速、同模式系统收益和 CUDA+Graph 联合收益。
+4. 修复回归问题或补充复现实验，不再主动扩展项目范围。
+
+## 15. 2026-09-09 最终复盘与图片补充八股学习计划
+
+### 15.1 学习方式
+
+项目开发完成后，采用“8 个项目 Part + 4 个相邻八股 Part”复盘。每个 Part 必须先讲清原理、数据流、关键变量、Tensor Shape 和显存/性能公式，再给出面试口述版；结尾安排闭卷巩固题，答错内容进入下一轮复测。
+
+每个核心问题统一展开为：
+
+1. 30～60 秒口述回答。
+2. 原理与必要公式。
+3. 与 NanoHybrid-VLM 的联系或差异。
+4. 2～4 个连续追问及回答。
+5. 可引用的代码、测试、Benchmark/Profile 证据。
+6. 本人实现、第三方复用与仅理解未实现的边界。
+7. 一句话记忆点和闭卷巩固题。
+
+### 15.2 原 8 个项目复盘 Part
+
+1. 请求生命周期与 Qwen3.5 Hybrid 总览。
+2. Scheduler、Continuous Batching、Chunked Prefill 与抢占。
+3. Paged KV Cache 与 Hybrid State Pool。
+4. 多模态输入、Vision Encoder、Placeholder 融合与 mRoPE。
+5. KV Block + GDN Snapshot 联合 Prefix Cache。
+6. Hybrid Decode CUDA Graph。
+7. State-Aware Recurrent/Causal-Conv CUDA Kernel。
+8. Benchmark、PyTorch Profiler、Nsight/SASS 基础与性能口径。
+
+图片中的项目内问题并入对应 Part 深挖：
+
+- Part 2：Continuous Batching 每轮如何组织 Decode/Prefill；Scheduler 如何动态加入和移除请求。
+- Part 4：Qwen3.5 多模态输入要求框架扩展哪些接口；ViT 的计算/IO 瓶颈如何判断。
+- Part 5：GDN recurrent/conv state 在 Prefix Cache 中如何保存、恢复并与 KV 对齐边界。
+- Part 6：CUDA Graph 的收益来源、适用场景；Prefill 是否适合捕获及判断依据。
+- Part 8：自研 GEMM 只有约 76% cuBLAS 时如何用 Nsight Compute 定位，而不是盲目堆优化术语。
+
+### 15.3 新增 Part 9：框架差异、PD 分离与 Hybrid 状态传输
+
+需要详细展开的问题：
+
+1. nano-vLLM 与正式 vLLM 在目标、模块、生产能力和适用场景上有什么区别？
+2. SGLang 的 Replay SSM 机制是什么，解决什么问题？回答前需按届时官方文档/源码核对准确术语和版本。
+3. Prefill-Decode Disaggregation 主要解决什么资源矛盾，为什么要把 Prefill 与 Decode 分开？
+4. Qwen3.5 Hybrid 做 PD 分离时，KV Cache、Recurrent State、Conv State、Token 边界和 mRoPE Metadata 应如何传输与校验？
+5. vLLM 常见性能优化分别落在调度、KV 内存、Attention Kernel、Graph、并行和请求级复用的哪一层？
+
+学习重点：
+
+- 区分“同机两 GPU、跨机 GPU、CPU 中转”三种状态传输路径。
+- 理解 PD 分离改善的是 Prefill/Decode 资源隔离和 SLO，不保证任何 workload 都提高吞吐。
+- 能解释 Hybrid 模型比纯 Transformer 多传两类 GDN State，且快照必须与相同 Token 边界的 KV 保持原子一致。
+
+红线：本项目未实现 PD 分离、跨机传输或 SGLang Replay SSM，只能作为相邻八股和基于当前状态抽象的设计题回答。
+
+### 15.4 新增 Part 10：MoE 与 TP/DP/EP 并行
+
+需要详细展开的问题：
+
+1. Dense 与 MoE 的计算路径、参数激活比例和显存/通信特征有什么区别？MoE 的优势和代价是什么？
+2. TP、DP、EP 分别沿什么维度切分权重、请求和专家？各自需要什么 Collective？
+3. TP 与 EP 同时使用时如何组成二维 Device Mesh，Attention/Dense 层与 MoE 层分别在哪个通信组执行？
+4. MoE Router、Top-K、Token Dispatch、Expert GEMM、Combine 的完整数据流是什么？负载不均衡为什么会拖慢整卡？
+
+学习重点：
+
+- TP：切单层矩阵/head，典型通信为 All-Reduce/Reduce-Scatter/All-Gather。
+- DP：复制权重、切请求；训练时同步梯度，推理时主要承担副本级吞吐扩展。
+- EP：切专家；典型 Token Dispatch/Combine 需要 All-to-All。
+- 能用 `world_size = tp_size × ep_size × dp_size` 的逻辑组织通信组，但避免把不同框架的具体实现说成唯一标准。
+
+红线：本项目 TP=1，且未实现 MoE/EP/DP；该 Part 只证明并行理论和系统设计能力。
+
+### 15.5 新增 Part 11：瓶颈分析、编译与算子融合
+
+需要详细展开的问题：
+
+1. 多模态 ViT 更偏计算瓶颈还是 IO 瓶颈？如何结合 Shape、算术强度和 Profile 判断？
+2. Decode 的 IO 瓶颈主要来自 Attention 还是 FFN？为什么答案随上下文长度、Batch、GQA/MoE 和量化变化？
+3. 自研 GEMM 比 cuBLAS 慢时，如何依次检查 Launch、Occupancy、寄存器、Shared Memory、Global Load/Store、Tensor Core 和 Tile Shape？
+4. `torch.compile` 大致做了哪些工作？TorchDynamo、AOTAutograd、Inductor 和 Graph Break 分别是什么？
+5. 算子融合为什么可能提升性能，何时反而会因寄存器压力、Occupancy 下降或重复计算变慢？
+6. 算子融合对 host gap、Kernel launch、HBM/显存与 CPU DDR 访问分别有什么影响？
+
+学习重点：
+
+- 用 Roofline 思维区分 compute-bound、memory-bound 和 launch-bound。
+- Nsight Systems 先找 host gap/同步/时间线空洞，Nsight Compute 再看单 Kernel，SASS 最后验证实际指令。
+- 融合主要减少中间 Tensor 的 HBM round-trip 和 Kernel launch，不等于“减少所有 DDR 访问”。
+- `torch.compile` 与 CUDA Graph 都能降低 Python/launch 开销，但前者还可能生成/融合 Kernel；二者机制不能混为一谈。
+
+红线：当前项目尚无 Nsight Compute 硬件计数器结论，也未用 `torch.compile` 形成项目性能结果。
+
+### 15.6 新增 Part 12：综合业务八股与压力面
+
+围绕图片中的“vLLM 业务八股 + 项目追问”进行不按章节提示的连续模拟面试，重点覆盖：
+
+1. 从业务 SLO 出发选择 Continuous Batching、Chunked Prefill、Prefix Cache、CUDA Graph、PD 分离或量化，而不是只背定义。
+2. 从请求到达开始，完整描述 Scheduler 每轮如何组合 Decode 和 Prefill 请求、分配 Token Budget、KV Block 与 State Slot。
+3. 对每项优化同时回答：解决哪个瓶颈、增加什么代价、什么场景收益小、如何用指标验证。
+4. 将图片中的18题随机混入最终简历深挖题，并持续追问到变量、Shape、通信原语或 Profile 指标。
+
+### 15.7 两张图片题目验收清单
+
+原图编号为 1～17、20，图片本身未给出 18、19；不得擅自补造缺失题目。
+
+- [ ] 1. nano-vLLM 和正式版 vLLM 有什么区别？
+- [ ] 2. SGLang 的 Replay SSM 机制是什么？
+- [ ] 3. Qwen3.5 多模态输入在框架层需要哪些扩展？
+- [ ] 4. 多模态 ViT 更偏计算瓶颈还是 IO 瓶颈，为什么？
+- [ ] 5. GDN SSM/recurrent state 与 conv state 在 Prefix Cache 中如何处理？
+- [ ] 6. PD 分离解决什么问题，为什么拆 Prefill 和 Decode？
+- [ ] 7. Hybrid 模型做 PD 分离时如何传输 KV Cache 与 GDN State？
+- [ ] 8. Decode 的 IO 瓶颈主要在 Attention 还是 FFN？
+- [ ] 9. MoE 和 Dense 有什么区别，MoE 的优势与代价是什么？
+- [ ] 10. TP、DP、EP 如何切分，TP 与 EP 如何组合？
+- [ ] 11. GEMM 只有约 76% cuBLAS 时如何用 Nsight Compute 找瓶颈？
+- [ ] 12. CUDA Graph 解决什么问题，哪些场景收益大或不明显？
+- [ ] 13. Prefill 是否也需要 CUDA Graph，判断依据是什么？
+- [ ] 14. `torch.compile` 大致做了什么？
+- [ ] 15. 算子融合为什么可能提升性能？
+- [ ] 16. 算子融合如何影响 host gap、显存/HBM 与 CPU DDR 访问？
+- [ ] 17. vLLM 还有哪些常见性能优化技术？
+- [ ] 20. Continuous Batching 如何实现，Scheduler 每轮如何组织 Decode 与 Prefill？
+
+验收条件：每题都能完成 30～60 秒口述，并至少回答两轮追问；项目已实现的问题必须给出真实变量/Shape/证据，相邻八股必须主动说明“理解但未实现”。
