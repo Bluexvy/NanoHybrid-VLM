@@ -193,3 +193,13 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Generated benchmark / profiler artifacts
+# Keep compact summaries (for example summary.json and operator_table.txt),
+# but do not commit large tensor dumps or raw profiler captures.
+artifacts/profiles/
+artifacts/**/*.pt
+artifacts/**/trace.json
+artifacts/**/*.qdstrm
+artifacts/**/*.nsys-rep
+artifacts/**/*.sqlite
