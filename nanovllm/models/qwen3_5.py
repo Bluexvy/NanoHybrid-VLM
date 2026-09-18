@@ -1,4 +1,6 @@
 import torch
+import torch.distributed as dist
+
 from nanovllm.utils.context import get_context
 from torch import nn
 
@@ -6,20 +8,26 @@ from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import Qwen3_5RMSNorm
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.activation import SiluAndMul
-from nanovllm.layers.linear import (
-    MergedColumnParallelLinear,
-    RowParallelLinear,
-)
+
 from nanovllm.layers.gated_delta_net import (
     Qwen3_5GatedDeltaNet,
 )
+
 from nanovllm.engine.hybrid_state import (
     GDNLayerState,
 )
+
+from nanovllm.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
+
 from nanovllm.layers.embed_head import (
     VocabParallelEmbedding,
     ParallelLMHead,
 )
+
 from nanovllm.models.qwen3_5_vision import (
     Qwen3_5VisionModel,
 )
@@ -48,15 +56,30 @@ class Qwen3_5Attention(nn.Module):
             )
 
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
 
-        # Qwen3.5 必须优先读取显式 head_dim。
-        # 0.8B 的值是 256，不是 1024 / 8。
+        tp_size = dist.get_world_size()
+
+        self.total_num_heads = (
+            config.num_attention_heads
+        )
+        self.total_num_kv_heads = (
+            config.num_key_value_heads
+        )
+
+        assert self.total_num_heads % tp_size == 0
+        assert self.total_num_kv_heads % tp_size == 0
+
+        self.num_heads = (
+            self.total_num_heads // tp_size
+        )
+        self.num_kv_heads = (
+            self.total_num_kv_heads // tp_size
+        )
+
         self.head_dim = getattr(
             config,
             "head_dim",
-            self.hidden_size // self.num_heads,
+            self.hidden_size // self.total_num_heads,
         )
 
         if self.num_heads % self.num_kv_heads != 0:
@@ -81,28 +104,40 @@ class Qwen3_5Attention(nn.Module):
             False,
         )
 
-        # q_proj 同时生成 Q 和 attention output gate。
-        self.q_proj = nn.Linear(
-            self.hidden_size,
-            self.q_size * 2,
+        self.q_proj = ColumnParallelLinear(
+            input_size=self.hidden_size,
+            output_size=(
+                self.total_num_heads
+                * self.head_dim
+                * 2
+            ),
             bias=attention_bias,
         )
 
-        self.k_proj = nn.Linear(
-            self.hidden_size,
-            self.kv_size,
+        self.k_proj = ColumnParallelLinear(
+            input_size=self.hidden_size,
+            output_size=(
+                self.total_num_kv_heads
+                * self.head_dim
+            ),
             bias=attention_bias,
         )
 
-        self.v_proj = nn.Linear(
-            self.hidden_size,
-            self.kv_size,
+        self.v_proj = ColumnParallelLinear(
+            input_size=self.hidden_size,
+            output_size=(
+                self.total_num_kv_heads
+                * self.head_dim
+            ),
             bias=attention_bias,
         )
 
-        self.o_proj = nn.Linear(
-            self.q_size,
-            self.hidden_size,
+        self.o_proj = RowParallelLinear(
+            input_size=(
+                self.total_num_heads
+                * self.head_dim
+            ),
+            output_size=self.hidden_size,
             bias=attention_bias,
         )
 

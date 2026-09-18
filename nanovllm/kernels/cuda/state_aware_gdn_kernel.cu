@@ -15,7 +15,6 @@ constexpr int WARP_SIZE = 32;
 constexpr int NUM_WARPS = 4;
 constexpr int VALUES_PER_LANE = 4;
 
-constexpr int NUM_HEADS = 32;
 constexpr int KEY_DIM = 128;
 constexpr int VALUE_DIM = 128;
 
@@ -74,6 +73,7 @@ __global__ void state_aware_gdn_bf16_kernel(
     float* recurrent_state_pool,
     __nv_bfloat16* output,
     int batch_size,
+    int num_heads,
     int num_gdn_layers,
     int gdn_index,
     float scale,
@@ -91,8 +91,8 @@ __global__ void state_aware_gdn_bf16_kernel(
     int64_t output_head_stride)
 {
     int batch_head_index = blockIdx.x;
-    int batch_index = batch_head_index / NUM_HEADS;
-    int head_index = batch_head_index % NUM_HEADS;
+    int batch_index = batch_head_index / num_heads;
+    int head_index = batch_head_index % num_heads;
 
     int thread_index = threadIdx.x;
     int lane_index = thread_index % WARP_SIZE;
@@ -189,9 +189,13 @@ __global__ void state_aware_gdn_bf16_kernel(
         ]
     */
     int64_t state_matrix_base =
-        state_slot * num_gdn_layers * NUM_HEADS * KEY_DIM * VALUE_DIM
-        + static_cast<int64_t>(gdn_index) * NUM_HEADS * KEY_DIM * VALUE_DIM
-        + static_cast<int64_t>(head_index) * KEY_DIM * VALUE_DIM;
+        (
+            (
+                state_slot * num_gdn_layers
+                + gdn_index
+            ) * num_heads
+            + head_index
+        ) * KEY_DIM * VALUE_DIM;
 
     int64_t value_head_base = static_cast<int64_t>(batch_index) * value_batch_stride + static_cast<int64_t>(head_index) * value_head_stride;
     int64_t output_head_base = static_cast<int64_t>(batch_index) * output_batch_stride + static_cast<int64_t>(head_index) * output_head_stride;
@@ -500,23 +504,34 @@ torch::Tensor state_aware_gdn_cuda(
     );
 
     int64_t batch_size = query.size(0);
+    int64_t num_heads = query.size(2);
 
     TORCH_CHECK(
-        query.dim() == 4 && batch_size > 0 && query.size(1) == 1
-        && query.size(2) == NUM_HEADS && query.size(3) == KEY_DIM
+        query.dim() == 4
+        && batch_size > 0
+        && num_heads > 0
+        && query.size(1) == 1
+        && query.size(3) == KEY_DIM
         && key.sizes() == query.sizes()
-        && value.dim() == 4 && value.size(0) == batch_size && value.size(1) == 1
-        && value.size(2) == NUM_HEADS && value.size(3) == VALUE_DIM
-        && g.dim() == 3 && g.size(0) == batch_size && g.size(1) == 1
-        && g.size(2) == NUM_HEADS && beta.sizes() == g.sizes(),
-        "expected Q/K=[B,1,32,128], V=[B,1,32,128] and G/Beta=[B,1,32]"
+        && value.dim() == 4
+        && value.size(0) == batch_size
+        && value.size(1) == 1
+        && value.size(2) == num_heads
+        && value.size(3) == VALUE_DIM
+        && g.dim() == 3
+        && g.size(0) == batch_size
+        && g.size(1) == 1
+        && g.size(2) == num_heads
+        && beta.sizes() == g.sizes(),
+        "invalid Q/K/V/G/Beta shape"
     );
 
     int64_t num_gdn_layers = recurrent_state_pool.size(1);
 
     TORCH_CHECK(
         recurrent_state_pool.dim() == 5 && recurrent_state_pool.size(0) > 0
-        && num_gdn_layers > 0 && recurrent_state_pool.size(2) == NUM_HEADS
+        && num_gdn_layers > 0
+        && recurrent_state_pool.size(2) == num_heads
         && recurrent_state_pool.size(3) == KEY_DIM
         && recurrent_state_pool.size(4) == VALUE_DIM
         && state_slot_ids.dim() == 1 && state_slot_ids.size(0) == batch_size
@@ -569,7 +584,9 @@ torch::Tensor state_aware_gdn_cuda(
     */
     cudaStream_t current_stream = c10::cuda::getCurrentCUDAStream(device_index);
 
-    int blocks = static_cast<int>(batch_size) * NUM_HEADS;
+    int blocks =
+    static_cast<int>(batch_size)
+    * static_cast<int>(num_heads);
 
     state_aware_gdn_bf16_kernel<<<blocks, BLOCK_SIZE, 0, current_stream>>>(
         query_pointer,
@@ -581,6 +598,7 @@ torch::Tensor state_aware_gdn_cuda(
         recurrent_state_pointer,
         output_pointer,
         static_cast<int>(batch_size),
+        static_cast<int>(num_heads),
         static_cast<int>(num_gdn_layers),
         static_cast<int>(gdn_index),
         static_cast<float>(scale),

@@ -14,12 +14,22 @@ from nanovllm.engine.hybrid_state import (
     HybridCacheSpec,
     HybridStateManager,
 )
+
 from nanovllm.engine.hybrid_cuda_graph import (
     HybridDecodeGraphPolicy,
     HybridDecodeStaticWorkspace,
 )
+
 from nanovllm.kernels.state_aware_gdn_cuda import (
     load_state_aware_gdn_cuda_extension,
+)
+
+from multiprocessing.reduction import (
+    ForkingPickler,
+)
+
+from nanovllm.engine.prefix_cache import (
+    PrefixKey,
 )
 
 class ModelRunner:
@@ -67,6 +77,11 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        
+        self.worker_prefix_state_shards: dict[
+            PrefixKey,
+            tuple[torch.Tensor, torch.Tensor],
+        ] = {}
         
         # 当前 Qwen3.5 多模态模型使用
         # temporal/height/width 三轴 RoPE。
@@ -441,7 +456,11 @@ class ModelRunner:
 
     def write_shm(self, method_name, *args):
         assert self.world_size > 1 and self.rank == 0
-        data = pickle.dumps([method_name, *args])
+        data = bytes(
+            ForkingPickler.dumps(
+                [method_name, *args]
+            )
+        )
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
@@ -453,6 +472,78 @@ class ModelRunner:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)
+
+
+    @torch.inference_mode()
+    def cache_worker_prefix_state(
+        self,
+        key: PrefixKey,
+        state_slot: int,
+    ) -> None:
+        if self.rank > 0:
+            state_manager = self.hybrid_state_manager
+            assert state_manager is not None
+
+            snapshot_dtype = {
+                "float32": torch.float32,
+                "bfloat16": torch.bfloat16,
+            }[
+                self.config
+                .prefix_recurrent_snapshot_dtype
+            ]
+
+            self.worker_prefix_state_shards[key] = (
+                state_manager.snapshot_slot(
+                    slot=state_slot,
+                    recurrent_snapshot_dtype=(
+                        snapshot_dtype
+                    ),
+                )
+            )
+
+        dist.barrier()
+
+
+    @torch.inference_mode()
+    def restore_worker_prefix_state(
+        self,
+        key: PrefixKey,
+        state_slot: int,
+    ) -> None:
+        if self.rank > 0:
+            state_manager = self.hybrid_state_manager
+            assert state_manager is not None
+
+            (
+                conv_state_snapshot,
+                recurrent_state_snapshot,
+            ) = self.worker_prefix_state_shards[key]
+
+            state_manager.restore_slot(
+                slot=state_slot,
+                conv_state_snapshot=(
+                    conv_state_snapshot
+                ),
+                recurrent_state_snapshot=(
+                    recurrent_state_snapshot
+                ),
+            )
+
+        dist.barrier()
+
+
+    def discard_worker_prefix_states(
+        self,
+        keys: list[PrefixKey],
+    ) -> None:
+        if self.rank > 0:
+            for key in keys:
+                self.worker_prefix_state_shards.pop(
+                    key,
+                    None,
+                )
+
+        dist.barrier()
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -671,6 +762,26 @@ class ModelRunner:
                     "KV cache block after reserving "
                     "GDN states"
                 )
+
+            if self.world_size > 1:
+                capacities = torch.tensor(
+                    [
+                        num_state_slots,
+                        num_kvcache_blocks,
+                    ],
+                    dtype=torch.int64,
+                    device=f"cuda:{self.rank}",
+                )
+
+                dist.all_reduce(
+                    capacities,
+                    op=dist.ReduceOp.MIN,
+                )
+
+                (
+                    num_state_slots,
+                    num_kvcache_blocks,
+                ) = capacities.tolist()
 
             # 把实际计算结果写回 Config。
             #
@@ -1435,7 +1546,7 @@ class ModelRunner:
     def run_hybrid_prefill(
         self,
         seqs: list[Sequence],
-    ) -> list[int]:
+    ) -> list[int] | None:
         """
         一次模型Forward处理整个Variable-length
         Prefill microbatch。
@@ -1601,21 +1712,31 @@ class ModelRunner:
                 ),
             )
 
-            # ParallelLMHead会根据：
-            #
-            # context.cu_seqlens_q[1:] - 1
-            #
-            # 自动选择每条Sequence本轮最后一个token。
+            # 所有Rank都必须进入ParallelLMHead。
+            # TP>1时，内部dist.gather需要每个Rank共同参与。
             logits = self.model.compute_logits(
                 hidden_states
             )
 
+            # 每个Rank都要把自己的本地GDN State分片写回本地State Pool。
+            state_manager.write_batched_states(
+                state_slots,
+                updated_gdn_states,
+            )
+
+            # 非零Rank完成本地状态写回和Logits Gather后即可返回。
+            # 完整Logits只存在于Rank 0。
+            if self.rank != 0:
+                return None
+
+            if logits is None:
+                raise RuntimeError(
+                    "Rank 0 did not receive gathered logits"
+                )
+
             expected_batch_size = len(seqs)
 
-            if (
-                logits.shape[0]
-                != expected_batch_size
-            ):
+            if logits.shape[0] != expected_batch_size:
                 raise RuntimeError(
                     "Prefill logits batch size does "
                     "not match the number of "
@@ -1623,19 +1744,6 @@ class ModelRunner:
                     f"expected {expected_batch_size}, "
                     f"got {logits.shape[0]}"
                 )
-
-            # =================================
-            # 第五阶段：批量Scatter新GDN状态
-            # =================================
-
-            state_manager.write_batched_states(
-                state_slots,
-                updated_gdn_states,
-            )
-
-            # =================================
-            # 第六阶段：一次Batch Sampling
-            # =================================
 
             temperatures = self.prepare_sample(
                 seqs
@@ -1657,7 +1765,7 @@ class ModelRunner:
     def run_hybrid_decode(
         self,
         seqs: list[Sequence],
-    ) -> list[int]:
+    ) -> list[int] | None:
 
         state_manager = (
             self.hybrid_state_manager
@@ -1828,12 +1936,20 @@ class ModelRunner:
                         updated_gdn_states,
                     )
 
-            # LM Head 暂时不进入 Graph。
+            # 所有Rank都必须参与Vocab Parallel LM Head的Logits Gather。
             logits = self.model.compute_logits(
                 hidden_states
             )
 
-            # 首版 Sampling 不进入 Graph。
+            # Rank 1只有本地Vocab Logits，Gather完成后返回None。
+            if self.rank != 0:
+                return None
+
+            if logits is None:
+                raise RuntimeError(
+                    "Rank 0 did not receive gathered logits"
+                )
+
             temperatures = self.prepare_sample(
                 seqs
             )
@@ -1852,7 +1968,7 @@ class ModelRunner:
         self,
         seqs: list[Sequence],
         is_prefill: bool,
-    ) -> list[int]:
+    ) -> list[int] | None:
 
         if is_prefill:
             return self.run_hybrid_prefill(
@@ -1886,7 +2002,7 @@ class ModelRunner:
         self,
         seqs: list[Sequence],
         is_prefill: bool,
-    ) -> list[int]:
+    ) -> list[int] | None:
 
         if self.is_hybrid_model:
             return self.run_hybrid(
@@ -2258,12 +2374,17 @@ class ModelRunner:
                     self.rank
                 )
 
+                if self.world_size > 1:
+                    dist.barrier(
+                        device_ids=[self.rank]
+                    )
+
                 # -----------------------------
                 # 捕获真正的 CUDA Graph
                 # -----------------------------
 
                 graph = torch.cuda.CUDAGraph()
-
+                
                 with torch.cuda.graph(
                     graph,
                     self.hybrid_graph_pool,
@@ -2284,7 +2405,12 @@ class ModelRunner:
                 torch.cuda.synchronize(
                     self.rank
                 )
-
+                
+                if self.world_size > 1:
+                    dist.barrier(
+                        device_ids=[self.rank]
+                    )
+                    
             finally:
                 reset_context()
 

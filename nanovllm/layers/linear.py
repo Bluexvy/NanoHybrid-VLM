@@ -8,6 +8,21 @@ def divide(numerator, denominator):
     assert numerator % denominator == 0
     return numerator // denominator
 
+def shard_tensor_by_segments(
+    tensor: torch.Tensor,
+    segment_sizes: list[int],
+    tp_rank: int,
+    tp_size: int,
+    dim: int = 0,
+):
+    assert all(size % tp_size == 0 for size in segment_sizes)
+
+    segments = torch.split(tensor, segment_sizes, dim=dim)
+    local_segments = [
+        segment.chunk(tp_size, dim=dim)[tp_rank]
+        for segment in segments
+    ]
+    return torch.cat(local_segments, dim=dim)
 
 class LinearBase(nn.Module):
 
@@ -92,6 +107,30 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
 
+class SegmentedColumnParallelLinear(ColumnParallelLinear):
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        bias: bool = False,
+    ):
+        self.output_sizes = output_sizes
+        super().__init__(input_size, sum(output_sizes), bias)
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ):
+        local_weight = shard_tensor_by_segments(
+            loaded_weight,
+            self.output_sizes,
+            self.tp_rank,
+            self.tp_size,
+            dim=self.tp_dim,
+        )
+        param.data.copy_(local_weight)
 
 class QKVParallelLinear(ColumnParallelLinear):
 

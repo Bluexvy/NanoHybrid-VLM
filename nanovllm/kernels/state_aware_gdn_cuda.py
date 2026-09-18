@@ -27,16 +27,10 @@ def _load_extension():
 
     build_directory.mkdir(parents=True, exist_ok=True)
 
-    cuda_home = "/workspace/cuda-12.8"
-
-    os.environ["CUDA_HOME"] = cuda_home
-    os.environ["PATH"] = f"{cuda_home}/bin:{os.environ['PATH']}"
     os.environ["MAX_JOBS"] = "1"
-    os.environ["TORCH_CUDA_ARCH_LIST"] = "12.0"
 
     from torch.utils import cpp_extension
 
-    cpp_extension.CUDA_HOME = cuda_home
 
     _extension = cpp_extension.load(
         name="nanovllm_state_aware_gdn_cuda_ext",

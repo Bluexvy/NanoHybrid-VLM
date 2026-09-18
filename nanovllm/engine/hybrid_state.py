@@ -141,12 +141,21 @@ class HybridCacheSpec:
         tensor_parallel_size: int = 1,
     ) -> "HybridCacheSpec":
 
-        # 当前 Qwen3.5 Runtime 明确只支持 TP=1。
-        if tensor_parallel_size != 1:
-            raise NotImplementedError(
-                "Qwen3.5 Hybrid Runtime currently "
-                "supports only tensor_parallel_size=1"
-            )
+        assert (
+            text_config.num_key_value_heads
+            % tensor_parallel_size
+            == 0
+        )
+        assert (
+            text_config.linear_num_key_heads
+            % tensor_parallel_size
+            == 0
+        )
+        assert (
+            text_config.linear_num_value_heads
+            % tensor_parallel_size
+            == 0
+        )
 
         # 区分 GDN 层和 Attention 层
         layer_types = tuple(
@@ -245,13 +254,28 @@ class HybridCacheSpec:
                 // text_config.num_attention_heads
             )
 
-        key_dim = (
+        local_num_kv_heads = (
+            text_config.num_key_value_heads
+            // tensor_parallel_size
+        )
+
+        local_num_gdn_key_heads = (
             text_config.linear_num_key_heads
+            // tensor_parallel_size
+        )
+
+        local_num_gdn_value_heads = (
+            text_config.linear_num_value_heads
+            // tensor_parallel_size
+        )
+
+        key_dim = (
+            local_num_gdn_key_heads
             * text_config.linear_key_head_dim
         )
 
         value_dim = (
-            text_config.linear_num_value_heads
+            local_num_gdn_value_heads
             * text_config.linear_value_head_dim
         )
 
@@ -285,7 +309,7 @@ class HybridCacheSpec:
                 gdn_index_by_layer
             ),
             num_kv_heads=(
-                text_config.num_key_value_heads
+                local_num_kv_heads
             ),
             attention_head_dim=(
                 attention_head_dim
@@ -295,7 +319,7 @@ class HybridCacheSpec:
                 text_config.linear_conv_kernel_dim
             ),
             num_gdn_value_heads=(
-                text_config.linear_num_value_heads
+                local_num_gdn_value_heads
             ),
             gdn_key_head_dim=(
                 text_config.linear_key_head_dim

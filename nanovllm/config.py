@@ -390,15 +390,6 @@ class Config:
                 "valid for models containing GDN layers"
             )
 
-        if (
-            hybrid_prefix_cache_enabled
-            and self.tensor_parallel_size != 1
-        ):
-            raise NotImplementedError(
-                "Hybrid Prefix State Cache currently "
-                "supports TP=1 only"
-            )
-
         if self.enable_prefix_cache is None:
             # Qwen3 保持原来的 Prefix Cache。
             #

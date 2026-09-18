@@ -273,6 +273,7 @@ class LLMEngine:
             self.prefix_model_namespace = (
                 "hybrid-prefix-v1"
                 f"|model={config.model}"
+                f"|tp_size={config.tensor_parallel_size}"
                 f"|model_dtype={self.model_runner.model_dtype}"
                 f"|active_recurrent_dtype="
                 f"{spec.recurrent_dtype}"
@@ -626,6 +627,10 @@ class LLMEngine:
             ):
                 continue
 
+            resident_keys_before = set(
+                cache.entries
+            )
+
             committed_entry, created = (
                 cache.commit(
                     key=key,
@@ -634,6 +639,20 @@ class LLMEngine:
                 )
             )
 
+            evicted_keys = list(
+                resident_keys_before
+                - set(cache.entries)
+            )
+
+            if (
+                self.model_runner.world_size > 1
+                and evicted_keys
+            ):
+                self.model_runner.call(
+                    "discard_worker_prefix_states",
+                    evicted_keys,
+                )
+                
             # 容量不足不是推理错误。
             #
             # 当前请求已经正常计算，只是不把这份状态
@@ -642,8 +661,15 @@ class LLMEngine:
                 continue
 
             if created:
-                seq.num_prefix_snapshots_created += 1
+                if self.model_runner.world_size > 1:
+                    self.model_runner.call(
+                        "cache_worker_prefix_state",
+                        key,
+                        seq.state_slot,
+                    )
 
+                seq.num_prefix_snapshots_created += 1
+                
     def _restore_pending_prefix_states(
         self,
         seqs: list[Sequence],
@@ -740,6 +766,13 @@ class LLMEngine:
                 entry=entry,
                 state_slot=seq.state_slot,
             )
+            
+            if self.model_runner.world_size > 1:
+                self.model_runner.call(
+                    "restore_worker_prefix_state",
+                    entry.key,
+                    seq.state_slot,
+                )
 
             # 同一请求只在第一次 Prefix-hit Prefill 前恢复。
             #

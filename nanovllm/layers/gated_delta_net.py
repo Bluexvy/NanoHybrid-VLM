@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -22,6 +23,13 @@ except ImportError:
     fused_recurrent_gated_delta_rule = None
     
 from nanovllm.utils.context import get_context
+
+from nanovllm.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    SegmentedColumnParallelLinear,
+    shard_tensor_by_segments,
+)
 
 from nanovllm.kernels.state_aware_gdn import (
     state_aware_gdn_decode_triton,
@@ -518,11 +526,34 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.hidden_size = config.hidden_size
 
-        self.num_k_heads = (
+        self.tp_rank = dist.get_rank()
+        self.tp_size = dist.get_world_size()
+
+        self.total_num_k_heads = (
             config.linear_num_key_heads
         )
-        self.num_v_heads = (
+        self.total_num_v_heads = (
             config.linear_num_value_heads
+        )
+
+        assert (
+            self.total_num_k_heads
+            % self.tp_size
+            == 0
+        )
+        assert (
+            self.total_num_v_heads
+            % self.tp_size
+            == 0
+        )
+
+        self.num_k_heads = (
+            self.total_num_k_heads
+            // self.tp_size
+        )
+        self.num_v_heads = (
+            self.total_num_v_heads
+            // self.tp_size
         )
 
         self.head_k_dim = (
@@ -538,6 +569,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 "linear_num_key_heads"
             )
 
+        self.total_key_dim = (
+            self.total_num_k_heads
+            * self.head_k_dim
+        )
+
+        self.total_value_dim = (
+            self.total_num_v_heads
+            * self.head_v_dim
+        )
+
+        self.total_conv_dim = (
+            self.total_key_dim * 2
+            + self.total_value_dim
+        )
+
         self.key_dim = (
             self.num_k_heads
             * self.head_k_dim
@@ -552,7 +598,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.key_dim * 2
             + self.value_dim
         )
-
+        
         self.conv_kernel_size = (
             config.linear_conv_kernel_dim
         )
@@ -578,10 +624,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 "linear_attention layer"
             )
 
-        self.in_proj_qkv = nn.Linear(
-            self.hidden_size,
-            self.conv_dim,
-            bias=False,
+        self.in_proj_qkv = (
+            SegmentedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[
+                    self.total_key_dim,
+                    self.total_key_dim,
+                    self.total_value_dim,
+                ],
+                bias=False,
+            )
         )
 
         """
@@ -589,23 +641,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         b：当前 token 想写多少
         z：当前 token 想输出多少
         """
-
-        self.in_proj_z = nn.Linear(
-            self.hidden_size,
-            self.value_dim,
+        self.in_proj_z = ColumnParallelLinear(
+            input_size=self.hidden_size,
+            output_size=self.total_value_dim,
             bias=False,
         )
 
-        # 每个 token、每个 Value head 一个标量。
-        self.in_proj_b = nn.Linear(
-            self.hidden_size,
-            self.num_v_heads,
+        self.in_proj_b = ColumnParallelLinear(
+            input_size=self.hidden_size,
+            output_size=self.total_num_v_heads,
             bias=False,
         )
 
-        self.in_proj_a = nn.Linear(
-            self.hidden_size,
-            self.num_v_heads,
+        self.in_proj_a = ColumnParallelLinear(
+            input_size=self.hidden_size,
+            output_size=self.total_num_v_heads,
             bias=False,
         )
 
@@ -618,10 +668,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             padding=self.conv_kernel_size - 1,
         )
 
+        self.conv1d.weight.weight_loader = (
+            self._load_conv1d_weight
+        )
+        
         self.dt_bias = nn.Parameter(
             torch.ones(self.num_v_heads)
         )
-
+        
+        self.dt_bias.weight_loader = (
+            self._load_value_head_weight
+        )
+        
         initial_a = torch.empty(
             self.num_v_heads,
             dtype=torch.float32,
@@ -630,16 +688,55 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(
             torch.log(initial_a)
         )
+        
+        self.A_log.weight_loader = (
+            self._load_value_head_weight
+        )
 
         self.norm = Qwen3_5RMSNormGated(
             self.head_v_dim,
             eps=self.layer_norm_epsilon,
         )
 
-        self.out_proj = nn.Linear(
-            self.value_dim,
-            self.hidden_size,
+        self.out_proj = RowParallelLinear(
+            input_size=self.total_value_dim,
+            output_size=self.hidden_size,
             bias=False,
+        )
+    
+    def _load_conv1d_weight(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ):
+        local_weight = shard_tensor_by_segments(
+            loaded_weight,
+            [
+                self.total_key_dim,
+                self.total_key_dim,
+                self.total_value_dim,
+            ],
+            self.tp_rank,
+            self.tp_size,
+            dim=0,
+        )
+        param.data.copy_(local_weight)
+
+
+    def _load_value_head_weight(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ):
+        shard_size = param.data.shape[0]
+        start = self.tp_rank * shard_size
+
+        param.data.copy_(
+            loaded_weight.narrow(
+                0,
+                start,
+                shard_size,
+            )
         )
     
     def _run_variable_length_causal_conv1d(
