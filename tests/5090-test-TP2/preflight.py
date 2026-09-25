@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import torch
+from torch.utils import cpp_extension
 from transformers import AutoConfig
 
 from suite_common import write_json
@@ -87,6 +88,13 @@ def engine_port_available() -> bool:
 
 def main() -> None:
     args = parse_args()
+
+    if not cpp_extension.is_ninja_available():
+        raise RuntimeError(
+            "Ninja is unavailable; state_aware_cuda "
+            "cannot build its PyTorch CUDA Extension"
+        )
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable")
     if torch.cuda.device_count() < args.tp_size:
@@ -133,6 +141,7 @@ def main() -> None:
             )
 
     payload = {
+        "ninja_available": True,
         "python": sys.version,
         "platform": platform.platform(),
         "torch": torch.__version__,

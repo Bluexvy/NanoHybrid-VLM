@@ -462,6 +462,17 @@ class ModelRunner:
             )
         )
         n = len(data)
+        required_bytes = 4 + n
+        capacity_bytes = len(self.shm.buf)
+
+        if required_bytes > capacity_bytes:
+            raise RuntimeError(
+                "TP command exceeds shared-memory "
+                "capacity: "
+                f"required={required_bytes}, "
+                f"capacity={capacity_bytes}"
+            )
+
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
         for event in self.event:
@@ -1276,6 +1287,11 @@ class ModelRunner:
             raise RuntimeError(
                 "Visual cache byte counter "
                 "became negative"
+            )
+
+        if self.world_size > 1:
+            dist.barrier(
+                device_ids=[self.rank]
             )
 
     @torch.inference_mode()
@@ -2194,6 +2210,19 @@ class ModelRunner:
         )
 
         max_batch_size = batch_sizes[-1]
+
+        num_state_slots = (
+            self.hybrid_state_manager.num_slots
+        )
+
+        if num_state_slots < max_batch_size:
+            raise RuntimeError(
+                "CUDA Graph capture requires at least "
+                "one GDN state slot per captured batch "
+                "row: "
+                f"num_state_slots={num_state_slots}, "
+                f"max_batch_size={max_batch_size}"
+            )
 
         max_num_blocks = (
             self.config.max_model_len

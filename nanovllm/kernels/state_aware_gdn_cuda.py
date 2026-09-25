@@ -31,6 +31,12 @@ def _load_extension():
 
     from torch.utils import cpp_extension
 
+    if not cpp_extension.is_ninja_available():
+        raise RuntimeError(
+            "state_aware_cuda requires Ninja to "
+            "build the PyTorch CUDA Extension. "
+            "Install it with: pip install ninja"
+        )
 
     _extension = cpp_extension.load(
         name="nanovllm_state_aware_gdn_cuda_ext",
