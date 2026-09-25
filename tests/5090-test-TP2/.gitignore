@@ -1,0 +1,6 @@
+config.sh
+results/
+*.nsys-rep
+*.qdstrm
+*_stats*.csv
+__pycache__/

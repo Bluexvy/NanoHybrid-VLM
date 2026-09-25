@@ -1,11 +1,11 @@
-#include <bits/stdc++.h>
+#include<bits/stdc++.h>
+
 using namespace std;
 
 struct TreeNode{
     int val;
     TreeNode* left;
     TreeNode* right;
-
     TreeNode(int x){
         val = x;
         left = nullptr;
@@ -13,27 +13,27 @@ struct TreeNode{
     }
 };
 
-TreeNode* buildTree(){
-    int value;
-    cin >> value;
+TreeNode* buildTree(vector<int>& nums, int index){
+    if(index >= nums.size()) return nullptr;
+    if(nums[index] == -1) return nullptr;
 
-    if(value == -1) return nullptr;
+    TreeNode* root = new TreeNode(nums[index]);
+    root->left = buildTree(nums, index * 2 + 1);
+    root->right = buildTree(nums, index * 2 + 2);
 
-    TreeNode* root = new TreeNode(value);
-    root->left = buildTree();
-    root->right = buildTree();
     return root;
 }
 
-void inorder(TreeNode* root){
+void inorderTraversal(TreeNode* root){
     if(root == nullptr) return;
-    inorder(root->left);
-    cout << root->val << " ";
-    inorder(root->right);
+    inorderTraversal(root->left);
+    cout<< root->val<< " ";
+    inorderTraversal(root->right);
 }
 
 int main(){
-    TreeNode* root = buildTree();
-    inorder(root);
+    vector<int> nums = {1,2,3,4,5,6,76,8,98,7678};
+    TreeNode* root = buildTree(nums, 0);
+    inorderTraversal(root);
     return 0;
 }
