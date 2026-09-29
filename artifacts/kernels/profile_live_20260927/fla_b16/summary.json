@@ -1,0 +1,98 @@
+{
+  "backend": "fla",
+  "batch_size": 16,
+  "block_value": 32,
+  "num_slots": 32,
+  "gdn_layer_idx": 7,
+  "state_pool_shape": [
+    32,
+    24,
+    32,
+    128,
+    128
+  ],
+  "state_pool_dtype": "torch.float32",
+  "slot_ids": [
+    0,
+    2,
+    4,
+    6,
+    8,
+    10,
+    12,
+    14,
+    16,
+    18,
+    20,
+    22,
+    24,
+    26,
+    28,
+    30
+  ],
+  "event_benchmark": {
+    "benchmark_steps": 100,
+    "total_ms": 7.84819221496582,
+    "mean_ms": 0.0784819221496582
+  },
+  "semantic_ranges": {
+    "nano::gdn_decode_step": {
+      "count": 8,
+      "cuda_total_us": 478.90399999999954,
+      "cuda_mean_us": 59.86299999999994
+    },
+    "nano::old_state_gather": {
+      "count": 8,
+      "cuda_total_us": 154.97400000000016,
+      "cuda_mean_us": 19.37175000000002
+    },
+    "nano::old_fla_recurrence": {
+      "count": 8,
+      "cuda_total_us": 185.7579999999998,
+      "cuda_mean_us": 23.219749999999976
+    },
+    "nano::old_state_scatter": {
+      "count": 8,
+      "cuda_total_us": 138.17199999999957,
+      "cuda_mean_us": 17.271499999999946
+    }
+  },
+  "top_cuda_events": [
+    {
+      "name": "FusedRecurrentFunction",
+      "count": 8,
+      "self_cuda_total_us": 185.7579999999998,
+      "self_cuda_mean_us": 23.219749999999976
+    },
+    {
+      "name": "fused_recurrent_gated_delta_rule_fwd_kernel",
+      "count": 8,
+      "self_cuda_total_us": 185.7579999999998,
+      "self_cuda_mean_us": 23.219749999999976
+    },
+    {
+      "name": "aten::index_select",
+      "count": 8,
+      "self_cuda_total_us": 154.97400000000016,
+      "self_cuda_mean_us": 19.37175000000002
+    },
+    {
+      "name": "void at::native::(anonymous namespace)::indexSelectSmallIndex<float, long, unsigned int, 2, 2, -2>(at::cuda::detail::TensorInfo<float, unsigned int>, at::cuda::detail::TensorInfo<float const, unsigned int>, at::cuda::detail::TensorInfo<long const, unsigned int>, int, int, unsigned int, long)",
+      "count": 8,
+      "self_cuda_total_us": 154.97400000000016,
+      "self_cuda_mean_us": 19.37175000000002
+    },
+    {
+      "name": "aten::index_copy_",
+      "count": 8,
+      "self_cuda_total_us": 138.17199999999957,
+      "self_cuda_mean_us": 17.271499999999946
+    },
+    {
+      "name": "void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::native::OpaqueType<4> >(at::TensorIterator&, long, long, long)::{lambda(int)#1}>(long, at::native::index_copy_kernel_impl<at::native::OpaqueType<4> >(at::TensorIterator&, long, long, long)::{lambda(int)#1})",
+      "count": 8,
+      "self_cuda_total_us": 138.17199999999957,
+      "self_cuda_mean_us": 17.271499999999946
+    }
+  ]
+}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -329,6 +330,119 @@ def benchmark_with_cuda_events(
     }
 
 
+def summarize_event_samples(samples_ms: list[float]):
+    ordered = sorted(samples_ms)
+
+    def percentile(p: float) -> float:
+        if len(ordered) == 1:
+            return ordered[0]
+
+        position = p * (len(ordered) - 1)
+        lower = int(position)
+        upper = min(lower + 1, len(ordered) - 1)
+        weight = position - lower
+        return (
+            ordered[lower] * (1.0 - weight)
+            + ordered[upper] * weight
+        )
+
+    return {
+        "count": len(samples_ms),
+        "mean_ms": statistics.fmean(samples_ms),
+        "median_ms": statistics.median(samples_ms),
+        "p95_ms": percentile(0.95),
+        "min_ms": ordered[0],
+        "max_ms": ordered[-1],
+    }
+
+
+def benchmark_old_fla_phases_with_cuda_events(
+    tensors: dict[str, torch.Tensor],
+    gdn_layer_idx: int,
+    warmup_steps: int = 20,
+    benchmark_steps: int = 100,
+):
+    """分别计量 Gather、FLA recurrence 和 Scatter 的 GPU 时间。"""
+
+    for _ in range(warmup_steps):
+        run_old_fla_step(
+            tensors=tensors,
+            gdn_layer_idx=gdn_layer_idx,
+        )
+
+    torch.cuda.synchronize()
+
+    state_pool = tensors["state_pool"]
+    state_slot_ids = tensors["state_slot_ids"].long()
+    q = tensors["q"].unsqueeze(1)
+    k = tensors["k"].unsqueeze(1)
+    v = tensors["v"].unsqueeze(1)
+    beta = tensors["beta"].unsqueeze(1)
+    g = tensors["g"].unsqueeze(1)
+
+    event_rows = []
+
+    for _ in range(benchmark_steps):
+        events = [
+            torch.cuda.Event(enable_timing=True)
+            for _ in range(4)
+        ]
+
+        events[0].record()
+        batched_state = torch.index_select(
+            state_pool[:, gdn_layer_idx],
+            dim=0,
+            index=state_slot_ids,
+        )
+        events[1].record()
+
+        _, final_state = fused_recurrent_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            beta=beta,
+            g=g,
+            scale=DK ** -0.5,
+            initial_state=batched_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        events[2].record()
+
+        state_pool[:, gdn_layer_idx].index_copy_(
+            dim=0,
+            index=state_slot_ids,
+            source=final_state,
+        )
+        events[3].record()
+        event_rows.append(events)
+
+    event_rows[-1][-1].synchronize()
+
+    gather_ms = []
+    recurrence_ms = []
+    scatter_ms = []
+    total_ms = []
+
+    for start, gather_end, recurrence_end, scatter_end in event_rows:
+        gather_ms.append(start.elapsed_time(gather_end))
+        recurrence_ms.append(gather_end.elapsed_time(recurrence_end))
+        scatter_ms.append(recurrence_end.elapsed_time(scatter_end))
+        total_ms.append(start.elapsed_time(scatter_end))
+
+    return {
+        "note": (
+            "Per-phase timing inserts extra CUDA events and may slightly "
+            "perturb very short kernels; use the separate whole-path "
+            "benchmark as the primary end-to-end latency."
+        ),
+        "gather": summarize_event_samples(gather_ms),
+        "fla_recurrence": summarize_event_samples(recurrence_ms),
+        "scatter": summarize_event_samples(scatter_ms),
+        "total": summarize_event_samples(total_ms),
+    }
+
+
 def get_event_cuda_time_us(event) -> float:
     """
     兼容不同 PyTorch 版本的字段命名。
@@ -533,6 +647,15 @@ def profile_case(
         )
     )
 
+    phase_event_benchmark = None
+    if backend == "fla":
+        phase_event_benchmark = (
+            benchmark_old_fla_phases_with_cuda_events(
+                tensors=tensors,
+                gdn_layer_idx=gdn_layer_idx,
+            )
+        )
+
     summary = {
         "backend": backend,
         "batch_size": batch_size,
@@ -551,6 +674,7 @@ def profile_case(
             .tolist()
         ),
         "event_benchmark": event_benchmark,
+        "phase_event_benchmark": phase_event_benchmark,
         **profiler_summary,
     }
 
@@ -572,6 +696,21 @@ def profile_case(
         f"{event_benchmark['mean_ms']:.6f} ms",
     )
 
+    if phase_event_benchmark is not None:
+        print("Phase CUDA Event latency:")
+        for phase_name in (
+            "gather",
+            "fla_recurrence",
+            "scatter",
+            "total",
+        ):
+            values = phase_event_benchmark[phase_name]
+            print(
+                f"  {phase_name}: "
+                f"mean={values['mean_ms']:.6f} ms, "
+                f"p95={values['p95_ms']:.6f} ms"
+            )
+
     print()
     print("Semantic ranges:")
 
@@ -580,7 +719,9 @@ def profile_case(
     ):
         print(
             f"  {name}: "
-            f"{values['cuda_total_us']:.3f} us"
+            f"calls={values['count']}, "
+            f"total={values['cuda_total_us']:.3f} us, "
+            f"mean={values['cuda_mean_us']:.3f} us"
         )
 
     print()

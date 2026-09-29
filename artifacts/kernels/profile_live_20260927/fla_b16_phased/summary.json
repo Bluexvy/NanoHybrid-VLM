@@ -1,0 +1,133 @@
+{
+  "backend": "fla",
+  "batch_size": 16,
+  "block_value": 32,
+  "num_slots": 32,
+  "gdn_layer_idx": 7,
+  "state_pool_shape": [
+    32,
+    24,
+    32,
+    128,
+    128
+  ],
+  "state_pool_dtype": "torch.float32",
+  "slot_ids": [
+    0,
+    2,
+    4,
+    6,
+    8,
+    10,
+    12,
+    14,
+    16,
+    18,
+    20,
+    22,
+    24,
+    26,
+    28,
+    30
+  ],
+  "event_benchmark": {
+    "benchmark_steps": 100,
+    "total_ms": 7.810463905334473,
+    "mean_ms": 0.07810463905334472
+  },
+  "phase_event_benchmark": {
+    "note": "Per-phase timing inserts extra CUDA events and may slightly perturb very short kernels; use the separate whole-path benchmark as the primary end-to-end latency.",
+    "gather": {
+      "count": 100,
+      "mean_ms": 0.02244575971737504,
+      "median_ms": 0.022143999114632607,
+      "p95_ms": 0.024224000051617622,
+      "min_ms": 0.019519999623298645,
+      "max_ms": 0.09414400160312653
+    },
+    "fla_recurrence": {
+      "count": 100,
+      "mean_ms": 0.03260383997112513,
+      "median_ms": 0.030719999223947525,
+      "p95_ms": 0.04308959990739822,
+      "min_ms": 0.025599999353289604,
+      "max_ms": 0.08089599758386612
+    },
+    "scatter": {
+      "count": 100,
+      "mean_ms": 0.020462719574570656,
+      "median_ms": 0.020479999482631683,
+      "p95_ms": 0.02074399935081601,
+      "min_ms": 0.018400000408291817,
+      "max_ms": 0.02457600086927414
+    },
+    "total": {
+      "count": 100,
+      "mean_ms": 0.07551231980323792,
+      "median_ms": 0.07236799970269203,
+      "p95_ms": 0.08569119684398174,
+      "min_ms": 0.06800000369548798,
+      "max_ms": 0.19961600005626678
+    }
+  },
+  "semantic_ranges": {
+    "nano::gdn_decode_step": {
+      "count": 8,
+      "cuda_total_us": 479.1890000000001,
+      "cuda_mean_us": 59.89862500000001
+    },
+    "nano::old_state_gather": {
+      "count": 8,
+      "cuda_total_us": 151.98599999999976,
+      "cuda_mean_us": 18.99824999999997
+    },
+    "nano::old_fla_recurrence": {
+      "count": 8,
+      "cuda_total_us": 188.43000000000046,
+      "cuda_mean_us": 23.553750000000058
+    },
+    "nano::old_state_scatter": {
+      "count": 8,
+      "cuda_total_us": 138.77299999999985,
+      "cuda_mean_us": 17.34662499999998
+    }
+  },
+  "top_cuda_events": [
+    {
+      "name": "FusedRecurrentFunction",
+      "count": 8,
+      "self_cuda_total_us": 188.43000000000046,
+      "self_cuda_mean_us": 23.553750000000058
+    },
+    {
+      "name": "fused_recurrent_gated_delta_rule_fwd_kernel",
+      "count": 8,
+      "self_cuda_total_us": 188.43000000000046,
+      "self_cuda_mean_us": 23.553750000000058
+    },
+    {
+      "name": "aten::index_select",
+      "count": 8,
+      "self_cuda_total_us": 151.98599999999976,
+      "self_cuda_mean_us": 18.99824999999997
+    },
+    {
+      "name": "void at::native::(anonymous namespace)::indexSelectSmallIndex<float, long, unsigned int, 2, 2, -2>(at::cuda::detail::TensorInfo<float, unsigned int>, at::cuda::detail::TensorInfo<float const, unsigned int>, at::cuda::detail::TensorInfo<long const, unsigned int>, int, int, unsigned int, long)",
+      "count": 8,
+      "self_cuda_total_us": 151.98599999999976,
+      "self_cuda_mean_us": 18.99824999999997
+    },
+    {
+      "name": "aten::index_copy_",
+      "count": 8,
+      "self_cuda_total_us": 138.77299999999985,
+      "self_cuda_mean_us": 17.34662499999998
+    },
+    {
+      "name": "void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::native::OpaqueType<4> >(at::TensorIterator&, long, long, long)::{lambda(int)#1}>(long, at::native::index_copy_kernel_impl<at::native::OpaqueType<4> >(at::TensorIterator&, long, long, long)::{lambda(int)#1})",
+      "count": 8,
+      "self_cuda_total_us": 138.77299999999985,
+      "self_cuda_mean_us": 17.34662499999998
+    }
+  ]
+}
