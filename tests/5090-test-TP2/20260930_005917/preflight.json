@@ -1,0 +1,81 @@
+{
+  "ninja_available": true,
+  "python": "3.12.3 | packaged by Anaconda, Inc. | (main, May  6 2024, 19:46:43) [GCC 11.2.0]",
+  "platform": "Linux-5.15.0-86-generic-x86_64-with-glibc2.35",
+  "torch": "2.8.0+cu128",
+  "torch_cuda": "12.8",
+  "cudnn": 91002,
+  "nccl_available": true,
+  "nccl_version": [
+    2,
+    27,
+    3
+  ],
+  "visible_device_count": 2,
+  "devices": [
+    {
+      "index": 0,
+      "name": "NVIDIA A100-PCIE-40GB",
+      "compute_capability": "8.0",
+      "total_memory_gib": 39.4935302734375,
+      "free_memory_gib": 39.07867431640625,
+      "bf16_supported": true
+    },
+    {
+      "index": 1,
+      "name": "NVIDIA A100-PCIE-40GB",
+      "compute_capability": "8.0",
+      "total_memory_gib": 39.4935302734375,
+      "free_memory_gib": 39.07867431640625,
+      "bf16_supported": true
+    }
+  ],
+  "peer_access": {
+    "0->1": true,
+    "1->0": true
+  },
+  "engine_port_2333_available": true,
+  "stale_nanovllm_shared_memory": false,
+  "model": "/root/autodl-tmp/models/Qwen3.5-9B",
+  "tp_size": 2,
+  "model_geometry": {
+    "hidden_size": 4096,
+    "num_hidden_layers": 32,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 4,
+    "intermediate_size": 12288,
+    "vocab_size": 248320,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 32,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "full_attention_layers": 8,
+    "linear_attention_layers": 24,
+    "tp_divisibility": {
+      "num_attention_heads": {
+        "value": 16,
+        "divisible": true
+      },
+      "num_key_value_heads": {
+        "value": 4,
+        "divisible": true
+      },
+      "intermediate_size": {
+        "value": 12288,
+        "divisible": true
+      },
+      "vocab_size": {
+        "value": 248320,
+        "divisible": true
+      },
+      "linear_num_key_heads": {
+        "value": 16,
+        "divisible": true
+      },
+      "linear_num_value_heads": {
+        "value": 32,
+        "divisible": true
+      }
+    }
+  }
+}

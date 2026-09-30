@@ -1,0 +1,7 @@
+preflight	PASS	17s
+nccl_smoke	PASS	6s
+tp1_eager_cuda	PASS	286s
+tp2_eager_cuda	PASS	148s
+compare_tp1_tp2	PASS	0s
+tp2_fla_smoke	PASS	34s
+summarize	PASS	0s

@@ -1,0 +1,13 @@
+{
+  "label": "tp1_vs_tp2_greedy",
+  "reference": "/root/autodl-tmp/nano-vllm/tests/5090-test-TP2/results/20260930_005917/tp1_eager_cuda.json",
+  "candidate": "/root/autodl-tmp/nano-vllm/tests/5090-test-TP2/results/20260930_005917/tp2_eager_cuda.json",
+  "compared": [
+    "p128_b1",
+    "p128_b16",
+    "p128_b4",
+    "p2048_b1"
+  ],
+  "mismatches": [],
+  "passed": true
+}

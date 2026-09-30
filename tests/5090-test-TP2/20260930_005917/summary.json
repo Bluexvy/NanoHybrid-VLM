@@ -1,0 +1,57 @@
+{
+  "correctness": {
+    "tp1_vs_tp2": {
+      "label": "tp1_vs_tp2_greedy",
+      "reference": "/root/autodl-tmp/nano-vllm/tests/5090-test-TP2/results/20260930_005917/tp1_eager_cuda.json",
+      "candidate": "/root/autodl-tmp/nano-vllm/tests/5090-test-TP2/results/20260930_005917/tp2_eager_cuda.json",
+      "compared": [
+        "p128_b1",
+        "p128_b16",
+        "p128_b4",
+        "p2048_b1"
+      ],
+      "mismatches": [],
+      "passed": true
+    },
+    "eager_vs_graph": null,
+    "prefix_passed": false
+  },
+  "cases": {
+    "p128_b1": {
+      "tp1_decode_tokens_per_second": 15.219352297951065,
+      "tp2_decode_tokens_per_second": 12.420104326976737,
+      "tp_speedup": 0.8160731208416023,
+      "tp2_graph_decode_tokens_per_second": null,
+      "graph_speedup": null,
+      "tp1_ttft_ms": 127.03933194279671,
+      "tp2_ttft_ms": 142.72065460681915
+    },
+    "p128_b16": {
+      "tp1_decode_tokens_per_second": 205.24249476495854,
+      "tp2_decode_tokens_per_second": 169.07558984188356,
+      "tp_speedup": 0.8237845190661275,
+      "tp2_graph_decode_tokens_per_second": null,
+      "graph_speedup": null,
+      "tp1_ttft_ms": 10548.283282201737,
+      "tp2_ttft_ms": 10404.337596613914
+    },
+    "p128_b4": {
+      "tp1_decode_tokens_per_second": 60.54542312432361,
+      "tp2_decode_tokens_per_second": 49.72514848420721,
+      "tp_speedup": 0.8212866624468358,
+      "tp2_graph_decode_tokens_per_second": null,
+      "graph_speedup": null,
+      "tp1_ttft_ms": 144.50851920992136,
+      "tp2_ttft_ms": 167.96876676380634
+    },
+    "p2048_b1": {
+      "tp1_decode_tokens_per_second": 15.05445334828309,
+      "tp2_decode_tokens_per_second": 12.316882030315547,
+      "tp_speedup": 0.8181553820232368,
+      "tp2_graph_decode_tokens_per_second": null,
+      "graph_speedup": null,
+      "tp1_ttft_ms": 515.817791223526,
+      "tp2_ttft_ms": 632.144033908844
+    }
+  }
+}

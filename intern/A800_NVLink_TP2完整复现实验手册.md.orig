@@ -1,0 +1,4 @@
+# A800 NVLink TP=2 完整复现实验手册
+
+> 本文档记录从租用服务器、配置环境、下载源码与模型，到 TP=2 Quick/Full、Kernel、Profiler、Nsight、归档下载的完整流程。目标环境为 2×A800 80GB NVLink。
+

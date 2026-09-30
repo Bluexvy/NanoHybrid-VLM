@@ -1,0 +1,126 @@
+{
+  "label": "tp2_fla_smoke",
+  "config": {
+    "model": "/root/autodl-tmp/models/Qwen3.5-9B",
+    "output": "/root/autodl-tmp/nano-vllm/tests/5090-test-TP2/results/20260930_012334/tp2_fla_smoke.json",
+    "label": "tp2_fla_smoke",
+    "tp_size": 2,
+    "mode": "eager",
+    "backend": "fla",
+    "cases": [
+      [
+        64,
+        1
+      ]
+    ],
+    "output_tokens": 8,
+    "repeats": 1,
+    "warmup_output_tokens": 2,
+    "token_budget": 256,
+    "gpu_memory_utilization": 0.78,
+    "graph_buckets": [
+      1
+    ],
+    "run_dynamic": false,
+    "run_vision": false,
+    "vision_size": 448
+  },
+  "cases": {
+    "p64_b1": {
+      "prompt_tokens": 64,
+      "batch_size": 1,
+      "iterations": [
+        {
+          "seq_ids": [
+            2
+          ],
+          "outputs": [
+            [
+              6297,
+              321,
+              1528,
+              27224,
+              13,
+              220,
+              25204,
+              14835
+            ]
+          ],
+          "prompt_tokens": [
+            64
+          ],
+          "completion_tokens": [
+            8
+          ],
+          "total_prefill_tokens": 64,
+          "total_decode_tokens": 7,
+          "prefill_tokens_per_second": 477.9367946866377,
+          "decode_tokens_per_second": 10.81535741364527,
+          "prefill_step_ms": {
+            "mean": 133.9089199900627,
+            "p50": 133.9089199900627,
+            "p95": 133.9089199900627,
+            "p99": 133.9089199900627,
+            "max": 133.9089199900627
+          },
+          "decode_step_ms": {
+            "mean": 92.46111448322024,
+            "p50": 92.0628197491169,
+            "p95": 96.07436209917068,
+            "p99": 97.01403468847275,
+            "max": 97.24895283579826
+          },
+          "ttft_ms": {
+            "mean": 134.51626151800156,
+            "p50": 134.51626151800156,
+            "p95": 134.51626151800156,
+            "p99": 134.51626151800156,
+            "max": 134.51626151800156
+          },
+          "tpot_ms": {
+            "mean": 92.0846877353532,
+            "p50": 92.0846877353532,
+            "p95": 92.0846877353532,
+            "p99": 92.0846877353532,
+            "max": 92.0846877353532
+          },
+          "e2e_ms": {
+            "mean": 779.1090756654739,
+            "p50": 779.1090756654739,
+            "p95": 779.1090756654739,
+            "p99": 779.1090756654739,
+            "max": 779.1090756654739
+          },
+          "total_seconds": 0.7817191854119301,
+          "repeat": 0
+        }
+      ]
+    }
+  },
+  "initialization_seconds": 18.04814215376973,
+  "scheduler": {
+    "num_preemptions": 0,
+    "num_recomputed_tokens": 0,
+    "num_prefix_hit_requests": 0,
+    "num_prefix_hit_tokens": 0
+  },
+  "graph": {
+    "replays": 0,
+    "eager_fallbacks": 7,
+    "fallback_reasons": {
+      "enforce_eager": 8
+    }
+  },
+  "rank0_memory_mib": {
+    "model_parameter_mib": 9409.050506591797,
+    "kv_cache_mib": 21240.0,
+    "gdn_state_mib": 24.75,
+    "visual_cache_current_mib": 0.0,
+    "visual_cache_peak_mib": 0.0,
+    "cuda_current_allocated_mib": 30756.8642578125,
+    "cuda_peak_allocated_mib": 30807.79833984375,
+    "cuda_reserved_mib": 30844.0,
+    "runtime_peak_extra_mib": 50.93408203125,
+    "kv_cache_block_mib": 4.0
+  }
+}

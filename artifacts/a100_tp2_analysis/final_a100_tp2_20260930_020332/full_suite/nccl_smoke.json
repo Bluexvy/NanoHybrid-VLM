@@ -1,0 +1,21 @@
+{
+  "world_size": 2,
+  "correctness_sum": 3.0,
+  "cases": {
+    "8192": {
+      "payload_bytes": 8192,
+      "mean_allreduce_us": 73.90207767486572,
+      "estimated_64_allreduces_ms": 4.729732971191407
+    },
+    "131072": {
+      "payload_bytes": 131072,
+      "mean_allreduce_us": 94.1875171661377,
+      "estimated_64_allreduces_ms": 6.028001098632813
+    },
+    "1048576": {
+      "payload_bytes": 1048576,
+      "mean_allreduce_us": 319.5801544189453,
+      "estimated_64_allreduces_ms": 20.4531298828125
+    }
+  }
+}

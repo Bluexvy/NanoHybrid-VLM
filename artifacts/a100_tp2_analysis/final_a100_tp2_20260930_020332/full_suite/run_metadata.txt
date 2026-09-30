@@ -1,0 +1,7 @@
+date: 2026-09-30T01:23:34+08:00
+hostname: autodl-container-b2551181fa-7149d834
+kernel: Linux autodl-container-b2551181fa-7149d834 5.15.0-86-generic #96-Ubuntu SMP Wed Sep 20 08:23:49 UTC 2023 x86_64 x86_64 x86_64 GNU/Linux
+git_commit: 6a4904ab3cc49f5a4df1da2753ceaa37c0830fcf
+git_status:
+ M tests/5090-test-TP2/profile_nccl.sh
+ M tests/5090-test-TP2/run_all.sh

@@ -1,0 +1,3 @@
+ M tests/5090-test-TP2/profile_nccl.sh
+ M tests/5090-test-TP2/run_all.sh
+?? artifacts/nsight/

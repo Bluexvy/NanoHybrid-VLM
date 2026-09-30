@@ -1,0 +1,1 @@
+Nsight Compute 无法采集：AutoDL 宿主机返回 ERR_NVGPUCTRPERM，容器 root 无法访问 GPU Performance Counters。

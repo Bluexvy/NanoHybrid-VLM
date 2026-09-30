@@ -1,0 +1,173 @@
+{
+  "label": "tp2_eager_vs_graph_greedy",
+  "reference": "/root/autodl-tmp/nano-vllm/tests/5090-test-TP2/results/20260930_012334/tp2_eager_cuda.json",
+  "candidate": "/root/autodl-tmp/nano-vllm/tests/5090-test-TP2/results/20260930_012334/tp2_graph_cuda.json",
+  "compared": [
+    "p128_b1",
+    "p128_b16",
+    "p128_b2",
+    "p128_b4",
+    "p128_b8",
+    "p2048_b1",
+    "p2048_b4",
+    "p2048_b8",
+    "dynamic",
+    "vision"
+  ],
+  "mismatches": [
+    {
+      "name": "p128_b16",
+      "request_index": 0,
+      "first_different_token": 58,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 1528,
+      "candidate_token": 2552
+    },
+    {
+      "name": "p128_b16",
+      "request_index": 1,
+      "first_different_token": 58,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 1528,
+      "candidate_token": 2552
+    },
+    {
+      "name": "p128_b16",
+      "request_index": 2,
+      "first_different_token": 58,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 1528,
+      "candidate_token": 2552
+    },
+    {
+      "name": "p128_b16",
+      "request_index": 3,
+      "first_different_token": 58,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 1528,
+      "candidate_token": 2552
+    },
+    {
+      "name": "p128_b16",
+      "request_index": 4,
+      "first_different_token": 69,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 13,
+      "candidate_token": 27224
+    },
+    {
+      "name": "p128_b16",
+      "request_index": 5,
+      "first_different_token": 69,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 13,
+      "candidate_token": 27224
+    },
+    {
+      "name": "p128_b16",
+      "request_index": 6,
+      "first_different_token": 69,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 13,
+      "candidate_token": 27224
+    },
+    {
+      "name": "p128_b16",
+      "request_index": 11,
+      "first_different_token": 108,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 2552,
+      "candidate_token": 1528
+    },
+    {
+      "name": "p128_b16",
+      "request_index": 15,
+      "first_different_token": 118,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 1788,
+      "candidate_token": 16629
+    },
+    {
+      "name": "p128_b8",
+      "request_index": 4,
+      "first_different_token": 118,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 4952,
+      "candidate_token": 1528
+    },
+    {
+      "name": "p128_b8",
+      "request_index": 5,
+      "first_different_token": 118,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 4952,
+      "candidate_token": 1528
+    },
+    {
+      "name": "p128_b8",
+      "request_index": 6,
+      "first_different_token": 118,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 4952,
+      "candidate_token": 1528
+    },
+    {
+      "name": "p2048_b4",
+      "request_index": 0,
+      "first_different_token": 38,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 321,
+      "candidate_token": 1528
+    },
+    {
+      "name": "p2048_b4",
+      "request_index": 1,
+      "first_different_token": 48,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 6297,
+      "candidate_token": 1528
+    },
+    {
+      "name": "p2048_b8",
+      "request_index": 0,
+      "first_different_token": 78,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 321,
+      "candidate_token": 1528
+    },
+    {
+      "name": "p2048_b8",
+      "request_index": 1,
+      "first_different_token": 88,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 321,
+      "candidate_token": 1528
+    },
+    {
+      "name": "p2048_b8",
+      "request_index": 6,
+      "first_different_token": 38,
+      "reference_length": 128,
+      "candidate_length": 128,
+      "reference_token": 1528,
+      "candidate_token": 321
+    }
+  ],
+  "passed": false
+}
