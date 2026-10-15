@@ -76,8 +76,22 @@ def compare_reports(reports):
     return errors, comparisons
 
 
-def render_markdown(reports, errors, comparisons):
-    lines = ["# DFlash A800 test report", "", f"Overall: {'FAIL' if errors else 'PASS'}", "",
+def classify_errors(reports, errors, allow_token_mismatch=False):
+    """Only benchmark token differences may be nonfatal; state checks stay strict."""
+    benchmark_cases = {r["case"]["name"] for r in reports if r["case"]["kind"] == "benchmark"}
+    fatal, warnings = [], []
+    for error in errors:
+        allowed = (allow_token_mismatch and error.get("error") == "greedy token mismatch"
+                   and error.get("case") in benchmark_cases)
+        (warnings if allowed else fatal).append(error)
+    return fatal, warnings
+
+
+def render_markdown(reports, errors, comparisons, warnings=None, complete=True):
+    warnings = warnings or []
+    fatal = [error for error in errors if error not in warnings]
+    status = "FAIL" if fatal else "WARN" if warnings else "PASS" if complete else "RUNNING"
+    lines = ["# DFlash A800 test report", "", f"Overall: {status}", "",
         "Fixed-budget Greedy generation. Warmups excluded. Built-in prompts are a smoke workload, not a standard benchmark.", "",
         "| Case | E2E tok/s | Decode-only tok/s | Accepted drafts | Mean output/verify/request | Mean TTFT ms | Mean TPOT ms |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
@@ -98,8 +112,13 @@ def render_markdown(reports, errors, comparisons):
         lines.append(f"| {row['case']} | {row['reference']} | "
             f"{number(row['end_to_end_output_tokens_per_second_speedup'])} | "
             f"{number(row['pure_decode_output_tokens_per_second_speedup'])} |")
-    if errors:
-        lines += ["", "## Errors", "", "```json", json.dumps(errors, indent=2, ensure_ascii=False), "```"]
+    if warnings:
+        lines += ["", "## Token consistency: FAIL", "",
+            "Benchmark token differences were allowed so timing could continue. "
+            "Performance is provisional: output trajectories differ and correctness has not passed.", "",
+            "```json", json.dumps(warnings, indent=2, ensure_ascii=False), "```"]
+    if fatal:
+        lines += ["", "## Errors", "", "```json", json.dumps(fatal, indent=2, ensure_ascii=False), "```"]
     lines += ["", "Per-rank peak memory, Graph captures/fallbacks, outputs, and workload hashes are in summary.json.",
         "Request TPOT is an average over output tokens; no per-token ITL percentiles are inferred from speculative bursts."]
     return "\n".join(lines) + "\n"
@@ -147,6 +166,8 @@ def main():
     parser.add_argument("--case-timeout", type=int, default=1200)
     parser.add_argument("--prompts-jsonl")
     parser.add_argument("--thinking", action="store_true")
+    parser.add_argument("--allow-token-mismatch", action="store_true",
+                        help="Continue benchmark timing on token mismatch; retain FAIL consistency and strict state checks")
     parser.add_argument("--skip-state-checks", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -186,14 +207,26 @@ def main():
             report["error"] = failure or report.get("error", f"worker exited {code}")
         reports.append(report)
         errors, comparisons = compare_reports(reports)
-        overall = not errors and len(reports) == len(plan)
+        fatal, warnings = classify_errors(reports, errors, args.allow_token_mismatch)
+        complete = len(reports) == len(plan)
+        overall = not errors and complete
         write_json(destination / "summary.json", dict(passed=overall, completed=len(reports), planned=len(plan),
-            errors=errors, comparisons=comparisons, cases=reports, manifest=manifest))
-        (destination / "summary.md").write_text(render_markdown(reports, errors, comparisons), encoding="utf-8")
-        if code or not report.get("passed") or errors:
+            performance_completed=complete and not fatal,
+            token_consistency_passed=complete and not errors,
+            errors=errors, fatal_errors=fatal, warnings=warnings,
+            comparisons=comparisons, cases=reports, manifest=manifest))
+        (destination / "summary.md").write_text(
+            render_markdown(reports, errors, comparisons, warnings, complete), encoding="utf-8")
+        if code or not report.get("passed") or fatal:
             print(f"FAIL: {case['name']}; retained reports/logs in {destination}", flush=True)
             raise SystemExit(1)
-    print(f"PASS: all cases and Greedy token comparisons; report: {destination / 'summary.md'}")
+        count = sum(warning.get("case") == case["name"] for warning in warnings)
+        if count:
+            print(f"WARN: {case['name']}: {count} token differences; continuing timing, consistency FAIL", flush=True)
+    if warnings:
+        print(f"COMPLETED WITH WARNINGS: timings collected; token consistency FAIL; report: {destination / 'summary.md'}")
+    else:
+        print(f"PASS: all cases and Greedy token comparisons; report: {destination / 'summary.md'}")
 
 
 if __name__ == "__main__":

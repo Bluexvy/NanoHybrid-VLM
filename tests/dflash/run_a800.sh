@@ -37,6 +37,7 @@ Environment:
   BATCHES="1 4" DRAFTS="3 7" REPEATS=3 OUTPUT_TOKENS=64
   PROMPTS_JSONL=/path/to/prompts.jsonl   optional {id,task,prompt} rows
   THINKING=1             enable Qwen thinking in benchmark prompts
+  ALLOW_TOKEN_MISMATCH=1  continue benchmark timing on token differences; consistency remains FAIL
   DRY_RUN=1              print commands only; no GPU/model/directory required
 
 Activate the existing CUDA environment first. This script does not install packages.
@@ -98,5 +99,6 @@ ARGS=("${PYTHON_BIN}" "${SCRIPT_DIR}/run_suite.py" --model "${MODEL_PATH}" --dra
     --memory-fraction "${GPU_MEMORY_UTILIZATION:-0.82}" --case-timeout "${CASE_TIMEOUT:-1200}")
 if [[ -n "${PROMPTS_JSONL:-}" ]]; then ARGS+=(--prompts-jsonl "${PROMPTS_JSONL}"); fi
 if [[ "${THINKING:-0}" == 1 ]]; then ARGS+=(--thinking); fi
+if [[ "${ALLOW_TOKEN_MISMATCH:-0}" == 1 ]]; then ARGS+=(--allow-token-mismatch); fi
 run "${ARGS[@]}"
 echo "Finished. Read ${OUTPUT_DIR}/cases/summary.md and summary.json; failures are never converted to PASS."

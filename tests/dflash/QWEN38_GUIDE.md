@@ -60,6 +60,22 @@ SUITE_MODE=full BATCHES="1 4 16" DRAFTS="3 7" \
 报告新增 draft_architecture，明确记录本次是否真正加载 DFlash2。
 任何数值、状态、Graph 或编译失败都停止并保留日志，不当作性能结果。
 
+如果需要先收集性能矩阵，可设置 `ALLOW_TOKEN_MISMATCH=1`。只把性能用例相对普通 Eager
+的逐 token 差异降为告警，继续生成性能数据；输入不一致、请求数不一致、运行错误、状态管理
+用例的输出差异仍然停止。生成保持 Greedy，接受规则、回滚、CUDA 小测试均不改变。
+报告保留全部差异，并显示 `Overall: WARN` / `Token consistency: FAIL`，
+JSON 中 `passed=false`、`token_consistency_passed=false`；`performance_completed=true`
+仅表示所有配置已运行结束。这类性能数据仅供排查，不能声称已通过正确性验收。
+当前 worker 没有覆盖 `Config.gdn_decode_backend`，普通 Decode 使用默认 `fla`；
+这些基线数据不能写成相对 `state_aware_cuda` Decode 的加速比。
+
+```bash
+ALLOW_TOKEN_MISMATCH=1 SUITE_MODE=full BATCHES="1 4 16" DRAFTS="3 7" \
+  bash tests/dflash/run_qwen38_a800.sh \
+  /root/autodl-tmp/models/Qwen3.8-27B \
+  /root/autodl-tmp/models/Qwen3.8-27B-DFlash2
+```
+
 可先不挂 GPU 检查启动参数：
 
 ```bash

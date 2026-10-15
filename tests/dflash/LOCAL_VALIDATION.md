@@ -78,3 +78,15 @@ Graph、真实接受率、显存峰值和吞吐。没有启动租卡或下载完
   新增检查使用内存中构造的真实 fast tokenizer，核对 thinking 开关、实际 token ID 和请求提交；
   无需模型权重或网络。另检查非法返回格式会立即失败。
 - 这里只验证了输入兼容性；完整 27B / A800 用例仍需服务器重跑。
+
+## 可选性能继续模式（2026-10-16）
+
+- A800 的 B=1 / 草稿 3 / Eager 在第 4 个 trial 出现 Greedy token 差异。
+  差异原因尚未定位，不能认定只是低精度舍入或认定已经通过正确性。
+- 增加默认关闭的 `ALLOW_TOKEN_MISMATCH=1` / `--allow-token-mismatch`：仅性能用例的
+  token 差异可降为告警继续；状态管理输出差异、运行错误、输入和请求数错误仍然失败。
+- 保留严格 `passed=false` 与全部错误；另外输出 `performance_completed`、
+  `token_consistency_passed`、`fatal_errors`、`warnings`。有差异时报告 WARN，不输出整体 PASS。
+- 本地 10 项 harness 检查通过，含模拟 worker 生成真实报告的完整调度检查、
+  告警/致命错误分类与报告标记；Bash 语法和 full 模式开关透传 dry-run 通过。
+- 没有更改模型、采样、接受规则或状态提交，也没有重新运行完整 27B。

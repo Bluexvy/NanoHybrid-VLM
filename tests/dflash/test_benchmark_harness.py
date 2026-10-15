@@ -5,7 +5,9 @@ from types import SimpleNamespace
 import unittest
 
 from benchmark_utils import chat_ids, counters_delta, speculation_metrics, run_requests, compare_outputs
-from run_suite import build_plan, compare_reports, launch
+from run_suite import build_plan, classify_errors, compare_reports, launch, render_markdown, main
+from unittest.mock import patch
+import json
 
 
 class Engine:
@@ -115,6 +117,49 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(len({case["name"] for case in plan}), len(plan))
         self.assertEqual(plan[-1]["kind"], "state_checks")
         self.assertTrue(any(case["method"] == "baseline" and case["graph"] for case in plan))
+
+    def test_only_benchmark_token_differences_can_be_nonfatal(self):
+        plan = build_plan([1], [3])
+        reports = [make_report(plan[0]), make_report(plan[1], [[1, 8, 3]])]
+        errors, _ = compare_reports(reports)
+        self.assertEqual(classify_errors(reports, errors), (errors, []))
+        self.assertEqual(classify_errors(reports, errors, True), ([], errors))
+        input_error = dict(case=plan[1]["name"], error="input workloads differ")
+        count_error = dict(case=plan[1]["name"], error="request count differs")
+        state_error = dict(case=plan[-1]["name"], error="greedy token mismatch")
+        worker_error = dict(case=plan[1]["name"], error="worker failed")
+        fatal, warnings = classify_errors(reports, errors + [input_error, count_error, state_error, worker_error], True)
+        self.assertEqual(fatal, [input_error, count_error, state_error, worker_error])
+        self.assertEqual(warnings, errors)
+        markdown = render_markdown([], errors, [], warnings)
+        self.assertIn("Overall: WARN", markdown)
+        self.assertIn("Token consistency: FAIL", markdown)
+        self.assertNotIn("Overall: PASS", markdown)
+
+    def test_performance_mode_finishes_but_never_marks_mismatches_passed(self):
+        plan = build_plan([1], [3], state_checks=False)[:2]
+        with tempfile.TemporaryDirectory() as directory:
+            def worker(command, log, timeout):
+                spec = json.loads(Path(command[command.index("--spec") + 1]).read_text())
+                output = [[1, 2, 3]] if spec["method"] == "baseline" else [[1, 8, 3]]
+                report = make_report(spec, output)
+                report["summary"].update(speculation=speculation_metrics({}),
+                    mean_request_ttft_ms=1., mean_request_tpot_ms=2.)
+                Path(command[command.index("--report") + 1]).write_text(json.dumps(report))
+                return 0, None
+            argv = ["run_suite.py", "--model", "unused", "--draft", "unused", "--output", directory,
+                    "--batches", "1", "--drafts", "3", "--allow-token-mismatch"]
+            with patch.object(sys, "argv", argv), patch("run_suite.build_plan", return_value=plan), \
+                    patch("run_suite.launch", side_effect=worker):
+                main()
+            report = json.loads((Path(directory) / "summary.json").read_text())
+            self.assertTrue(report["performance_completed"])
+            self.assertFalse(report["passed"])
+            self.assertFalse(report["token_consistency_passed"])
+            self.assertEqual(report["completed"], 2)
+            self.assertEqual(len(report["warnings"]), 1)
+            self.assertEqual(report["fatal_errors"], [])
+            self.assertIn("Token consistency: FAIL", (Path(directory) / "summary.md").read_text())
 
     def test_worker_failures_and_timeouts_preserve_logs(self):
         with tempfile.TemporaryDirectory() as directory:
