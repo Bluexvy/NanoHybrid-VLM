@@ -23,6 +23,8 @@ except ImportError:
     fused_recurrent_gated_delta_rule = None
     
 from nanovllm.utils.context import get_context
+from nanovllm.engine.gdn_replay import capture_packed_gdn_inputs
+from nanovllm.kernels.gdn_verification import verification_conv, verification_recurrent
 
 from nanovllm.layers.linear import (
     ColumnParallelLinear,
@@ -1068,6 +1070,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         torch.Tensor,
         torch.Tensor | None,
     ]:
+        if (get_context().gdn_mtp_verification and prefill_seqlens
+                and len(set(prefill_seqlens)) == 1):
+            batch, length = len(prefill_seqlens), prefill_seqlens[0]
+            channels = mixed_qkv.shape[1]
+            unpacked = mixed_qkv.transpose(1, 2).reshape(batch, length, channels).transpose(1, 2)
+            result, state = verification_conv(
+                unpacked, self.conv1d.weight.squeeze(1), self.conv1d.bias, conv_state,
+                backend=get_context().gdn_mtp_verification_backend, activation=self.activation)
+            return result.transpose(1, 2).reshape(1, batch * length, channels).transpose(1, 2), state
+        if get_context().gdn_mtp_verification and prefill_seqlens:
+            outputs, states, offset = [], [], 0
+            for row, length in enumerate(prefill_seqlens):
+                output, state = self._run_causal_conv1d(mixed_qkv[:, :, offset:offset + length],
+                                                       conv_state[row:row + 1], (length,))
+                outputs.append(output)
+                states.append(state)
+                offset += length
+            return torch.cat(outputs, 2), torch.cat(states, 0)
         is_variable_length_prefill = (
             prefill_seqlens is not None
             and len(prefill_seqlens) > 1
@@ -1489,6 +1509,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
+        if (get_context().gdn_mtp_verification and prefill_seqlens
+                and len(set(prefill_seqlens)) == 1):
+            batch, length = len(prefill_seqlens), prefill_seqlens[0]
+            unpack = lambda tensor: tensor.reshape(batch, length, *tensor.shape[2:])
+            output, state = verification_recurrent(
+                unpack(query), unpack(key), unpack(value), unpack(g), unpack(beta),
+                recurrent_state, backend=get_context().gdn_mtp_verification_backend)
+            return output.reshape(1, batch * length, *output.shape[2:]), state
+        if get_context().gdn_mtp_verification and prefill_seqlens:
+            outputs, states, offset = [], [], 0
+            for row, length in enumerate(prefill_seqlens):
+                part = slice(offset, offset + length)
+                output, state = self._run_gated_delta_rule(query[:, part], key[:, part], value[:, part],
+                    g[:, part], beta[:, part], recurrent_state[row:row + 1], (length,))
+                outputs.append(output)
+                states.append(state)
+                offset += length
+            return torch.cat(outputs, 1), torch.cat(states, 0)
         is_variable_length_prefill = (
             prefill_seqlens is not None
             and len(prefill_seqlens) > 1
@@ -1603,6 +1641,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             .transpose(1, 2)
             .contiguous()
         )
+        context = get_context()
+        replay_records = context.gdn_replay_records
+        replay_count = context.gdn_replay_capture_tokens
+        raw_replay_input = None
+        if replay_records is not None:
+            if (not context.is_prefill or batch_size != 1
+                    or not 1 <= replay_count <= sequence_length):
+                raise ValueError("GDN replay capture requires packed verification inputs")
+            raw_replay_input = mixed_qkv
 
         (
             mixed_qkv,
@@ -1689,7 +1736,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 dim=2,
             )
 
-        context = get_context()
+        if replay_records is not None:
+            if self.layer_idx in replay_records:
+                raise RuntimeError("GDN layer captured twice in one verification")
+            replay_records[self.layer_idx] = capture_packed_gdn_inputs(
+                raw_replay_input, key, value, g, beta, prefill_seqlens, replay_count)
 
         use_state_aware_decode = (
             not context.is_prefill

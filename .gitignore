@@ -203,3 +203,4 @@ artifacts/**/trace.json
 artifacts/**/*.qdstrm
 artifacts/**/*.nsys-rep
 artifacts/**/*.sqlite
+artifacts/dflash-a800/

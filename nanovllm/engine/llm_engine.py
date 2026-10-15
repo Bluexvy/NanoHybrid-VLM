@@ -282,6 +282,8 @@ class LLMEngine:
                 f"|conv_dtype={spec.conv_dtype}"
                 f"|block_size={config.kvcache_block_size}"
                 f"|gdn_layers={spec.num_gdn_layers}"
+                f"|mtp={bool(config.mtp_num_speculative_tokens)}"
+                f"|speculative={config.speculative_method}|draft={config.dflash_model}"
             )
 
             self.prefix_state_cache = (
@@ -357,6 +359,10 @@ class LLMEngine:
             )
         )
 
+        if (self.model_runner.config.speculative_method == "dflash"
+                and processed_prompt.pixel_values is not None):
+            raise ValueError("DFlash supports text requests only; use native MTP for image inputs")
+
         seq = Sequence(
             processed_prompt.token_ids,
             sampling_params,
@@ -382,6 +388,7 @@ class LLMEngine:
             ),
         )
 
+        seq.mtp_num_speculative_tokens = self.model_runner.config.mtp_num_speculative_tokens
         enqueue_time = perf_counter()
 
         self.scheduler.add(seq)
@@ -636,6 +643,8 @@ class LLMEngine:
                     key=key,
                     kv_block_ids=kv_block_ids,
                     state_slot=seq.state_slot,
+                    mtp_snapshot=(self.model_runner.mtp_prefix_snapshot(seq.seq_id, checkpoint_tokens)
+                                  if self.model_runner.config.mtp_num_speculative_tokens else None),
                 )
             )
 
@@ -643,6 +652,8 @@ class LLMEngine:
                 resident_keys_before
                 - set(cache.entries)
             )
+            if self.model_runner.config.mtp_num_speculative_tokens and evicted_keys:
+                self.model_runner.call("discard_mtp_prefixes", evicted_keys)
 
             if (
                 self.model_runner.world_size > 1
@@ -661,6 +672,9 @@ class LLMEngine:
                 continue
 
             if created:
+                if self.model_runner.config.mtp_num_speculative_tokens:
+                    self.model_runner.mtp_prefix_snapshots[key] = committed_entry.mtp_snapshot
+                    self.model_runner.call("cache_mtp_prefix", key, seq.seq_id)
                 if self.model_runner.world_size > 1:
                     self.model_runner.call(
                         "cache_worker_prefix_state",
@@ -778,6 +792,8 @@ class LLMEngine:
             #
             # 后续 Chunked Prefill 和 Decode 都直接延续
             # active slot 中的最新状态。
+            if self.model_runner.config.mtp_num_speculative_tokens:
+                self.model_runner.call("restore_mtp_prefix", seq.prefix_cache_key, seq.seq_id)
             seq.prefix_restore_pending = False
 
     def step(
@@ -815,24 +831,24 @@ class LLMEngine:
 
         if plan.decode_seqs:
             start = perf_counter()
-
-            decode_token_ids = (
-                self.model_runner.call(
-                    "run",
-                    plan.decode_seqs,
-                    False,
-                )
-            )
-
-            self.scheduler.record_computed_block_metadata(
-                plan.decode_seqs
-            )
-
-            self.scheduler.postprocess(
-                plan.decode_seqs,
-                decode_token_ids,
-                False,
-            )
+            if self.model_runner.config.mtp_num_speculative_tokens:
+                configured = self.model_runner.config.mtp_num_speculative_tokens
+                draft_counts = []
+                for seq in plan.decode_seqs:
+                    count = min(configured, seq.max_tokens - seq.num_completion_tokens - 1,
+                                self.model_runner.config.max_model_len - seq.num_tokens)
+                    count = max(0, count)
+                    if not self.scheduler.block_manager.reserve_verification_tokens(seq, 1 + count):
+                        count = 0
+                    draft_counts.append(count)
+                decode_token_ids = self.model_runner.call("run_mtp_batch", plan.decode_seqs, draft_counts)
+                for seq, tokens in zip(plan.decode_seqs, decode_token_ids):
+                    self.scheduler.postprocess_speculative(seq, tokens)
+                stats.num_decode_tokens = sum(map(len, decode_token_ids))
+            else:
+                decode_token_ids = self.model_runner.call("run", plan.decode_seqs, False)
+                self.scheduler.record_computed_block_metadata(plan.decode_seqs)
+                self.scheduler.postprocess(plan.decode_seqs, decode_token_ids, False)
             self._record_request_progress(
                 plan.decode_seqs
             )

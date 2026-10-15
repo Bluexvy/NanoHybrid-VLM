@@ -804,6 +804,28 @@ class BlockManager:
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
+    def reserve_verification_tokens(self, seq: Sequence, num_tokens: int) -> bool:
+        """Reserve uncommitted target suffix capacity without hashing drafts."""
+        end = seq.num_cached_tokens + num_tokens
+        needed = (end + self.block_size - 1) // self.block_size
+        additional = max(0, needed - len(seq.block_table))
+        if additional > len(self.free_block_ids):
+            return False
+        for _ in range(additional):
+            seq.block_table.append(self._allocate_block())
+        return True
+
+    def trim_verification_blocks(self, seq: Sequence, computed_tokens: int) -> None:
+        """Release rejected suffix blocks; the pending bonus gets space later."""
+        keep = (computed_tokens + self.block_size - 1) // self.block_size
+        for block_id in seq.block_table[keep:]:
+            block = self.blocks[block_id]
+            if block.ref_count != 1 or block.cache_ref_count != 0:
+                raise RuntimeError("Speculative tail block must be exclusively owned")
+            block.ref_count -= 1
+            self._deallocate_block(block_id)
+        del seq.block_table[keep:]
+
     def may_append(self, seq: Sequence):
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())

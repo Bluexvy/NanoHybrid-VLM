@@ -62,6 +62,7 @@ class Scheduler:
         self.max_num_batched_tokens = (
             config.max_num_batched_tokens
         )
+        self.decode_token_cost = 1 + config.mtp_num_speculative_tokens
 
         self.max_prefill_wait_ms = (
             config.max_prefill_wait_ms
@@ -480,7 +481,7 @@ class Scheduler:
         while (
             self.running
             and len(decode_seqs) < decode_seq_limit
-            and num_decode_tokens < decode_token_limit
+            and num_decode_tokens + self.decode_token_cost <= decode_token_limit
         ):
             seq = self.running.popleft()
 
@@ -522,7 +523,7 @@ class Scheduler:
             self.block_manager.may_append(seq)
 
             decode_seqs.append(seq)
-            num_decode_tokens += 1
+            num_decode_tokens += self.decode_token_cost
 
         # 上面为了遍历 running，临时把被调度请求
         # 从 deque 中取了出来。
@@ -981,6 +982,31 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
                 self.release_state_slot(seq)
                 self.running.remove(seq)
+
+    def postprocess_speculative(self, seq: Sequence, token_ids: list[int]) -> None:
+        """Commit validated outputs, then hash only the computed prefix."""
+        if not token_ids or seq.num_scheduled_tokens != 1:
+            raise ValueError("Speculative commit requires a scheduled decode token")
+        remaining = seq.max_tokens - seq.num_completion_tokens
+        if len(token_ids) > remaining:
+            raise ValueError("Speculative result exceeds output token budget")
+        for index, token_id in enumerate(token_ids):
+            if not seq.ignore_eos and token_id == self.eos and index != len(token_ids) - 1:
+                raise ValueError("Speculative result must stop at EOS")
+        for token_id in token_ids:
+            seq.append_token(token_id)
+        seq.num_scheduled_tokens = len(token_ids)
+        computed = seq.num_cached_tokens + seq.num_scheduled_tokens
+        self.block_manager.trim_verification_blocks(seq, computed)
+        self.block_manager.hash_blocks(seq)
+        seq.num_cached_tokens = computed
+        seq.num_scheduled_tokens = 0
+        if ((not seq.ignore_eos and token_ids[-1] == self.eos)
+                or seq.num_completion_tokens == seq.max_tokens):
+            seq.status = SequenceStatus.FINISHED
+            self.block_manager.deallocate(seq)
+            self.release_state_slot(seq)
+            self.running.remove(seq)
 
     def can_allocate_state_slot(
         self,

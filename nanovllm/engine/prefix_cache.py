@@ -78,6 +78,12 @@ class PrefixStateEntry:
     # 恢复到 active state slot 时，目标状态池
     # 仍然使用 spec.recurrent_dtype，也就是 FP32。
     recurrent_state_snapshot: torch.Tensor
+    # Optional native MTP KV/feature boundary. Included in the LRU budget.
+    mtp_snapshot: object | None = None
+
+    @property
+    def auxiliary_snapshot_bytes(self) -> int:
+        return 0 if self.mtp_snapshot is None else self.mtp_snapshot.nbytes
 
     @property
     def gdn_snapshot_bytes(self) -> int:
@@ -386,6 +392,7 @@ class PrefixStateCache:
         self.total_evicted_capacity_bytes = 0
 
         self.total_gdn_snapshot_bytes = 0
+        self.total_mtp_snapshot_bytes = 0
         self.num_commits = 0
         self.num_duplicate_commits = 0
         
@@ -861,6 +868,7 @@ class PrefixStateCache:
     def _additional_capacity_bytes(
         self,
         kv_block_ids: tuple[int, ...],
+        auxiliary_bytes: int = 0,
     ) -> int:
         """
         如果现在提交候选Entry，它会增加多少缓存容量。
@@ -905,11 +913,13 @@ class PrefixStateCache:
         return (
             self.estimated_gdn_snapshot_bytes_per_entry
             + additional_kv_bytes
+            + auxiliary_bytes
         ) 
 
     def _ensure_capacity_for(
         self,
         kv_block_ids: tuple[int, ...],
+        auxiliary_bytes: int = 0,
     ) -> bool:
         """
         在创建候选Entry之前，通过LRU淘汰确保预算充足。
@@ -924,6 +934,7 @@ class PrefixStateCache:
             self.estimated_gdn_snapshot_bytes_per_entry
             + len(kv_block_ids)
             * self.kv_block_bytes
+            + auxiliary_bytes
         )
 
         # 单个Entry自身就超过预算时，不应该先把已有
@@ -942,7 +953,8 @@ class PrefixStateCache:
             # 淘汰后候选Entry需要重新承担这些Block容量。
             additional_capacity_bytes = (
                 self._additional_capacity_bytes(
-                    kv_block_ids
+                    kv_block_ids,
+                    auxiliary_bytes,
                 )
             )
 
@@ -996,6 +1008,7 @@ class PrefixStateCache:
             | tuple[int, ...]
         ),
         state_slot: int,
+        mtp_snapshot=None,
     ) -> tuple[
         PrefixStateEntry | None,
         bool,
@@ -1095,9 +1108,10 @@ class PrefixStateCache:
 
             return existing_entry, False
 
+        if mtp_snapshot is not None and mtp_snapshot.num_cached_tokens != key.num_cached_tokens:
+            raise ValueError("MTP snapshot and target prefix boundaries must match")
         has_capacity = self._ensure_capacity_for(
-            normalized_block_ids
-        )
+            normalized_block_ids, 0 if mtp_snapshot is None else mtp_snapshot.nbytes)
 
         if not has_capacity:
             return None, False
@@ -1121,6 +1135,7 @@ class PrefixStateCache:
             recurrent_state_snapshot=(
                 recurrent_state_snapshot
             ),
+            mtp_snapshot=None if mtp_snapshot is None else mtp_snapshot.clone(),
         )
 
         entry.validate(
@@ -1164,6 +1179,7 @@ class PrefixStateCache:
         self.total_gdn_snapshot_bytes += (
             entry.gdn_snapshot_bytes
         )
+        self.total_mtp_snapshot_bytes += entry.auxiliary_snapshot_bytes
 
         self.num_commits += 1
 
@@ -1217,8 +1233,9 @@ class PrefixStateCache:
         self.total_gdn_snapshot_bytes -= (
             entry.gdn_snapshot_bytes
         )
+        self.total_mtp_snapshot_bytes -= entry.auxiliary_snapshot_bytes
 
-        if self.total_gdn_snapshot_bytes < 0:
+        if self.total_gdn_snapshot_bytes < 0 or self.total_mtp_snapshot_bytes < 0:
             raise RuntimeError(
                 "Prefix snapshot byte accounting "
                 "became negative"
@@ -1276,6 +1293,7 @@ class PrefixStateCache:
 
         return (
             entry.gdn_snapshot_bytes
+            + entry.auxiliary_snapshot_bytes
             + reclaimable_kv_bytes
         )
         
@@ -1350,6 +1368,7 @@ class PrefixStateCache:
 
         return (
             self.current_gdn_snapshot_bytes
+            + self.total_mtp_snapshot_bytes
             + self.current_pinned_kv_capacity_bytes
         )
         

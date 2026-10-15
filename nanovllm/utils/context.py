@@ -28,6 +28,13 @@ class Context:
     #     FLA 使用的累积序列边界。
     prefill_seqlens: tuple[int, ...] | None = None
     gdn_cu_seqlens: torch.Tensor | None = None
+    # Per-verification compact input collector. Ordinary forwards/graphs leave
+    # it None; the initial TP=1/B=1 MTP path captures only the first input token.
+    gdn_replay_records: dict | None = None
+    gdn_replay_capture_tokens: int = 0
+    # Fixed-length native MTP verification uses graph-safe batched recurrence.
+    gdn_mtp_verification: bool = False
+    gdn_mtp_verification_backend: str = "reference"
     
     # Decode 阶段使用的 GDN recurrent backend。
     gdn_decode_backend: str = "fla"

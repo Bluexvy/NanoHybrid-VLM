@@ -42,6 +42,8 @@ class Sequence:
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
+        # TP workers can retain only a decode suffix at this logical offset.
+        self.token_offset = 0
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
@@ -57,6 +59,7 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.mtp_num_speculative_tokens = 0
         
         # 只保存整数 slot 编号，
         # 不保存任何 GPU Tensor。
@@ -174,6 +177,17 @@ class Sequence:
         return self.num_tokens
 
     def __getitem__(self, key):
+        offset = getattr(self, "token_offset", 0)
+        if offset:
+            if isinstance(key, slice):
+                indices = range(*key.indices(self.num_tokens))
+                if indices and min(indices) < offset:
+                    raise IndexError("TP decode payload does not contain historical token IDs")
+                return [self.token_ids[index - offset] for index in indices]
+            index = key + self.num_tokens if key < 0 else key
+            if index < offset or index >= self.num_tokens:
+                raise IndexError("Token index is outside the TP decode suffix")
+            return self.token_ids[index - offset]
         return self.token_ids[key]
 
 
@@ -306,12 +320,28 @@ class Sequence:
             self.state_slot,
             last_state,
             *multimodal_state,
+            {
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+                "ignore_eos": self.ignore_eos,
+                "mtp_num_speculative_tokens": self.mtp_num_speculative_tokens,
+                "prefix_cache_key": self.prefix_cache_key,
+                "token_ids": (self.token_ids if self.is_prefill else [self.last_token])
+                             if self.mtp_num_speculative_tokens else None,
+                "token_offset": (getattr(self, "token_offset", 0) if self.is_prefill else self.num_tokens - 1)
+                                if self.mtp_num_speculative_tokens else 0,
+                "mm_token_type_ids": self.mm_token_type_ids if self.mtp_num_speculative_tokens and self.is_prefill else None,
+                "mrope_position_ids": self.mrope_position_ids if self.mtp_num_speculative_tokens and self.is_prefill else None,
+            },
         )
                 
     def __setstate__(
         self,
         state,
     ):
+        metadata = state[-1] if isinstance(state[-1], dict) else {}
+        if metadata:
+            state = state[:-1]
         (
             self.seq_id,
             self.num_tokens,
@@ -341,3 +371,13 @@ class Sequence:
         else:
             self.token_ids = []
             self.last_token = last_state
+        self.temperature = metadata.get("temperature", 0)
+        self.max_tokens = metadata.get("max_tokens", 0)
+        self.ignore_eos = metadata.get("ignore_eos", False)
+        self.mtp_num_speculative_tokens = metadata.get("mtp_num_speculative_tokens", 0)
+        self.prefix_cache_key = metadata.get("prefix_cache_key")
+        self.token_offset = metadata.get("token_offset", 0)
+        if metadata.get("token_ids") is not None:
+            self.token_ids = metadata["token_ids"]
+            self.mm_token_type_ids = metadata["mm_token_type_ids"]
+            self.mrope_position_ids = metadata["mrope_position_ids"]

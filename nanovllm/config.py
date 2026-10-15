@@ -26,6 +26,22 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    # Native MTP reuses one trained head autoregressively for 1..15 drafts.
+    mtp_num_speculative_tokens: int = 0
+    # DFlash uses the same scheduler/verification budget as native MTP.
+    # Select explicitly; merely providing a directory does not enable it.
+    speculative_method: str = "mtp"
+    dflash_model: str | None = None
+    dflash_num_speculative_tokens: int = 7
+    # replay_inputs: replay only GDN from compact inputs at a rejected boundary.
+    # recompute: original full-target suffix recomputation for comparison.
+    mtp_gdn_rollback: str = "replay_inputs"
+    # auto: fused CUDA for supported shapes; reference for CPU/other shapes.
+    mtp_gdn_replay_backend: str = "auto"
+    mtp_gdn_verification_backend: str = "auto"
+    # Verification graphs are captured lazily and bounded by a reserved budget.
+    mtp_cuda_graph_max_entries: int = 8
+    mtp_cuda_graph_memory_fraction: float = 0.1
     
     # Qwen3.5 Decode 的 GDN recurrent backend。
     #
@@ -154,6 +170,34 @@ class Config:
     # __post_init__() 是 @dataclass 在自动执行完 __init__() 后调用的初始化hook
     # 但有些初始化工作不能只是赋值 还需要检查参数是否合法 所以不能只用dataclass
     def __post_init__(self):
+        if self.speculative_method not in {"mtp", "dflash"}:
+            raise ValueError("speculative_method must be mtp or dflash")
+        if self.speculative_method == "dflash":
+            if not self.dflash_model or not os.path.isdir(self.dflash_model):
+                raise ValueError("DFlash requires a local dflash_model directory")
+            if (type(self.dflash_num_speculative_tokens) is not int
+                    or not 1 <= self.dflash_num_speculative_tokens <= 15):
+                raise ValueError("dflash_num_speculative_tokens must be in [1,15]")
+            if self.mtp_num_speculative_tokens:
+                raise ValueError("Select either native MTP or DFlash, not both")
+            self.mtp_num_speculative_tokens = self.dflash_num_speculative_tokens
+        elif self.dflash_model is not None:
+            raise ValueError("Set speculative_method='dflash' to use dflash_model")
+        if self.mtp_gdn_verification_backend not in {"auto", "reference", "cuda"}:
+            raise ValueError("mtp_gdn_verification_backend must be auto/reference/cuda")
+        if (type(self.mtp_cuda_graph_max_entries) is not int or self.mtp_cuda_graph_max_entries < 1
+                or not 0 < self.mtp_cuda_graph_memory_fraction < 1):
+            raise ValueError("Invalid MTP CUDA Graph entry/memory budget")
+        if self.mtp_gdn_replay_backend not in {"auto", "reference", "cuda"}:
+            raise ValueError("mtp_gdn_replay_backend must be 'auto', 'reference' or 'cuda'")
+        if self.mtp_gdn_rollback not in {"replay_inputs", "recompute"}:
+            raise ValueError("mtp_gdn_rollback must be 'replay_inputs' or 'recompute'")
+        if (type(self.mtp_num_speculative_tokens) is not int
+                or not 0 <= self.mtp_num_speculative_tokens <= 15):
+            raise ValueError("mtp_num_speculative_tokens must be an integer in [0,15]")
+        if self.mtp_num_speculative_tokens:
+            if self.max_num_batched_tokens < 1 + self.mtp_num_speculative_tokens:
+                raise ValueError("MTP token budget must cover pending plus configured drafts")
         
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
@@ -331,6 +375,20 @@ class Config:
             layer_type == "linear_attention"
             for layer_type in layer_types
         )
+        if self.mtp_num_speculative_tokens:
+            if (root_config.model_type != "qwen3_5"
+                    or not has_gdn_layers or getattr(text_config, "num_experts", 0)):
+                raise ValueError("Native MTP backend supports dense Qwen3.5 only")
+            if self.speculative_method == "dflash":
+                from nanovllm.models.dflash import read_dflash_config, validate_dflash_checkpoint
+                draft = read_dflash_config(self.dflash_model, text_config, self.tensor_parallel_size)
+                if self.dflash_num_speculative_tokens >= draft.block_size:
+                    raise ValueError("DFlash drafts must fit checkpoint block_size minus one anchor")
+                self.max_model_len = min(self.max_model_len, draft.max_position_embeddings)
+                validate_dflash_checkpoint(self.dflash_model, draft)
+            else:
+                from nanovllm.engine.speculative import validate_mtp_checkpoint
+                validate_mtp_checkpoint(self.model)
         
         supported_hybrid_prefix_modes = {
             "disabled",
@@ -419,5 +477,7 @@ class Config:
         # 最大上下文长度属于语言模型，因此读取 text_config
         self.max_model_len = min(
             self.max_model_len,
-            text_config.max_position_embeddings,
+            # MTP pairs h_t with x_{t+1}, so its RoPE index is shifted by 1.
+            text_config.max_position_embeddings - int(bool(self.mtp_num_speculative_tokens)
+                                                      and self.speculative_method == "mtp"),
         )

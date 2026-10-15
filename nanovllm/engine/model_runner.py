@@ -3,8 +3,12 @@ import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
+from time import monotonic, sleep
 
 from nanovllm.config import Config
+from nanovllm.engine.mtp_runner import MTPRunnerMixin
+from nanovllm.engine.dflash_runner import DFlashRunnerMixin
+from nanovllm.engine.mtp_graph import MTPVerificationGraphMixin
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.registry import get_model_class
 from nanovllm.layers.sampler import Sampler
@@ -32,7 +36,7 @@ from nanovllm.engine.prefix_cache import (
     PrefixKey,
 )
 
-class ModelRunner:
+class ModelRunner(DFlashRunnerMixin, MTPVerificationGraphMixin, MTPRunnerMixin):
     
     IMAGE_TOKEN_TYPE = 1
 
@@ -44,6 +48,7 @@ class ModelRunner:
     ):
         
         self.config = config
+        self.initialize_mtp_runtime()
         
         root_config = config.hf_config
         text_config = config.text_config
@@ -230,8 +235,21 @@ class ModelRunner:
 
         # 根据配置创建模型结构和参数空间
         self.model = model_class(root_config)
+        if config.mtp_num_speculative_tokens and config.speculative_method == "mtp":
+            self.model.enable_mtp()
         # 加载权重
         load_model(self.model, config.model)
+        if config.speculative_method == "dflash":
+            from nanovllm.models.dflash import DFlashDraftModel, read_dflash_config
+            self.dflash = DFlashDraftModel(read_dflash_config(config.dflash_model, text_config, self.world_size))
+            load_model(self.dflash, config.dflash_model)
+            self.dflash.eval()
+            self.model.model.language_model.dflash_target_layer_ids = self.dflash.config.target_layer_ids
+        if config.mtp_num_speculative_tokens and (
+                config.mtp_gdn_verification_backend != "reference" or config.mtp_gdn_replay_backend == "cuda"):
+            # Compile before warmup/capture, never inside a captured forward.
+            from nanovllm.kernels.gdn_replay_cuda import load_gdn_replay_cuda_extension
+            load_gdn_replay_cuda_extension()
         # 创建 Sampler
         self.sampler = Sampler()
         # 模型预热
@@ -365,10 +383,30 @@ class ModelRunner:
             "runtime_peak_extra_bytes": (
                 runtime_peak_extra_bytes
             ),
+            "mtp_kv_cache_bytes": sum(t.numel() * t.element_size()
+                                      for cache in self.mtp_caches.values() for t in cache),
+            "mtp_prefix_snapshot_bytes": sum(snapshot.nbytes for snapshot in self.mtp_prefix_snapshots.values()),
+            "mtp_graph_memory_bytes": self.mtp_graph_memory_bytes,
+            "dflash_kv_cache_bytes": sum(t.numel() * t.element_size()
+                for cache in self.dflash_caches.values() for kv in cache for t in kv),
+            "dflash_parameter_bytes": (sum(p.numel() * p.element_size() for p in self.dflash.parameters())
+                                       if hasattr(self, "dflash") else 0),
             "kv_cache_block_bytes": (
                 self.kv_cache_block_bytes
             ),
         }
+
+    def get_distributed_memory_stats(self, reset_peak=False):
+        """All ranks participate; measure outside timed benchmark intervals."""
+        snapshot = dict(self.get_memory_stats(), rank=self.rank)
+        if reset_peak:
+            torch.cuda.reset_peak_memory_stats(self.rank)
+        if self.world_size > 1:
+            snapshots = [None] * self.world_size
+            dist.all_gather_object(snapshots, snapshot)
+        else:
+            snapshots = [snapshot]
+        return snapshots if self.rank == 0 else None
 
     @property
     def kv_cache_block_bytes(self) -> int:
@@ -416,6 +454,11 @@ class ModelRunner:
         )
 
     def exit(self):
+        self.mtp_verification_graphs.clear()
+        self.mtp_draft_graphs.clear()
+        self.mtp_prefix_snapshots.clear()
+        self.release_mtp_requests(list(self.mtp_caches))
+        self.dflash_caches.clear()
         self.release_visual_embedding_cache(
             list(
                 self.visual_embedding_cache.keys()
@@ -456,6 +499,14 @@ class ModelRunner:
 
     def write_shm(self, method_name, *args):
         assert self.world_size > 1 and self.rank == 0
+        # A worker clears its event only AFTER copying/unpickling the previous
+        # command. Do not overwrite that command when lightweight CPU methods
+        # (cache release, etc.) return before the worker has consumed it.
+        deadline = monotonic() + 120.0
+        while any(event.is_set() for event in self.event):
+            if monotonic() >= deadline:
+                raise TimeoutError("TP worker did not acknowledge the previous command")
+            sleep(0.0001)
         data = bytes(
             ForkingPickler.dumps(
                 [method_name, *args]
@@ -692,6 +743,23 @@ class ModelRunner:
             - used_bytes
             - activation_headroom_bytes
         )
+        if config.mtp_num_speculative_tokens:
+            self.mtp_graph_memory_budget = (int(memory_limit_bytes * config.mtp_cuda_graph_memory_fraction)
+                                            if not config.enforce_eager else 0)
+            cache_budget_bytes -= self.mtp_graph_memory_budget
+            # Reserve both persistent drafter KV and contiguous SDPA/cat
+            # intermediates; these are separate from target paged KV.
+            draft_config = self.dflash.config if config.speculative_method == "dflash" else text_config
+            head_dim = getattr(draft_config, "head_dim",
+                               draft_config.hidden_size // draft_config.num_attention_heads)
+            draft_layers = draft_config.num_hidden_layers if config.speculative_method == "dflash" else 1
+            scalar_bytes = torch.empty((), dtype=self.model_dtype).element_size()
+            cache_budget_bytes -= (
+                2 * config.max_model_len * head_dim * scalar_bytes
+                * (config.max_num_seqs * draft_config.num_key_value_heads * draft_layers
+                   + 2 * draft_config.num_key_value_heads * draft_layers + draft_config.num_attention_heads)
+                // self.world_size
+            )
 
         if cache_budget_bytes <= 0:
             raise RuntimeError(
@@ -964,6 +1032,10 @@ class ModelRunner:
                     text_positions = list(
                         range(start, end)
                     )
+                    if seq.mrope_position_delta is not None:
+                        # Compact TP decode/verify payloads omit full positions;
+                        # generated text still carries the multimodal delta.
+                        text_positions = [position + seq.mrope_position_delta for position in text_positions]
 
                     for axis in range(3):
                         positions[axis].extend(
@@ -1264,6 +1336,7 @@ class ModelRunner:
         """
 
         for seq_id in seq_ids:
+            self.release_mtp_requests([seq_id])
             visual_embeddings = (
                 self.visual_embedding_cache.pop(
                     seq_id,
@@ -1987,9 +2060,12 @@ class ModelRunner:
     ) -> list[int] | None:
 
         if is_prefill:
-            return self.run_hybrid_prefill(
+            result = self.run_hybrid_prefill(
                 seqs
             )
+            if self.config.mtp_num_speculative_tokens:
+                return self.update_mtp_after_prefill(seqs, result)
+            return result
 
         return self.run_hybrid_decode(
             seqs

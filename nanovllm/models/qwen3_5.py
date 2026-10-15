@@ -778,6 +778,8 @@ class Qwen3_5TextModel(nn.Module):
             )
         ]
 
+        dflash_layers = getattr(self, "dflash_target_layer_ids", ())
+        dflash_features = {}
         for layer_idx, layer in enumerate(
             self.layers
         ):
@@ -846,10 +848,20 @@ class Qwen3_5TextModel(nn.Module):
                         "returned a GDN state"
                     )
 
+            if layer_idx in dflash_layers:
+                # HF hidden_states[i+1] is the output of decoder layer i.
+                dflash_features[layer_idx] = hidden_states
+
         # 最后一个 DecoderLayer 后还有一次 RMSNorm。
         hidden_states = self.norm(
             hidden_states
         )
+        if getattr(self, "capture_mtp_hidden_states", False):
+            self.last_mtp_hidden_states = hidden_states
+        if dflash_layers:
+            if self.num_hidden_layers - 1 in dflash_features:
+                dflash_features[self.num_hidden_layers - 1] = hidden_states
+            self.last_dflash_hidden_states = torch.cat([dflash_features[i] for i in dflash_layers], dim=-1)
 
         return (
             hidden_states,
@@ -977,7 +989,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         ),
     }
 
-    # MTP 暂不属于首版范围。
+    # MTP is opt-in. enable_mtp() enables strict loading of these weights.
     #
     # Vision Tower 已实现，因此 model.visual.*
     # 必须接受严格的权重加载和完整性检查。
@@ -1044,6 +1056,12 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             .language_model
             .embed_tokens(input_ids)
         )
+
+    def enable_mtp(self) -> None:
+        from nanovllm.models.qwen3_5_mtp import Qwen3_5MTP
+        self.mtp = Qwen3_5MTP(self.text_config)
+        self.ignored_weight_prefixes = ()
+        self.model.language_model.capture_mtp_hidden_states = True
 
     def get_visual_embeddings(
         self,
