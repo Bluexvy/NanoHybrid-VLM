@@ -90,6 +90,7 @@ if [[ "${RUN_UNIT_TESTS}" == 1 ]]; then
     # Binding test has its own gate below; exclude it from this small regression suite.
     run "${PYTHON_BIN}" -m unittest discover -s tests/dflash -p 'test_dflash_*.py'
     run "${PYTHON_BIN}" -m unittest discover -s tests/dflash -p 'test_benchmark_harness.py'
+    run "${PYTHON_BIN}" -m unittest discover -s tests/dflash -p 'test_decode_metadata.py'
 fi
 if [[ "${RUN_BINDING_TESTS}" == 1 ]]; then
     if [[ "${GDN_DECODE_BACKEND}" == state_aware_cuda ]]; then

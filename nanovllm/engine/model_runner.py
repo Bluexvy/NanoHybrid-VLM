@@ -987,8 +987,12 @@ class ModelRunner(DFlashRunnerMixin, MTPVerificationGraphMixin, MTPRunnerMixin):
                 f"found {cache_layer_idx}"
             )
 
-    def prepare_block_tables(self, seqs: list[Sequence]):
+    def prepare_block_tables(self, seqs: list[Sequence], *, num_columns: int | None = None):
         max_len = max(len(seq.block_table) for seq in seqs)
+        if num_columns is not None:
+            if num_columns < max_len:
+                raise ValueError("Block table capacity cannot truncate live KV pages")
+            max_len = num_columns
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
@@ -1212,7 +1216,15 @@ class ModelRunner(DFlashRunnerMixin, MTPVerificationGraphMixin, MTPRunnerMixin):
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+        # FA's Decode split heuristic depends on page-table capacity, not only
+        # live context lengths. Match the captured Workspace even in Eager-only
+        # runs and non-bucket fallbacks, so routing alone cannot change capacity.
+        # Extra columns are metadata; no additional KV pages/tokens are allocated.
+        if self.is_hybrid_model:
+            num_columns = (self.config.max_model_len + self.block_size - 1) // self.block_size
+            block_tables = self.prepare_block_tables(seqs, num_columns=num_columns)
+        else:
+            block_tables = self.prepare_block_tables(seqs)
         set_context(
             is_prefill=False,
             slot_mapping=slot_mapping,

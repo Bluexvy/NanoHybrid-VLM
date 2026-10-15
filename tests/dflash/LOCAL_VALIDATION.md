@@ -125,3 +125,16 @@ Graph、真实接受率、显存峰值和吞吐。没有启动租卡或下载完
   不能把旧报告的相同误差摘要当成逐元素相同或声称根因已修复。
 - 本地9项诊断器测试通过，新增元数据padding保留有效页/长度/slot、异常恢复prepare_decode
   和GDN checkpoint等检查；正常推理、CUDA kernel和接受/回滚规则未改。
+
+## 混合模型Decode统一页表容量（2026-10-16）
+
+- A800单因素对照回传：input=26/89处，普通Eager仅把页表扩宽，即与Graph的hidden和
+  logits逐元素相同，input=89的argmax翻转也复现。确认了这些位置的容量敏感路径。
+- 混合模型普通Decode按max_model_len/block_size向上取整固定表宽，和已有Graph一致；
+  Eager-only及非bucket回退也采用相同规则。保留真实长度、页ID与slot mapping；
+  不增加KV页，不补虚假请求/token。Prefill/投机验证、非混合Decode保持旧布局。
+- 新增7项实际ModelRunner元数据方法的小测试（仅替换pinned分配/CUDA传输），覆盖
+  Eager开关、跨页、mRoPE delta、请求重排/结束、非bucket B=3、向上取整、拒绝截断有效页
+  以及Prefill/非混合兼容；7项通过。原9项诊断器测试也通过。
+- 服务器套件加入元数据测试；诊断器记录实际表宽与逻辑页数，供A800复核修正后的普通
+  Eager/Graph对齐。该修正尚无完整27B运行结果，未宣称投机一致性问题已全部解决。

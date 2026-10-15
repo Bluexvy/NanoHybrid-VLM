@@ -144,6 +144,8 @@ def diagnose_hybrid_step(runner, seqs, lookahead, probe=True):
 
     def record_logits(hidden):
         output = original_compute(hidden)
+        table = get_context().block_tables
+        observed["table_columns"] = None if table is None else table.shape[1]
         observed["hidden"] = hidden.detach().float().cpu().clone()
         if output is not None:
             observed["logits"] = output.detach().float().cpu().clone()
@@ -175,6 +177,7 @@ def diagnose_hybrid_step(runner, seqs, lookahead, probe=True):
         baseline_ids = runner.run_hybrid_decode(seqs)
         baseline_states = manager.read_batched_states(slots)
         base_hidden, base_logits, base_trace = observed["hidden"], observed.get("logits"), dict(trace)
+        base_table_columns = observed["table_columns"]
 
         if batch in runner.hybrid_graphs:
             manager.write_batched_states(slots, checkpoint)
@@ -239,7 +242,8 @@ def diagnose_hybrid_step(runner, seqs, lookahead, probe=True):
                     recurrent_state=torch.cat([part[layer].recurrent_state for part in parts], 0))
                     for layer in range(len(checkpoint))]
             compare(name, hidden, logits, updated)
-        metadata = {"dynamic_table_columns": max(len(seq.block_table) for seq in seqs),
+        metadata = {"logical_table_columns": max(len(seq.block_table) for seq in seqs),
+                    "dynamic_table_columns": base_table_columns,
                     "static_table_columns": runner.hybrid_graph_workspace.block_tables.shape[1]
                                             if batch in runner.hybrid_graphs else None,
                     "min_context_len": min(seq.num_tokens for seq in seqs),

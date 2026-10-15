@@ -73,3 +73,21 @@ verify_block在预测index=40的row6/15、index=101的row3/12处也改变argmax�
 先用新增`decode_padded_table`只复查`--probe-at 26 89`，输出另一个JSON；
 若只改变表宽就与Graph逐元素一致，才能进一步锁定Attention表容量/内部计算选择。
 该检查没有改变正常推理算法、采样或CUDA kernel。
+
+## 页表容量对照结果及修正
+
+A800回传`numerics-b16-table.json`的终端输出显示，在input=26/89两处，普通Eager
+仅增加页表列数，即与Graph的hidden、logits逐元素相同；input=89的argmax翻转也复现。
+因此这些检查点的普通Decode分歧可由页表容量变化复现。实际SplitKV数量仍是源码估计，
+没有用设备跟踪直接测量；该结果也不代表投机验证和回滚已全部对齐。
+
+混合模型`prepare_decode`现在统一使用`ceil(max_model_len / block_size)`列，与已有
+Graph Workspace相同，覆盖Eager-only、Graph和非bucket回退。有效context length、
+物理页ID、slot mapping仍按真实请求构造，多余列为-1，不分配额外KV页或虚假token。
+Prefill/投机验证仍使用原来的动态页表；普通非混合Qwen3的Decode保持原有布局。
+这是统一普通Decode路径的数值条件，不是非标准batch的Graph padding，也不改变GDN内核。
+
+诊断报告现在区分`logical_table_columns`（真实页数）与`dynamic_table_columns`（普通
+Eager实际传入的列数）。修正后本例应为logical=1、dynamic=4、static=4；重新运行
+`--probe-at 26 89`检查Graph相对新普通Eager的差异。预期hidden/logits逐元素相同，仍需
+A800验证。旧性能数据不能当作修正后的性能结果，验证路径的GDN差异仍待定位。
