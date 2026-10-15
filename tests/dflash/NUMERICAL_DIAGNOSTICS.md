@@ -16,10 +16,13 @@ python tests/dflash/diagnose_numerics.py \
 不要使用 torchrun；引擎负责 TP worker。probe 编号表示正在计算的 completion token 的
 零基下标；该步预测下一个下标。例如 probe=26 会检查输出 token 下标27的 logits。
 
-五条路径从同一个 GDN checkpoint 和历史 KV 开始：
+六条路径从同一个 GDN checkpoint 和历史 KV 开始：
 
 - `decode_eager`：普通直接寻址 Decode，作为基线。
 - `decode_graph`：现有捕获的 Decode Graph。
+- `decode_padded_table`：普通Eager仅把Block Table补到静态表宽；不改变真实请求数、
+  token数、context length、有效页ID或GDN状态。另记录与Graph的hidden/logits直接比较，
+  用于区分表宽和其他静态Workspace因素。这是页表容量对照，不是batch padding实现。
 - `decode_static_eager`：使用同一静态 Workspace/metadata，但通过 Python 直接执行模型。
 - `verify_one`：无草稿的单token功能式验证。
 - `verify_block`：强制使用普通基线的后续token作为候选；比较anchor输出，并把GDN状态重放至
@@ -50,3 +53,23 @@ python tests/dflash/diagnose_numerics.py \
 参考：[FlashAttention v2.8.3 C++入口](https://github.com/Dao-AILab/flash-attention/blob/v2.8.3/csrc/flash_attn/flash_api.cpp)。
 
 本地小张量测试只验证诊断器指标、路径接线和状态恢复，不能替代A800/27B的定位结果。
+
+## 已回传A800结果与下一步（2026-10-16）
+
+`numerics-b16.json`完成7个固定历史位置、每处B=16的对照。实际GPU为108SM，动态/静态
+表宽1/4。前三个GDN层的Graph状态与普通Eager一致；出现偏离时静态Eager的第一个差异
+位于decoder.3（第一个Full Attention），后面的GDN状态才开始不同。Graph与静态Eager
+相对基线的全部hidden/logits/state差异摘要相同；旧报告没有两者直接的逐元素比较。
+
+Graph在预测index=90、row14处，top2从28.25/28.125变成28.125/28.125而改变argmax。
+verify_block在预测index=40的row6/15、index=101的row3/12处也改变argmax，基线top2
+分别27/27、21.5/21.5，验证路径变成相差0.125。BF16在[16,32)间的间隔正是0.125。
+这说明观察到的翻转与近邻/并列候选相关，不等于完整模型或回滚已经验证正确。
+
+验证路径第0层Conv状态与普通Decode完全一致，Recurrent状态最大绝对差约1.9e-6～5.8e-6，
+相对L2约3e-8～5e-8；最终hidden相对L2约1%～1.8%。仍需分离Conv激活、Recurrent输出、
+不同token行数的线性投影与归约/FMA路径。原报告不能单独证明回滚错误或排除所有状态问题。
+
+先用新增`decode_padded_table`只复查`--probe-at 26 89`，输出另一个JSON；
+若只改变表宽就与Graph逐元素一致，才能进一步锁定Attention表容量/内部计算选择。
+该检查没有改变正常推理算法、采样或CUDA kernel。

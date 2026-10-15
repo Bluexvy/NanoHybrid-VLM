@@ -114,3 +114,14 @@ Graph、真实接受率、显存峰值和吞吐。没有启动租卡或下载完
   这是具体的数值路径假设，还未在完整27B运行时确认，不宣称已经修复根因。
 - 本地7项诊断器小测试通过，检查top2/非有限值、anchor位置、异常/成功后的状态恢复、
   hook清理、静态路由、SplitKV heuristic估计。无完整权重下载、无27B实际诊断结果。
+
+## A800数值报告复核与单因素页表对照（2026-10-16）
+
+- 已复核用户回传的`numerics-b16.json`：7处固定历史、2个rank。Graph与静态Workspace
+  Eager的相对基线差异摘要相同，首个差异位于Full Attention的decoder.3；验证路径更早
+  在GDN偏离，观察到的argmax翻转均涉及相差0.125或并列的top2候选。
+- 诊断器新增`decode_padded_table`，保持普通Eager，仅扩大页表宽度，不增加请求/token，
+  不改变有效历史长度/页ID；直接比较其hidden/logits与Graph。该对照仍需A800运行，
+  不能把旧报告的相同误差摘要当成逐元素相同或声称根因已修复。
+- 本地9项诊断器测试通过，新增元数据padding保留有效页/长度/slot、异常恢复prepare_decode
+  和GDN checkpoint等检查；正常推理、CUDA kernel和接受/回滚规则未改。

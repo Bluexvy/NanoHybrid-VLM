@@ -1,5 +1,6 @@
 """Opt-in fixed-history diagnostics. Never used by normal generation or timing."""
 import math
+from contextlib import contextmanager
 import torch
 import torch.distributed as dist
 
@@ -82,6 +83,34 @@ def anchor_rows(tensor, batch):
     return tensor[::tensor.shape[0] // batch]
 
 
+@contextmanager
+def padded_decode_table(runner, columns):
+    """Diagnostic ablation: change table capacity only, retaining live KV IDs.
+
+    This pads page metadata, NOT requests/tokens. Live context lengths, slots,
+    and ordinary Eager execution stay unchanged. Extra pages are never live.
+    """
+    from nanovllm.utils.context import get_context
+    original = runner.prepare_decode
+
+    def prepare(seqs):
+        result = original(seqs)
+        context = get_context()
+        table = context.block_tables
+        if table is None or table.ndim != 2 or columns < table.shape[1]:
+            raise ValueError("Diagnostic table width must cover all live pages")
+        padded = table.new_zeros((table.shape[0], columns))
+        padded[:, :table.shape[1]].copy_(table)
+        context.block_tables = padded
+        return result
+
+    runner.prepare_decode = prepare
+    try:
+        yield
+    finally:
+        runner.prepare_decode = original
+
+
 @torch.inference_mode()
 def diagnose_hybrid_step(runner, seqs, lookahead, probe=True):
     """Compare paths from one checkpoint; advance active GDN by baseline ONE step.
@@ -154,6 +183,23 @@ def diagnose_hybrid_step(runner, seqs, lookahead, probe=True):
             graph_ids = runner.run_hybrid_decode(seqs)
             compare("decode_graph", observed["hidden"], observed.get("logits"), manager.read_batched_states(slots))
             comparisons["decode_graph"]["sampled_ids"] = graph_ids
+            graph_hidden, graph_logits = observed["hidden"], observed.get("logits")
+
+            # Keep ordinary Eager allocations/execution; change ONLY table width.
+            # Compare directly with Graph, rather than inferring equality from
+            # coincidentally equal max-error summaries against the baseline.
+            manager.write_batched_states(slots, checkpoint)
+            trace.clear()
+            runner.enforce_eager = True
+            columns = runner.hybrid_graph_workspace.block_tables.shape[1]
+            with padded_decode_table(runner, columns):
+                runner.run_hybrid_decode(seqs)
+            compare("decode_padded_table", observed["hidden"], observed.get("logits"),
+                    manager.read_batched_states(slots))
+            against_graph = {"hidden": tensor_difference(graph_hidden, observed["hidden"])}
+            if runner.rank == 0:
+                against_graph["logits"] = logits_difference(graph_logits, observed["logits"])
+            comparisons["decode_padded_table"]["against_graph"] = against_graph
 
             # Same static tensors as Graph, but executed by Python, with hooks.
             manager.write_batched_states(slots, checkpoint)
@@ -195,7 +241,10 @@ def diagnose_hybrid_step(runner, seqs, lookahead, probe=True):
             compare(name, hidden, logits, updated)
         metadata = {"dynamic_table_columns": max(len(seq.block_table) for seq in seqs),
                     "static_table_columns": runner.hybrid_graph_workspace.block_tables.shape[1]
-                                            if batch in runner.hybrid_graphs else None}
+                                            if batch in runner.hybrid_graphs else None,
+                    "min_context_len": min(seq.num_tokens for seq in seqs),
+                    "max_context_len": max(seq.num_tokens for seq in seqs),
+                    "block_size": runner.block_size}
         attention = next((module for module in runner.model.modules()
                           if module.__class__.__name__ == "Attention"), None)
         if attention is not None and torch.cuda.is_available():

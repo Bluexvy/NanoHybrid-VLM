@@ -10,6 +10,7 @@ import cpu_runtime
 from nanovllm.engine.numerical_diagnostics import (
     anchor_rows, diagnose_hybrid_step, logits_difference, tensor_difference,
     estimate_decode_splits,
+    padded_decode_table,
 )
 
 
@@ -50,6 +51,8 @@ class Runner:
         self.enforce_eager = False
         self.hybrid_graphs = {}
         self.fail_graph = False
+        self.fail_padded = False
+        self.seen_table_widths = []
         self.hybrid_graph_workspace = SimpleNamespace(
             hidden_states=torch.zeros(batch, 4), slot_mapping=torch.zeros(batch, dtype=torch.int32),
             context_lens=torch.ones(batch, dtype=torch.int32), block_tables=torch.zeros(batch, 1, dtype=torch.int32),
@@ -68,6 +71,12 @@ class Runner:
         self.hybrid_graph_workspace.hidden_states.copy_(hidden)
 
     def run_hybrid_decode(self, seqs):
+        from nanovllm.utils.context import get_context
+        self.prepare_decode(seqs)
+        width = get_context().block_tables.shape[1]
+        self.seen_table_widths.append(width)
+        if self.fail_padded and self.enforce_eager and width == 4:
+            raise RuntimeError("diagnostic padded table failure")
         if not self.enforce_eager and self.fail_graph:
             raise RuntimeError("diagnostic graph failure")
         hidden = self.model(torch.eye(4)[:len(seqs)])
@@ -146,11 +155,53 @@ class DiagnosticTests(unittest.TestCase):
         runner.hybrid_graphs[2] = True
         value = diagnose_hybrid_step(runner, requests(), [[5], [6]])
         results = value["ranks"][0]["comparisons"]
-        self.assertEqual(set(results), {"decode_graph", "decode_static_eager", "verify_one", "verify_block"})
+        self.assertEqual(set(results), {"decode_graph", "decode_padded_table", "decode_static_eager", "verify_one", "verify_block"})
         for mode, result in results.items():
             self.assertTrue(result["hidden"]["exact"], mode)
             self.assertEqual(result["logits"]["argmax_mismatches"], 0, mode)
         self.assertTrue(torch.equal(runner.hybrid_state_manager.value, torch.ones_like(runner.hybrid_state_manager.value)))
+        self.assertTrue(results["decode_padded_table"]["against_graph"]["hidden"]["exact"])
+
+    def test_table_padding_preserves_live_ids_lengths_and_slots(self):
+        from nanovllm.utils.context import get_context, reset_context
+        runner = Runner()
+        runner.hybrid_graph_workspace.block_tables[:, 0] = torch.tensor([7, 11])
+        original = runner.prepare_decode
+        try:
+            with padded_decode_table(runner, 4):
+                runner.prepare_decode(requests())
+                context = get_context()
+                self.assertEqual(context.block_tables.tolist(), [[7, 0, 0, 0], [11, 0, 0, 0]])
+                self.assertIs(context.context_lens, runner.hybrid_graph_workspace.context_lens)
+                self.assertIs(context.slot_mapping, runner.hybrid_graph_workspace.slot_mapping)
+                self.assertEqual(runner.hybrid_graph_workspace.block_tables.tolist(), [[7], [11]])
+                raise RuntimeError("restore preparation")
+        except RuntimeError:
+            pass
+        finally:
+            reset_context()
+        self.assertEqual(runner.prepare_decode, original)
+
+    def test_failed_padding_probe_restores_preparation_and_baseline_state(self):
+        runner = Runner()
+        runner.hybrid_graphs[2] = True
+        runner.hybrid_graph_workspace.block_tables = torch.zeros(2, 4, dtype=torch.int32)
+        # Real prepare_decode creates the compact dynamic table independently.
+        original = runner.prepare_decode
+        def compact(seqs):
+            from nanovllm.utils.context import get_context
+            result = original(seqs)
+            get_context().block_tables = torch.zeros(2, 1, dtype=torch.int32)
+            return result
+        runner.prepare_decode = compact
+        runner.fail_padded = True
+        with self.assertRaisesRegex(RuntimeError, "diagnostic padded table failure"):
+            diagnose_hybrid_step(runner, requests(), [[5], [6]])
+        self.assertEqual(runner.seen_table_widths, [1, 1, 4])
+        self.assertIs(runner.prepare_decode, compact)
+        self.assertTrue(torch.equal(runner.hybrid_state_manager.value, torch.ones_like(runner.hybrid_state_manager.value)))
+        self.assertFalse(runner.enforce_eager)
+        self.assertFalse(runner.model.model.language_model.layers[0]._forward_hooks)
 
     def test_non_probe_step_only_advances_the_baseline(self):
         runner = Runner()

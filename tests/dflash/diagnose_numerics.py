@@ -61,6 +61,7 @@ def main():
     environment_file = Path(args.results).parent.parent / "environment.json"
     source_environment = json.loads(environment_file.read_text()) if environment_file.exists() else {}
     report = {"purpose": "fixed-history diagnostic, not a benchmark or correctness pass",
+              "diagnostic_version": "table_width_ablation_v2",
               "arguments": vars(args), "source_commit": source_environment.get("git_commit"),
               "source_token_consistency_passed": source.get("token_consistency_passed"), "steps": []}
     try:
@@ -96,7 +97,11 @@ def main():
                 print(f"probe input={step}, prediction={step+1}: " + "; ".join(
                     f"{mode}: argmax_diff={result['logits'].get('argmax_mismatches')}, "
                     f"hidden_max={result['hidden'].get('max_abs')}, "
-                    f"first_layer={result['first_nonidentical_layer']}" for mode, result in rank0.items()), flush=True)
+                    f"first_layer={result['first_nonidentical_layer']}" +
+                    (f", vs_graph_hidden_exact={result['against_graph']['hidden']['exact']}, "
+                     f"vs_graph_logits_exact={result['against_graph']['logits']['exact']}"
+                     if 'against_graph' in result else '')
+                    for mode, result in rank0.items()), flush=True)
             llm.scheduler.postprocess(seqs, [tokens[step + 1] for tokens in oracle], False)
         report["diagnostic_completed"] = True
         write_json(args.output, report)
