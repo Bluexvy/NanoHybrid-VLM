@@ -40,6 +40,10 @@ class ModelRunner(DFlashRunnerMixin, MTPVerificationGraphMixin, MTPRunnerMixin):
     
     IMAGE_TOKEN_TYPE = 1
 
+    def diagnose_hybrid_numerics(self, seqs, lookahead, probe=True):
+        from nanovllm.engine.numerical_diagnostics import diagnose_hybrid_step
+        return diagnose_hybrid_step(self, seqs, lookahead, probe)
+
     def __init__(    
         self,
         config: Config,
