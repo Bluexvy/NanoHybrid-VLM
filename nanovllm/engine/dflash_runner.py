@@ -84,7 +84,10 @@ class DFlashRunnerMixin:
         probabilities, tokens = [], None
         if self.rank == 0:
             logits = self.dflash.transform_logits(logits)
-            if seq.temperature == 0:
+            if getattr(self.dflash.config, "is_dflash2", False):
+                tokens, probabilities = self.dflash.candidate_selector.select(
+                    hidden[1:], logits, pending, seq.temperature)
+            elif seq.temperature == 0:
                 tokens = logits.argmax(-1).tolist()
                 probabilities = [None] * count
             else:

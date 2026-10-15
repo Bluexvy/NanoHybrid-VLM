@@ -22,11 +22,11 @@ class Target(gpu.Target):
 
 
 class Runner(DFlashRunnerMixin, gpu.Runner):
-    def __init__(self):
+    def __init__(self, version=1):
         super().__init__()
         self.config.speculative_method = "dflash"
         self.model = Target().cuda().eval()
-        config = helpers.tiny_config()
+        config = helpers.tiny_config(version)
         config.hidden_size, config.intermediate_size = 8, 12
         config.num_attention_heads, config.num_key_value_heads = 2, 1
         config.num_target_layers, config.target_layer_ids = 5, (1, 4)
@@ -36,9 +36,11 @@ class Runner(DFlashRunnerMixin, gpu.Runner):
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA PyTorch")
 class GPUIntegrationTests(unittest.TestCase):
+    runner_type = Runner
+
     def test_verification_graph_keeps_its_own_live_multilayer_features(self):
         torch.manual_seed(157)
-        runner, seqs = Runner(), gpu.requests()
+        runner, seqs = self.runner_type(), gpu.requests()
         for iteration in range(2):
             if iteration:
                 seqs.reverse()
@@ -58,7 +60,7 @@ class GPUIntegrationTests(unittest.TestCase):
 
     def test_partial_acceptance_commits_only_valid_gdn_and_draft_context(self):
         torch.manual_seed(159)
-        runner, seqs = Runner(), gpu.requests()
+        runner, seqs = self.runner_type(), gpu.requests()
         expected, proposals = {}, {}
         with torch.inference_mode():
             for row, seq in enumerate(seqs):
@@ -85,6 +87,11 @@ class GPUIntegrationTests(unittest.TestCase):
             for a, b in zip(cache, runner.dflash_caches[seq.seq_id]):
                 for x, y in zip(a, b):
                     torch.testing.assert_close(x, y, rtol=3e-5, atol=3e-6)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA PyTorch")
+class DFlash2GPUIntegrationTests(GPUIntegrationTests):
+    runner_type = staticmethod(lambda: Runner(2))
 
 
 if __name__ == "__main__":

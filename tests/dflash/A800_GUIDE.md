@@ -1,5 +1,8 @@
 # 2×A800 一键测试 DFlash
 
+Qwen3.8-27B + DFlash2 请优先阅读 [QWEN38_GUIDE.md](QWEN38_GUIDE.md)，
+使用 `run_qwen38_a800.sh`，不要误用下面的 9B 草稿下载默认值。
+
 本套件负责：真实权重 Greedy 对齐、接受率、推进长度、端到端/Decode 吞吐、TTFT/TPOT、
 每个 rank 的显存、前缀命中和动态请求状态检查。它不会自动安装依赖或租用机器。
 

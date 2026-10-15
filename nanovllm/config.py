@@ -378,7 +378,7 @@ class Config:
         if self.mtp_num_speculative_tokens:
             if (root_config.model_type != "qwen3_5"
                     or not has_gdn_layers or getattr(text_config, "num_experts", 0)):
-                raise ValueError("Native MTP backend supports dense Qwen3.5 only")
+                raise ValueError("Speculation supports dense Qwen3.5/Qwen3.8 hybrid models only")
             if self.speculative_method == "dflash":
                 from nanovllm.models.dflash import read_dflash_config, validate_dflash_checkpoint
                 draft = read_dflash_config(self.dflash_model, text_config, self.tensor_parallel_size)

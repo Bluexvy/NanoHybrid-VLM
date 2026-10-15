@@ -14,6 +14,7 @@ BACKEND="${BACKEND:-auto}"
 DRY_RUN="${DRY_RUN:-0}"
 RUN_UNIT_TESTS="${RUN_UNIT_TESTS:-1}"
 DOWNLOAD_DRAFT="${DOWNLOAD_DRAFT:-0}"
+DRAFT_REPO="${DRAFT_REPO:-z-lab/Qwen3.5-9B-DFlash}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export MAX_JOBS="${MAX_JOBS:-2}"
 export TOKENIZERS_PARALLELISM=false
@@ -28,7 +29,8 @@ Usage: bash tests/dflash/run_a800.sh TARGET_DIR DFLASH_DIR [OUTPUT_DIR]
 
 Environment:
   SUITE_MODE=smoke|full    smoke: B=1,4, drafts=3; full: B=1,4,16, drafts=3,7
-  DOWNLOAD_DRAFT=1        explicitly download z-lab/Qwen3.5-9B-DFlash first
+  DOWNLOAD_DRAFT=1        download DRAFT_REPO first (default: z-lab/Qwen3.5-9B-DFlash)
+  DRAFT_REPO=...          use incoai/Qwen3.8-27B-DFlash2 for Qwen3.8
   BACKEND=auto|cuda|reference
   RUN_UNIT_TESTS=0        skip the small CPU/GPU regression tests
   RUN_BINDING_TESTS=0     skip C++ binding gate (default: enabled unless reference)
@@ -70,7 +72,7 @@ trap 'status=$?; if (( status != 0 )); then printf "FAILED (exit %s). Logs: %s\n
 
 echo "DFlash TP=2 ${SUITE_MODE}; visible GPUs=${CUDA_VISIBLE_DEVICES}; results=${OUTPUT_DIR}"
 if [[ "${DOWNLOAD_DRAFT}" == 1 ]]; then
-    run env HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "${PYTHON_BIN}" -c 'import sys; from huggingface_hub import snapshot_download; snapshot_download(repo_id="z-lab/Qwen3.5-9B-DFlash", local_dir=sys.argv[1])' "${DRAFT_PATH}"
+    run env HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "${PYTHON_BIN}" -c 'import sys; from huggingface_hub import snapshot_download; snapshot_download(repo_id=sys.argv[1], local_dir=sys.argv[2])' "${DRAFT_REPO}" "${DRAFT_PATH}"
 fi
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1

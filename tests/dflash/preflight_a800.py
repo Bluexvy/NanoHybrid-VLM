@@ -60,6 +60,15 @@ def main():
                             "vocab_size": config.text_config.vocab_size,
                             "num_hidden_layers": config.text_config.num_hidden_layers,
                             "dtype": str(getattr(config.text_config, "dtype", None))}
+        from nanovllm.models.dflash import read_dflash_config
+        draft = read_dflash_config(args.draft, config.text_config, args.tp)
+        report["draft"] = {"architecture": draft.architectures[0], "layers": draft.num_hidden_layers,
+            "target_layer_ids": draft.target_layer_ids, "block_size": draft.block_size,
+            "mask_token_id": draft.mask_token_id, "is_dflash2": draft.is_dflash2}
+        if draft.is_dflash2:
+            from download_qwen38 import describe_pair
+            report["layout"] = describe_pair(json.loads((Path(args.model) / "config.json").read_text()),
+                json.loads((Path(args.draft) / "config.json").read_text()), args.tp)
         if args.backend != "reference":
             from torch.utils.cpp_extension import CUDA_HOME
             nvcc = shutil.which("nvcc") or (str(Path(CUDA_HOME) / "bin/nvcc") if CUDA_HOME else None)

@@ -13,12 +13,12 @@ import sys
 from types import SimpleNamespace
 
 
-def worker(rank, size, method):
+def worker(rank, size, method, version=1):
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=method, rank=rank, world_size=size)
     try:
         torch.manual_seed(173)
-        config = tiny_config()
+        config = tiny_config(version)
         config.num_attention_heads, config.num_key_value_heads = 8, 4
         full = DFlashDraftModel(config, tp_rank=0, tp_size=1).eval()
         local = DFlashDraftModel(config, tp_rank=rank, tp_size=size).eval()
@@ -85,15 +85,21 @@ def worker(rank, size, method):
 
 
 class TensorParallelTests(unittest.TestCase):
-    def check(self, size):
+    def check(self, size, version=1):
         with tempfile.TemporaryDirectory() as directory:
-            mp.spawn(worker, args=(size, (Path(directory) / "rendezvous").as_uri()), nprocs=size, join=True)
+            mp.spawn(worker, args=(size, (Path(directory) / "rendezvous").as_uri(), version), nprocs=size, join=True)
 
     def test_tp2(self):
         self.check(2)
 
     def test_tp4(self):
         self.check(4)
+
+    def test_v2_tp2(self):
+        self.check(2, 2)
+
+    def test_v2_tp4(self):
+        self.check(4, 2)
 
 
 if __name__ == "__main__":

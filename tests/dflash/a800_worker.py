@@ -46,7 +46,8 @@ def run(args, spec):
         **options)
     startup = perf_counter() - start
     try:
-        report = {"case": spec, "passed": False, "startup_seconds_not_timed": startup}
+        report = {"case": spec, "passed": False, "startup_seconds_not_timed": startup,
+            "draft_architecture": llm.model_runner.dflash.config.architectures[0] if options else None}
         if spec["kind"] == "state_checks":
             shared = tokenizer.encode("A technical document about GPU memory, caching, and inference scheduling. ",
                                       add_special_tokens=False)

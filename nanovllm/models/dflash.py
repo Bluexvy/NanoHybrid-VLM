@@ -1,6 +1,7 @@
-"""DFlash v1 adapter, with explicit context-only KV and TP projections.
+"""DFlash v1/v2 adapter, with explicit context-only KV and TP projections.
 
-Checkpoint layout and math follow z-lab/dflash's DFlashDraftModel (MIT).
+Checkpoint layout and math follow z-lab/dflash's DFlashDraftModel and
+DFlash2DraftModel (MIT; copyright 2026 Z Lab, see third_party/dflash-LICENSE).
 No remote Python code is executed. Target embeddings/LM head remain shared.
 """
 import json
@@ -27,8 +28,10 @@ def read_dflash_config(path, target_config=None, tp_size=1):
         raise ValueError("DFlash dimensions and TP size must be positive integers")
     cfg = SimpleNamespace(**raw)
     extra = raw.get("dflash_config", {})
-    if raw.get("architectures") != ["DFlashDraftModel"] or raw.get("model_type") != "qwen3":
-        raise ValueError("Expected a DFlash v1 Qwen3 draft checkpoint, not MTP/EAGLE/DFlash2")
+    architecture = raw.get("architectures")
+    if architecture not in (["DFlashDraftModel"], ["DFlash2DraftModel"]) or raw.get("model_type") != "qwen3":
+        raise ValueError("Expected a DFlash v1/v2 Qwen3 draft checkpoint, not MTP/EAGLE")
+    cfg.is_dflash2 = architecture == ["DFlash2DraftModel"]
     cfg.target_layer_ids = tuple(extra.get("target_layer_ids", raw.get("target_layer_ids", ())))
     cfg.block_size = extra.get("block_size", raw.get("block_size", 16))
     cfg.mask_token_id = extra.get("mask_token_id", raw.get("mask_token_id"))
@@ -44,6 +47,15 @@ def read_dflash_config(path, target_config=None, tp_size=1):
     cfg.is_causal = raw.get("is_causal")
     cfg.sliding_window = raw.get("sliding_window")
     cfg.layer_types = raw.get("layer_types", ["full_attention"] * cfg.num_hidden_layers)
+    if cfg.is_dflash2:
+        for name in ("conv_kernel_size", "conv_group_size", "selector_rank", "selector_top_k"):
+            value = extra.get(name, raw.get(name))
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"DFlash2 requires a positive integer {name}")
+            setattr(cfg, name, value)
+        if (cfg.conv_kernel_size != 2 or cfg.hidden_size % cfg.conv_group_size
+                or cfg.selector_top_k > cfg.vocab_size):
+            raise ValueError("Unsupported DFlash2 convolution or selector layout")
     if (not cfg.target_layer_ids or len(set(cfg.target_layer_ids)) != len(cfg.target_layer_ids)
             or any(type(i) is not int or not 0 <= i < cfg.num_target_layers for i in cfg.target_layer_ids)
             or len(cfg.layer_types) != cfg.num_hidden_layers
@@ -65,9 +77,8 @@ def read_dflash_config(path, target_config=None, tp_size=1):
     return cfg
 
 
-def validate_dflash_checkpoint(path, config):
-    """Inspect local safetensors headers before allocating the target on GPU."""
-    from safetensors import safe_open
+def dflash_checkpoint_shapes(config):
+    """Global (unsharded) checkpoint shapes, including v2's raw codebooks."""
     cfg = config
     required = {"fc.weight": (cfg.hidden_size, cfg.hidden_size * len(cfg.target_layer_ids)),
                 "hidden_norm.weight": (cfg.hidden_size,), "norm.weight": (cfg.hidden_size,)}
@@ -89,6 +100,22 @@ def validate_dflash_checkpoint(path, config):
         for name in ("gate_proj", "up_proj", "down_proj"):
             required[prefix + f"mlp.{name}.weight"] = ((cfg.hidden_size, cfg.intermediate_size)
                 if name == "down_proj" else (cfg.intermediate_size, cfg.hidden_size))
+        if getattr(cfg, "is_dflash2", False):
+            for name in ("attention_conv", "mlp_conv"):
+                required[prefix + name + ".base_kernel"] = (2, cfg.conv_kernel_size, cfg.hidden_size)
+                required[prefix + name + ".kernel_projection.weight"] = (
+                    2 * cfg.conv_kernel_size * (cfg.hidden_size // cfg.conv_group_size), cfg.hidden_size)
+    if getattr(cfg, "is_dflash2", False):
+        for name in ("predecessor_codebook", "successor_codebook"):
+            required["candidate_selector." + name] = (cfg.vocab_size, cfg.selector_rank)
+        required["candidate_selector.hidden_projection.weight"] = (cfg.selector_rank, cfg.hidden_size)
+    return required
+
+
+def validate_dflash_checkpoint(path, config):
+    """Inspect local safetensors headers before allocating the target on GPU."""
+    from safetensors import safe_open
+    required = dflash_checkpoint_shapes(config)
     actual = {}
     unsupported_dtypes = []
     for file in sorted(Path(path).glob("*.safetensors")):
@@ -183,10 +210,99 @@ class DFlashLayer(nn.Module):
         self.input_layernorm = DFlashRMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.post_attention_layernorm = DFlashRMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.mlp = MTPMLP(cfg, rank, size)
+        self.attention_conv = self.mlp_conv = None
+        if getattr(cfg, "is_dflash2", False):
+            self.attention_conv = GroupedDynamicCausalConv(cfg.hidden_size, cfg.conv_kernel_size, cfg.conv_group_size)
+            self.mlp_conv = GroupedDynamicCausalConv(cfg.hidden_size, cfg.conv_kernel_size, cfg.conv_group_size)
 
     def forward(self, x, positions, context):
-        x = x + self.self_attn(self.input_layernorm(x), positions, context)
-        return x + self.mlp(self.post_attention_layernorm(x))
+        residual = x
+        x = self.input_layernorm(x)
+        if self.attention_conv is not None:
+            x, kernel = self.attention_conv.prepare(x)
+        x = self.self_attn(x, positions, context)
+        if self.attention_conv is not None:
+            x = self.attention_conv.finish(x, kernel)
+        x = residual + x
+        residual = x
+        x = self.post_attention_layernorm(x)
+        if self.mlp_conv is not None:
+            x, kernel = self.mlp_conv.prepare(x)
+        x = self.mlp(x)
+        if self.mlp_conv is not None:
+            x = self.mlp_conv.finish(x, kernel)
+        return residual + x
+
+
+class GroupedDynamicCausalConv(nn.Module):
+    """Block-local two-tap convolution; no persistent GDN/conv state.
+
+    Kept replicated across TP ranks: input and row-parallel outputs are full
+    hidden vectors. The dynamic post kernel is computed from the PRE input.
+    """
+    def __init__(self, hidden_size, kernel_size, group_size):
+        super().__init__()
+        self.kernel_size, self.group_size = kernel_size, group_size
+        self.base_kernel = nn.Parameter(torch.zeros(2, kernel_size, hidden_size))
+        self.kernel_projection = nn.Linear(hidden_size, 2 * kernel_size * (hidden_size // group_size), bias=False)
+
+    def convolve(self, hidden, dynamic, base):
+        length, width = hidden.shape
+        groups = width // self.group_size
+        blocks = hidden.reshape(length, groups, self.group_size)
+        dynamic = dynamic.reshape(length, self.kernel_size, groups, 1)
+        result = torch.zeros_like(blocks)
+        for offset in range(self.kernel_size):
+            values = blocks if offset == 0 else F.pad(blocks[:-offset], (0, 0, 0, 0, offset, 0))
+            result = result + base[offset].reshape(1, groups, self.group_size).to(hidden.dtype) * values
+            result = torch.addcmul(result, dynamic[:, offset], values)
+        return result.reshape_as(hidden)
+
+    def prepare(self, hidden):
+        dynamic = self.kernel_projection(hidden).reshape(hidden.shape[0], 2, self.kernel_size, -1)
+        return self.convolve(hidden, dynamic[:, 0], self.base_kernel[0]), dynamic[:, 1]
+
+    def finish(self, hidden, dynamic):
+        return self.convolve(hidden, dynamic, self.base_kernel[1])
+
+
+class CandidateSelector(nn.Module):
+    """Rank-0 conditional path selection with exact q rows for rejection.
+
+    Raw Parameter names match released checkpoints (no '.weight' suffix).
+    """
+    def __init__(self, cfg):
+        super().__init__()
+        self.top_k = cfg.selector_top_k
+        self.predecessor_codebook = nn.Parameter(torch.empty(cfg.vocab_size, cfg.selector_rank))
+        self.successor_codebook = nn.Parameter(torch.empty(cfg.vocab_size, cfg.selector_rank))
+        nn.init.normal_(self.predecessor_codebook, std=.02)
+        nn.init.normal_(self.successor_codebook, std=.02)
+        self.hidden_projection = nn.Linear(cfg.hidden_size, cfg.selector_rank, bias=False)
+
+    def select(self, hidden, logits, anchor, temperature):
+        if temperature < 0 or hidden.shape[0] != logits.shape[0] or logits.shape[-1] < self.top_k:
+            raise ValueError("Invalid DFlash2 selector input")
+        unary, candidates = torch.topk(logits, self.top_k, dim=-1, sorted=False)
+        gates = self.hidden_projection(hidden)
+        previous = torch.as_tensor(anchor, dtype=torch.long, device=hidden.device).reshape(())
+        tokens, distributions = [], []
+        for position in range(hidden.shape[0]):
+            predecessor = F.embedding(previous, self.predecessor_codebook) * gates[position]
+            successor = F.embedding(candidates[position], self.successor_codebook)
+            scores = unary[position] + torch.einsum("r,kr->k", predecessor, successor)
+            if temperature == 0:
+                selected = scores.argmax(-1)
+            else:
+                probabilities = torch.softmax(scores.float() / temperature, -1)
+                selected = torch.multinomial(probabilities, 1).reshape(())
+                # q depends on the selected predecessor. Outside Top-K q=0,
+                # which is required by the common verifier's (p-q)+ residual.
+                distributions.append(torch.zeros(logits.shape[-1], device=logits.device,
+                    dtype=torch.float32).scatter(0, candidates[position], probabilities))
+            previous = candidates[position, selected]
+            tokens.append(previous)
+        return torch.stack(tokens).tolist(), distributions if temperature else [None] * len(tokens)
 
 
 class DFlashDraftModel(nn.Module):
@@ -200,6 +316,8 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = DFlashRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.norm = DFlashRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.layers = nn.ModuleList([DFlashLayer(config, i, rank, size) for i in range(config.num_hidden_layers)])
+        if getattr(config, "is_dflash2", False):
+            self.candidate_selector = CandidateSelector(config)
 
     def append_context(self, features, positions, past=None):
         """Commit VERIFIED target features only. Draft/noise KV never persists."""

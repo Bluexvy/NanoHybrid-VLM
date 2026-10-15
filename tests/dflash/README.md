@@ -1,14 +1,16 @@
-# Qwen3.5-9B DFlash 接入
+# Qwen3.5 DFlash / Qwen3.8 DFlash2 接入
+
+**Qwen3.8-27B + DFlash2 的无卡下载、TP=2 适配说明和一键测试，见 [QWEN38_GUIDE.md](QWEN38_GUIDE.md)。**
 
 2×A800 的一键启动、接受率/性能统计与结果说明见 [A800_GUIDE.md](A800_GUIDE.md)。
 
-本后端实现 DFlash v1 的并行起草，保留原生 MTP。参考：
+本后端支持 DFlash v1/v2 的并行起草，保留原生 MTP。以下原有示例是 9B + v1。参考：
 
 - 官方实现：https://github.com/z-lab/dflash （MIT）
 - 对应草稿：https://huggingface.co/z-lab/Qwen3.5-9B-DFlash
 - 论文：https://arxiv.org/abs/2602.06036
 
-这里实现的是 DFlash v1，不是 DFlash 2，也没有重新训练草稿。
+根据草稿 config.architectures 自动选择 v1 或 v2；没有重新训练草稿。
 引擎只读取本地 config.json 和 safetensors，不执行仓库中的远程 Python。
 
 ## 使用
@@ -68,7 +70,8 @@ python tests/dflash/example_dflash.py --model /models/Qwen3.5-9B --draft /models
 - 官方 9B 草稿配置是 6 层，读取主模型 `[1,5,9,13,17,21,25,29]` 共 8 层输出。
 - DFlash 使用标准 RMSNorm 的 `weight`，目标 Qwen3.5 使用 `1 + weight`，不能混用。
 - 草稿使用自己完整 Head 的 RoPE 配置；不能复用目标模型的部分旋转/mRoPE。
-- Sliding draft attention 使用因果窗口；full draft attention 可以看到整段噪声块。
+- 草稿因果性优先读取 is_causal；未指定时 sliding 默认因果、full 默认非因果。
+  Qwen3.8 DFlash2 显式 is_causal=false，所以其 sliding 窗口内允许双向读取噪声块。
   目标模型验证始终保持正常因果性。
 - 草稿缓存只保存已确认上下文的 K/V。当前 block 的 noise K/V 临时参与计算，不持久化。
 - 原生 MTP Prefix Snapshot 保存 L-1 组移位输入和边界特征。

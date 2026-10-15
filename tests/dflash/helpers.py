@@ -20,7 +20,13 @@ def tiny_raw():
         dflash_config={"block_size": 4, "mask_token_id": 31, "target_layer_ids": [1, 3]})
 
 
-def tiny_config():
+def tiny_config(version=1):
     with tempfile.TemporaryDirectory() as directory:
-        (Path(directory) / "config.json").write_text(json.dumps(tiny_raw()))
+        raw = tiny_raw()
+        if version == 2:
+            raw["architectures"] = ["DFlash2DraftModel"]
+            raw["is_causal"] = False
+            raw["dflash_config"].update(conv_kernel_size=2, conv_group_size=4,
+                selector_rank=4, selector_top_k=4)
+        (Path(directory) / "config.json").write_text(json.dumps(raw))
         return read_dflash_config(directory)
