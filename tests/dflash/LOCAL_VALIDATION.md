@@ -138,3 +138,14 @@ Graph、真实接受率、显存峰值和吞吐。没有启动租卡或下载完
   以及Prefill/非混合兼容；7项通过。原9项诊断器测试也通过。
 - 服务器套件加入元数据测试；诊断器记录实际表宽与逻辑页数，供A800复核修正后的普通
   Eager/Graph对齐。该修正尚无完整27B运行结果，未宣称投机一致性问题已全部解决。
+
+## 普通Decode A800复核与GDN子步骤诊断（2026-10-16）
+
+- 用户回传修正后的input=26/89：Graph、页表对照、静态Eager均相对普通Eager
+  hidden_max=0、argmax_diff=0；verify_one仍有hidden差异，input=89的verify_block有1个
+  argmax差异。仅确认这两个固定历史检查点的普通Decode对齐。
+- opt-in诊断增加首个GDN的11处子步骤观察，保留数学操作；记录真实执行顺序下的首个
+  不同位置，区分输入投影、Conv激活、递推输出与门控RMSNorm/输出投影。
+- 本地13项诊断器测试通过，新增Decode/packed/flattened-head对齐、观察不改变输出、
+  注入Conv输出误差定位到conv.output、异常后恢复既有方法覆盖与清理hooks。
+  这些是诊断器的小测试，不是完整GDN/27B的精度通过。

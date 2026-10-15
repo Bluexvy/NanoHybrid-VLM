@@ -91,3 +91,27 @@ Prefill/投机验证仍使用原来的动态页表；普通非混合Qwen3的Deco
 Eager实际传入的列数）。修正后本例应为logical=1、dynamic=4、static=4；重新运行
 `--probe-at 26 89`检查Graph相对新普通Eager的差异。预期hidden/logits逐元素相同，仍需
 A800验证。旧性能数据不能当作修正后的性能结果，验证路径的GDN差异仍待定位。
+
+## 普通Decode复核与首个GDN细分观察
+
+修正后用户回传：input=26/89的`decode_graph`、`decode_padded_table`和
+`decode_static_eager`均为hidden_max=0、argmax_diff=0。该两个位置的普通Decode一致，
+不能外推为完整生成、所有batch或投机验证通过。input=89的verify_block仍有1个argmax差异。
+
+诊断版本`first_gdn_stages_v3`只对第一个GDN增加11处观察点，保留原计算：
+
+- `input`：GDN输入，可区分更前面的Embedding/Input RMSNorm与GDN内部差异。
+- `in_proj_qkv`、`in_proj_z`、`in_proj_b`、`in_proj_a`：输入线性投影。
+- `conv.input`、`conv.output`：Conv原始输入和卷积+激活后的输出，区别于历史Conv状态。
+- `recurrent.output`：进入门控RMSNorm前的递推输出；该误差也可能从Conv/投影传入。
+- `norm.gate`、`norm.output`：归一化的门控输入和最终结果。
+- `out_proj.output`：GDN输出投影及其TP聚合后的结果。
+
+记录`first_gdn_stages`与`first_nonidentical_gdn_stage`。每处仅取同一请求的anchor，
+将Decode的[B,1,C]、验证的[1,B*L,C]、归一化的[tokens*heads,D]对齐到[B,C]。
+观察点按实际执行顺序记录；现有Graph不会执行Python hooks，因此Graph的该列表为空。
+非probe步骤不安装这些观察点，成功/异常退出都会清理hooks和临时Conv方法包装。
+
+下次仍使用原诊断命令，建议`--probe-at 0 26 89`，输出新文件`numerics-b16-gdn.json`。
+不要因为first_gdn=`recurrent.output`就直接认定Recurrent算子错误；需要先确认前面的
+input、QKV投影、conv.output以及g/beta投影一致。当前只定位，不更改浮点运算或接受规则。

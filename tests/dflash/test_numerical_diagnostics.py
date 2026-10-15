@@ -11,7 +11,40 @@ from nanovllm.engine.numerical_diagnostics import (
     anchor_rows, diagnose_hybrid_step, logits_difference, tensor_difference,
     estimate_decode_splits,
     padded_decode_table,
+    anchor_token_rows, trace_first_gdn,
 )
+
+
+class Gate(torch.nn.Module):
+    def forward(self, hidden, gate):
+        return hidden + gate
+
+
+class Qwen3_5GatedDeltaNet(torch.nn.Module):
+    """CPU fixture for the actual GDN observation boundaries, not GDN math."""
+    def __init__(self):
+        super().__init__()
+        self.value_dim = 4
+        self.conv_delta = 0.
+        self.fail_conv = False
+        for name in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"):
+            setattr(self, name, torch.nn.Identity())
+        self.norm = Gate()
+
+    def _run_causal_conv1d(self, mixed_qkv, conv_state=None, prefill_seqlens=None):
+        if self.fail_conv:
+            raise RuntimeError("GDN convolution failure")
+        return mixed_qkv + self.conv_delta, conv_state
+
+    def forward(self, hidden_states):
+        raw = self.in_proj_qkv(hidden_states).transpose(1, 2)
+        core, _ = self._run_causal_conv1d(mixed_qkv=raw)
+        core = core.transpose(1, 2)
+        z = self.in_proj_z(hidden_states)
+        self.in_proj_b(hidden_states)
+        self.in_proj_a(hidden_states)
+        output = self.norm((core * .5).reshape(-1, 2), z.reshape(-1, 2))
+        return self.out_proj(output.reshape_as(hidden_states))
 
 
 class Pool:
@@ -101,6 +134,57 @@ def requests():
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_token_anchors_align_packed_sequence_and_flattened_heads(self):
+        tokens = torch.arange(24).reshape(1, 6, 4)
+        self.assertEqual(anchor_token_rows(tokens, 2).tolist(), [[0, 1, 2, 3], [12, 13, 14, 15]])
+        self.assertTrue(torch.equal(anchor_token_rows(tokens, 2),
+                                    anchor_token_rows(tokens.reshape(-1, 2), 2, features=4)))
+
+    def test_first_gdn_trace_aligns_all_stages_without_changing_output(self):
+        gdn = Qwen3_5GatedDeltaNet()
+        hidden = torch.arange(8).reshape(2, 1, 4).float()
+        expected = gdn(hidden_states=hidden)
+        with trace_first_gdn(gdn, 2) as stages:
+            actual = gdn(hidden_states=hidden)
+            self.assertTrue(torch.equal(actual, expected))
+            baseline = dict(stages)
+            stages.clear()
+            packed = hidden.reshape(2, 4).repeat_interleave(3, 0).reshape(1, 6, 4)
+            gdn(hidden_states=packed)
+            self.assertEqual(len(stages), 11)
+            for name, value in stages.items():
+                self.assertTrue(torch.equal(value, baseline[name]), name)
+        self.assertNotIn("_run_causal_conv1d", gdn.__dict__)
+        for part in gdn.modules():
+            self.assertFalse(part._forward_hooks)
+            self.assertFalse(part._forward_pre_hooks)
+
+    def test_first_gdn_trace_distinguishes_conv_output_from_history(self):
+        gdn = Qwen3_5GatedDeltaNet()
+        hidden = torch.arange(8).reshape(2, 1, 4).float()
+        with trace_first_gdn(gdn, 2) as stages:
+            gdn(hidden_states=hidden)
+            baseline = dict(stages)
+            stages.clear()
+            gdn.conv_delta = .25
+            gdn(hidden_states=hidden)
+            first = next(name for name, value in stages.items() if not torch.equal(value, baseline[name]))
+            self.assertEqual(first, "conv.output")
+            self.assertTrue(torch.equal(stages["conv.input"], baseline["conv.input"]))
+
+    def test_first_gdn_trace_failure_restores_existing_method_override(self):
+        gdn = Qwen3_5GatedDeltaNet()
+        original = gdn._run_causal_conv1d
+        gdn._run_causal_conv1d = original
+        gdn.fail_conv = True
+        with self.assertRaisesRegex(RuntimeError, "GDN convolution failure"):
+            with trace_first_gdn(gdn, 2):
+                gdn(hidden_states=torch.ones(2, 1, 4))
+        self.assertIs(gdn._run_causal_conv1d, original)
+        for part in gdn.modules():
+            self.assertFalse(part._forward_hooks)
+            self.assertFalse(part._forward_pre_hooks)
+
     def test_splitkv_estimate_changes_partition_for_batch16(self):
         for batch in (1, 4):
             a = estimate_decode_splits(batch, 12, 2, 256, 256, 108)

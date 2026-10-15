@@ -61,7 +61,7 @@ def main():
     environment_file = Path(args.results).parent.parent / "environment.json"
     source_environment = json.loads(environment_file.read_text()) if environment_file.exists() else {}
     report = {"purpose": "fixed-history diagnostic, not a benchmark or correctness pass",
-              "diagnostic_version": "table_width_ablation_v2",
+              "diagnostic_version": "first_gdn_stages_v3",
               "arguments": vars(args), "source_commit": source_environment.get("git_commit"),
               "source_token_consistency_passed": source.get("token_consistency_passed"), "steps": []}
     try:
@@ -97,11 +97,16 @@ def main():
                 print(f"probe input={step}, prediction={step+1}: " + "; ".join(
                     f"{mode}: argmax_diff={result['logits'].get('argmax_mismatches')}, "
                     f"hidden_max={result['hidden'].get('max_abs')}, "
-                    f"first_layer={result['first_nonidentical_layer']}" +
+                    f"first_layer={result['first_nonidentical_layer']}, "
+                    f"first_gdn={result['first_nonidentical_gdn_stage']}" +
                     (f", vs_graph_hidden_exact={result['against_graph']['hidden']['exact']}, "
                      f"vs_graph_logits_exact={result['against_graph']['logits']['exact']}"
                      if 'against_graph' in result else '')
                     for mode, result in rank0.items()), flush=True)
+                for mode in ("verify_one", "verify_block"):
+                    print(f"  {mode} first GDN: " + "; ".join(
+                        f"{row['stage']}={'exact' if row.get('exact') else row.get('max_abs', 'shape/nonfinite')}"
+                        for row in rank0[mode]["first_gdn_stages"]), flush=True)
             llm.scheduler.postprocess(seqs, [tokens[step + 1] for tokens in oracle], False)
         report["diagnostic_completed"] = True
         write_json(args.output, report)

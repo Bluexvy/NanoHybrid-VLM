@@ -1,6 +1,6 @@
 """Opt-in fixed-history diagnostics. Never used by normal generation or timing."""
 import math
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import torch
 import torch.distributed as dist
 
@@ -83,6 +83,69 @@ def anchor_rows(tensor, batch):
     return tensor[::tensor.shape[0] // batch]
 
 
+def anchor_token_rows(tensor, batch, features=None):
+    """Align Decode [B,1,C], packed [1,B*L,C], or flattened head rows."""
+    width = tensor.shape[-1] if features is None else features
+    return anchor_rows(tensor.reshape(-1, width), batch).detach().float().cpu().clone()
+
+
+@contextmanager
+def trace_first_gdn(model, batch):
+    """Observe the first GDN only; never replace its mathematical operations."""
+    stages = {}
+    module = next((part for part in model.modules()
+                   if part.__class__.__name__ == "Qwen3_5GatedDeltaNet"), None)
+    if module is None:
+        yield stages
+        return
+    handles = []
+    original_conv = module._run_causal_conv1d
+    had_override = "_run_causal_conv1d" in module.__dict__
+    wrapped = False
+
+    def save(name, tensor, features=None):
+        stages[name] = anchor_token_rows(tensor, batch, features)
+
+    def input_hook(part, args, kwargs):
+        save("input", kwargs["hidden_states"] if "hidden_states" in kwargs else args[0])
+
+    def output_hook(name, features=None):
+        def hook(part, args, output):
+            save(name, output, features)
+        return hook
+
+    def conv(*args, **kwargs):
+        raw = kwargs["mixed_qkv"] if "mixed_qkv" in kwargs else args[0]
+        save("conv.input", raw.transpose(1, 2))
+        result = original_conv(*args, **kwargs)
+        save("conv.output", result[0].transpose(1, 2))
+        return result
+
+    def norm_input(part, args):
+        # norm sees [tokens*value_heads, head_dim], not token-major hidden rows.
+        save("recurrent.output", args[0], module.value_dim)
+        save("norm.gate", args[1], module.value_dim)
+
+    try:
+        handles.append(module.register_forward_pre_hook(input_hook, with_kwargs=True))
+        for name in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"):
+            handles.append(getattr(module, name).register_forward_hook(output_hook(name)))
+        module._run_causal_conv1d = conv
+        wrapped = True
+        handles.append(module.norm.register_forward_pre_hook(norm_input))
+        handles.append(module.norm.register_forward_hook(output_hook("norm.output", module.value_dim)))
+        handles.append(module.out_proj.register_forward_hook(output_hook("out_proj.output")))
+        yield stages
+    finally:
+        if wrapped:
+            if had_override:
+                module._run_causal_conv1d = original_conv
+            else:
+                del module._run_causal_conv1d
+        for handle in handles:
+            handle.remove()
+
+
 @contextmanager
 def padded_decode_table(runner, columns):
     """Diagnostic ablation: change table capacity only, retaining live KV IDs.
@@ -140,6 +203,7 @@ def diagnose_hybrid_step(runner, seqs, lookahead, probe=True):
     baseline_states = None
     original_compute = runner.model.compute_logits
     handles, trace, observed, comparisons = [], {}, {}, {}
+    stage_trace, stack = {}, ExitStack()
     language = runner.model.model.language_model
 
     def record_logits(hidden):
@@ -165,10 +229,20 @@ def diagnose_hybrid_step(runner, seqs, lookahead, probe=True):
                              "layers": layer_errors,
                              "first_nonidentical_layer": next((r["layer"] for r in layer_errors
                                                               if not r.get("exact", False)), None)}
+        stage_errors = [{"stage": key, **tensor_difference(base_stages[key], value)}
+                        for key, value in stage_trace.items() if key in base_stages]
+        comparisons[name]["first_gdn_stages"] = stage_errors
+        comparisons[name]["first_nonidentical_gdn_stage"] = next(
+            (row["stage"] for row in stage_errors if not row.get("exact", False)), None)
         if runner.rank == 0:
             comparisons[name]["logits"] = logits_difference(base_logits, logits)
 
+    def clear_traces():
+        trace.clear()
+        stage_trace.clear()
+
     try:
+        stage_trace = stack.enter_context(trace_first_gdn(runner.model, batch))
         runner.model.compute_logits = record_logits
         for index, layer in enumerate(language.layers):
             handles.append(layer.register_forward_hook(hook_for(f"decoder.{index}")))
@@ -178,10 +252,11 @@ def diagnose_hybrid_step(runner, seqs, lookahead, probe=True):
         baseline_states = manager.read_batched_states(slots)
         base_hidden, base_logits, base_trace = observed["hidden"], observed.get("logits"), dict(trace)
         base_table_columns = observed["table_columns"]
+        base_stages = dict(stage_trace)
 
         if batch in runner.hybrid_graphs:
             manager.write_batched_states(slots, checkpoint)
-            trace.clear()
+            clear_traces()
             runner.enforce_eager = False
             graph_ids = runner.run_hybrid_decode(seqs)
             compare("decode_graph", observed["hidden"], observed.get("logits"), manager.read_batched_states(slots))
@@ -192,7 +267,7 @@ def diagnose_hybrid_step(runner, seqs, lookahead, probe=True):
             # Compare directly with Graph, rather than inferring equality from
             # coincidentally equal max-error summaries against the baseline.
             manager.write_batched_states(slots, checkpoint)
-            trace.clear()
+            clear_traces()
             runner.enforce_eager = True
             columns = runner.hybrid_graph_workspace.block_tables.shape[1]
             with padded_decode_table(runner, columns):
@@ -206,7 +281,7 @@ def diagnose_hybrid_step(runner, seqs, lookahead, probe=True):
 
             # Same static tensors as Graph, but executed by Python, with hooks.
             manager.write_batched_states(slots, checkpoint)
-            trace.clear()
+            clear_traces()
             ids, positions = runner.prepare_decode(seqs)
             dynamic = get_context()
             workspace = runner.hybrid_graph_workspace
@@ -224,7 +299,7 @@ def diagnose_hybrid_step(runner, seqs, lookahead, probe=True):
 
         for name, drafts in (("verify_one", [[] for _ in seqs]), ("verify_block", lookahead)):
             manager.write_batched_states(slots, checkpoint)
-            trace.clear()
+            clear_traces()
             logits, hidden, updated, records = runner._verify_mtp_batch(seqs, drafts)
             positions, offset = [], 0
             for tokens in drafts:
@@ -272,6 +347,7 @@ def diagnose_hybrid_step(runner, seqs, lookahead, probe=True):
         runner.model.compute_logits = original_compute
         for handle in handles:
             handle.remove()
+        stack.close()
         # Alternate paths must not contaminate the continuation history.
         manager.write_batched_states(slots, baseline_states if baseline_states is not None else checkpoint)
         reset_context()
