@@ -21,11 +21,15 @@ def main():
     parser.add_argument("--draft", required=True)
     parser.add_argument("--tp", type=int, default=2)
     parser.add_argument("--backend", choices=("auto", "cuda", "reference"), default="auto")
+    parser.add_argument("--gdn-decode-backend", choices=("fla", "state_aware_triton", "state_aware_cuda"),
+                        default="state_aware_cuda")
     parser.add_argument("--report", required=True)
     args = parser.parse_args()
     report = {"passed": False, "python": sys.version, "executable": sys.executable,
         "model": str(Path(args.model).resolve()), "draft": str(Path(args.draft).resolve()),
-        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"), "packages": {}}
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"), "packages": {},
+        "gdn_decode_backend": args.gdn_decode_backend, "gdn_verification_backend": args.backend,
+        "gdn_replay_backend": args.backend}
     try:
         for package in ("torch", "transformers", "triton", "flash-attn", "flash-linear-attention", "causal-conv1d", "ninja"):
             try: report["packages"][package] = metadata.version(package)
@@ -48,7 +52,12 @@ def main():
         from causal_conv1d import causal_conv1d_fn
         config = Config(args.model, speculative_method="dflash", dflash_model=args.draft,
             dflash_num_speculative_tokens=3, tensor_parallel_size=args.tp,
-            max_num_seqs=2, hybrid_cuda_graph_batch_sizes=(1, 2), enforce_eager=True)
+            max_num_seqs=2, hybrid_cuda_graph_batch_sizes=(1, 2), enforce_eager=True,
+            gdn_decode_backend=args.gdn_decode_backend)
+        if args.gdn_decode_backend == "state_aware_cuda":
+            text = config.text_config
+            if (text.linear_key_head_dim, text.linear_value_head_dim, text.linear_conv_kernel_dim) != (128, 128, 4):
+                raise ValueError("state_aware_cuda requires GDN Dk/Dv=128 and convolution width=4")
         if not list(Path(args.model).glob("*.safetensors")):
             raise RuntimeError("Target model directory contains no safetensors weights")
         tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
@@ -67,11 +76,11 @@ def main():
             from download_qwen38 import describe_pair
             report["layout"] = describe_pair(json.loads((Path(args.model) / "config.json").read_text()),
                 json.loads((Path(args.draft) / "config.json").read_text()), args.tp)
-        if args.backend != "reference":
+        if args.backend != "reference" or args.gdn_decode_backend == "state_aware_cuda":
             from torch.utils.cpp_extension import CUDA_HOME
             nvcc = shutil.which("nvcc") or (str(Path(CUDA_HOME) / "bin/nvcc") if CUDA_HOME else None)
             if not nvcc or not Path(nvcc).is_file() or not shutil.which("c++"):
-                raise RuntimeError("CUDA backend needs nvcc and a C++ compiler; use BACKEND=reference RUN_BINDING_TESTS=0 for correctness-only fallback")
+                raise RuntimeError("Selected CUDA backends need nvcc and a C++ compiler; reference verification does not disable state_aware_cuda Decode")
             compiler = subprocess.run([nvcc, "--version"], text=True, capture_output=True, check=True)
             report["nvcc"] = compiler.stdout
         report["passed"] = True

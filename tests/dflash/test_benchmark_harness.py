@@ -8,6 +8,7 @@ from benchmark_utils import chat_ids, counters_delta, speculation_metrics, run_r
 from run_suite import build_plan, classify_errors, compare_reports, launch, render_markdown, main
 from unittest.mock import patch
 import json
+from a800_worker import engine_options
 
 
 class Engine:
@@ -46,6 +47,19 @@ def make_report(case, outputs=None):
 
 
 class HarnessTests(unittest.TestCase):
+    def test_engine_options_select_custom_cuda_for_baseline_and_dflash(self):
+        args = SimpleNamespace(tp=2, token_budget=256, max_model_len=1024, memory_fraction=.82,
+                               backend="auto", draft="draft", gdn_decode_backend="state_aware_cuda")
+        for case in build_plan([1, 4, 16], [3, 7]):
+            with self.subTest(case=case["name"]):
+                options = engine_options(args, case)
+                self.assertEqual(options["gdn_decode_backend"], "state_aware_cuda")
+                self.assertEqual(options["tensor_parallel_size"], 2)
+                self.assertEqual(options["enforce_eager"], not case["graph"])
+                self.assertEqual(options.get("speculative_method"), "dflash" if case["method"] == "dflash" else None)
+        args.gdn_decode_backend = "fla"
+        self.assertEqual(engine_options(args, build_plan([1], [3])[0])["gdn_decode_backend"], "fla")
+
     def test_real_tokenizer_chat_prompt_is_a_flat_token_list(self):
         from tokenizers import Tokenizer
         from tokenizers.models import WordLevel
@@ -111,6 +125,17 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(errors[0]["error"], "input workloads differ")
         self.assertIsNone(compare_outputs([[1, 2]], [[1, 2]]))
 
+    def test_report_rejects_mixed_decode_backends(self):
+        plan = build_plan([1], [3], state_checks=False)
+        reports = [make_report(plan[0]), make_report(plan[1])]
+        reports[0]["gdn_decode_backend"] = "state_aware_cuda"
+        reports[1]["gdn_decode_backend"] = "fla"
+        errors, _ = compare_reports(reports)
+        self.assertEqual(errors[0]["error"], "GDN Decode backends differ")
+        fatal, warnings = classify_errors(reports, errors, True)
+        self.assertEqual(fatal, errors)
+        self.assertEqual(warnings, [])
+
     def test_plan_includes_matched_graph_baseline_and_state_checks(self):
         plan = build_plan([1, 4], [3])
         self.assertEqual(len(plan), 10)
@@ -140,6 +165,7 @@ class HarnessTests(unittest.TestCase):
         plan = build_plan([1], [3], state_checks=False)[:2]
         with tempfile.TemporaryDirectory() as directory:
             def worker(command, log, timeout):
+                self.assertEqual(command[command.index("--gdn-decode-backend") + 1], "state_aware_cuda")
                 spec = json.loads(Path(command[command.index("--spec") + 1]).read_text())
                 output = [[1, 2, 3]] if spec["method"] == "baseline" else [[1, 8, 3]]
                 report = make_report(spec, output)

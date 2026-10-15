@@ -90,3 +90,15 @@ Graph、真实接受率、显存峰值和吞吐。没有启动租卡或下载完
 - 本地 10 项 harness 检查通过，含模拟 worker 生成真实报告的完整调度检查、
   告警/致命错误分类与报告标记；Bash 语法和 full 模式开关透传 dry-run 通过。
 - 没有更改模型、采样、接受规则或状态提交，也没有重新运行完整 27B。
+
+## 显式选择原 Decode CUDA 后端（2026-10-16）
+
+- 套件、preflight、worker 增加 `--gdn-decode-backend`，默认 `state_aware_cuda`；
+  与短序列投机验证/重放的 `--backend` 独立。普通 Eager/Graph 均显式传入引擎。
+- 每个用例和环境报告记录选中的 Decode 后端，worker 启动后核对 Config；
+  报告拒绝把不同 Decode 后端直接作一致性通过。
+- 启动完整权重之前新增原 Conv/Recurrent 绑定测试（B=1/4/16，H=24，Dk/Dv=128，
+  C=5120），覆盖多步更新、变动槽位、固定输出、未寻址状态与 Graph。
+- 本地 12 项 harness 检查通过，含配置/参数透传、禁止混用后端与报告策略回归；
+  完整启动的 Bash 语法和双 CUDA 开关 dry-run 通过。绑定测试在 CPU PyTorch 环境明确跳过。
+  原 CUDA 核心没有修改，真实 C++ 编译与新局部形状数值检查仍需在 A800 执行。

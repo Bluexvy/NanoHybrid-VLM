@@ -14,6 +14,25 @@ from benchmark_utils import (chat_ids, counters_delta, read_workloads, run_reque
                              token_digest, write_json)
 
 
+def engine_options(args, spec):
+    options = {}
+    if spec["method"] == "dflash":
+        options = dict(speculative_method="dflash", dflash_model=args.draft,
+                       dflash_num_speculative_tokens=spec["drafts"])
+    batch = spec["batch"]
+    return dict(tensor_parallel_size=args.tp, max_num_seqs=batch,
+        max_num_batched_tokens=args.token_budget, max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.memory_fraction, enforce_eager=not spec["graph"],
+        scheduler_policy="decode_first" if spec["kind"] == "state_checks" else "prefill_first",
+        max_prefill_wait_ms=60000,
+        hybrid_cuda_graph_batch_sizes=tuple(i for i in (1, 2, 4, 8, 16, 32, 64, 128) if i <= batch),
+        hybrid_prefix_cache_mode="opportunistic" if spec["kind"] == "state_checks" and options else "disabled",
+        prefix_checkpoint_interval_blocks=1, prefix_recurrent_snapshot_dtype="float32",
+        gdn_decode_backend=args.gdn_decode_backend,
+        mtp_gdn_verification_backend=args.backend, mtp_gdn_replay_backend=args.backend,
+        **options)
+
+
 def run(args, spec):
     import torch
     from transformers import AutoTokenizer
@@ -23,25 +42,19 @@ def run(args, spec):
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
-    options = {}
-    if spec["method"] == "dflash":
-        options = dict(speculative_method="dflash", dflash_model=args.draft,
-                       dflash_num_speculative_tokens=spec["drafts"])
+    options = spec["method"] == "dflash"
     batch = spec["batch"]
+    print(f"GDN Decode backend: {args.gdn_decode_backend}; verification/replay: {args.backend}", flush=True)
     start = perf_counter()
-    llm = LLM(args.model, tensor_parallel_size=args.tp, max_num_seqs=batch,
-        max_num_batched_tokens=args.token_budget, max_model_len=args.max_model_len,
-        gpu_memory_utilization=args.memory_fraction, enforce_eager=not spec["graph"],
-        scheduler_policy="decode_first" if spec["kind"] == "state_checks" else "prefill_first",
-        max_prefill_wait_ms=60000,
-        hybrid_cuda_graph_batch_sizes=tuple(i for i in (1, 2, 4, 8, 16, 32, 64, 128) if i <= batch),
-        hybrid_prefix_cache_mode="opportunistic" if spec["kind"] == "state_checks" and options else "disabled",
-        prefix_checkpoint_interval_blocks=1, prefix_recurrent_snapshot_dtype="float32",
-        mtp_gdn_verification_backend=args.backend, mtp_gdn_replay_backend=args.backend,
-        **options)
+    llm = LLM(args.model, **engine_options(args, spec))
     startup = perf_counter() - start
     try:
+        actual_backend = llm.model_runner.config.gdn_decode_backend
+        if actual_backend != args.gdn_decode_backend:
+            raise RuntimeError(f"Requested GDN backend {args.gdn_decode_backend}, got {actual_backend}")
         report = {"case": spec, "passed": False, "startup_seconds_not_timed": startup,
+            "gdn_decode_backend": actual_backend,
+            "gdn_verification_backend": args.backend, "gdn_replay_backend": args.backend,
             "draft_architecture": llm.model_runner.dflash.config.architectures[0] if options else None}
         if spec["kind"] == "state_checks":
             shared = tokenizer.encode("A technical document about GPU memory, caching, and inference scheduling. ",
@@ -118,6 +131,8 @@ def main():
     parser.add_argument("--report", required=True)
     parser.add_argument("--tp", type=int, default=2)
     parser.add_argument("--backend", choices=("auto", "reference", "cuda"), default="auto")
+    parser.add_argument("--gdn-decode-backend", choices=("fla", "state_aware_triton", "state_aware_cuda"),
+                        default="state_aware_cuda")
     parser.add_argument("--output-tokens", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)

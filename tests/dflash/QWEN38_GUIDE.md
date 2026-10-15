@@ -66,8 +66,14 @@ SUITE_MODE=full BATCHES="1 4 16" DRAFTS="3 7" \
 报告保留全部差异，并显示 `Overall: WARN` / `Token consistency: FAIL`，
 JSON 中 `passed=false`、`token_consistency_passed=false`；`performance_completed=true`
 仅表示所有配置已运行结束。这类性能数据仅供排查，不能声称已通过正确性验收。
-当前 worker 没有覆盖 `Config.gdn_decode_backend`，普通 Decode 使用默认 `fla`；
-这些基线数据不能写成相对 `state_aware_cuda` Decode 的加速比。
+当前套件显式选择 `GDN_DECODE_BACKEND=state_aware_cuda`（默认），普通 Eager/Graph
+使用原来的直接寻址 Conv/Recurrent CUDA 算子；投机短序列验证/恢复仍使用独立的验证/replay
+算子，由 `BACKEND=auto|cuda|reference` 控制。两者不是同一个开关。前一版未显式选中
+Decode 后端，产生的默认 FLA 数据不能与这版自定义 CUDA 基线混用。
+日志、environment.json、每个用例与 Markdown 表都记录 Decode 后端；不同 Decode 后端
+的用例不能互相通过基线校验。若需要 FLA 对照，另开一轮 `GDN_DECODE_BACKEND=fla`。
+默认在完整模型加载前增加原始 CUDA 绑定小测试，覆盖每卡 H=24、Dk/Dv=128、Conv C=5120、
+B=1/4/16、动态槽位和 Eager/Graph，检查未寻址状态保持不变。
 
 ```bash
 ALLOW_TOKEN_MISMATCH=1 SUITE_MODE=full BATCHES="1 4 16" DRAFTS="3 7" \

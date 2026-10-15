@@ -55,6 +55,8 @@ def compare_reports(reports):
         if baseline is None:
             errors.append({"case": case["name"], "error": "missing Eager baseline"})
             continue
+        if report.get("gdn_decode_backend") != baseline.get("gdn_decode_backend"):
+            errors.append({"case": case["name"], "error": "GDN Decode backends differ"})
         if len(report["trials"]) != len(baseline["trials"]):
             errors.append({"case": case["name"], "error": "trial counts differ"})
         for index, (expected, actual) in enumerate(zip(baseline["trials"], report["trials"])):
@@ -93,8 +95,8 @@ def render_markdown(reports, errors, comparisons, warnings=None, complete=True):
     status = "FAIL" if fatal else "WARN" if warnings else "PASS" if complete else "RUNNING"
     lines = ["# DFlash A800 test report", "", f"Overall: {status}", "",
         "Fixed-budget Greedy generation. Warmups excluded. Built-in prompts are a smoke workload, not a standard benchmark.", "",
-        "| Case | E2E tok/s | Decode-only tok/s | Accepted drafts | Mean output/verify/request | Mean TTFT ms | Mean TPOT ms |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
+        "| Case | GDN Decode backend | E2E tok/s | Decode-only tok/s | Accepted drafts | Mean output/verify/request | Mean TTFT ms | Mean TPOT ms |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
     def number(value, percent=False):
         if value is None: return "N/A"
         return f"{value:.2%}" if percent else f"{value:.3f}"
@@ -102,7 +104,7 @@ def render_markdown(reports, errors, comparisons, warnings=None, complete=True):
         if "summary" not in report: continue
         s, name = report["summary"], report["case"]["name"]
         spec = s["speculation"]
-        lines.append(f"| {name} | {number(s['end_to_end_output_tokens_per_second'])} | "
+        lines.append(f"| {name} | {report.get('gdn_decode_backend', 'unrecorded')} | {number(s['end_to_end_output_tokens_per_second'])} | "
             f"{number(s['pure_decode_output_tokens_per_second'])} | {number(spec['acceptance_rate'], True)} | "
             f"{number(spec['mean_emitted_tokens_per_request_round'])} | {number(s['mean_request_ttft_ms'])} | "
             f"{number(s['mean_request_tpot_ms'])} |")
@@ -157,6 +159,8 @@ def main():
     parser.add_argument("--drafts", nargs="+", type=int, default=[3])
     parser.add_argument("--tp", type=int, default=2)
     parser.add_argument("--backend", choices=("auto", "cuda", "reference"), default="auto")
+    parser.add_argument("--gdn-decode-backend", choices=("fla", "state_aware_triton", "state_aware_cuda"),
+                        default="state_aware_cuda")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--output-tokens", type=int, default=64)
@@ -195,7 +199,7 @@ def main():
         write_json(spec, case)
         command = [sys.executable, str(ROOT / "tests/dflash/a800_worker.py"), "--model", args.model,
             "--draft", args.draft, "--spec", str(spec), "--report", str(report_file)]
-        for name in ("tp", "backend", "repeats", "warmups", "output_tokens", "max_model_len", "token_budget", "memory_fraction"):
+        for name in ("tp", "backend", "gdn_decode_backend", "repeats", "warmups", "output_tokens", "max_model_len", "token_budget", "memory_fraction"):
             command += ["--" + name.replace("_", "-"), str(getattr(args, name))]
         if args.prompts_jsonl: command += ["--prompts-jsonl", str(Path(args.prompts_jsonl).resolve())]
         if args.thinking: command += ["--thinking"]
