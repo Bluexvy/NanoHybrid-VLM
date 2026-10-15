@@ -27,6 +27,16 @@ def read_workloads(path=None):
     return [dict(row, id=str(row.get("id", i)), task=str(row.get("task", "custom"))) for i, row in enumerate(rows)]
 
 
+def chat_ids(tokenizer, text, thinking):
+    # New Transformers versions default to BatchEncoding; the engine takes list[int].
+    ids = tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=True,
+        add_generation_prompt=True, enable_thinking=thinking, return_dict=False, return_tensors=None)
+    if (not isinstance(ids, list) or not ids
+            or any(not isinstance(token, int) or isinstance(token, bool) or token < 0 for token in ids)):
+        raise TypeError("Chat template must produce a nonempty list of integer token IDs")
+    return ids
+
+
 def write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

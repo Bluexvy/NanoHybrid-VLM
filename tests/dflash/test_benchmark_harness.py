@@ -4,7 +4,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
-from benchmark_utils import counters_delta, speculation_metrics, run_requests, compare_outputs
+from benchmark_utils import chat_ids, counters_delta, speculation_metrics, run_requests, compare_outputs
 from run_suite import build_plan, compare_reports, launch
 
 
@@ -44,6 +44,35 @@ def make_report(case, outputs=None):
 
 
 class HarnessTests(unittest.TestCase):
+    def test_real_tokenizer_chat_prompt_is_a_flat_token_list(self):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import WhitespaceSplit
+        from transformers import PreTrainedTokenizerFast
+
+        backend = Tokenizer(WordLevel({"[UNK]": 0, "[USER]": 1, "hello": 2, "world": 3,
+            "[ASSISTANT]": 4, "[THINK]": 5, "[NO_THINK]": 6}, unk_token="[UNK]"))
+        backend.pre_tokenizer = WhitespaceSplit()
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+        tokenizer.chat_template = ("[USER] {{ messages[0]['content'] }} "
+            "{% if add_generation_prompt %}[ASSISTANT] {% endif %}"
+            "{% if enable_thinking %}[THINK]{% else %}[NO_THINK]{% endif %}")
+        for thinking, last in ((False, 6), (True, 5)):
+            with self.subTest(thinking=thinking):
+                ids = chat_ids(tokenizer, "hello world", thinking)
+                self.assertIsInstance(ids, list)
+                self.assertEqual(ids, [1, 2, 3, 4, last])
+                self.assertTrue(all(type(token) is int for token in ids))
+                result = run_requests(Engine(), [ids], [3], lambda: None)
+                self.assertEqual(result["outputs"], [[0, 1, 2]])
+
+    def test_chat_prompt_rejects_non_token_payloads_before_model_startup(self):
+        for value in ({"input_ids": [1, 2]}, [[1, 2]], [], [True], [1, -2]):
+            with self.subTest(value=value):
+                tokenizer = SimpleNamespace(apply_chat_template=lambda *args, **kwargs: value)
+                with self.assertRaisesRegex(TypeError, "list of integer token IDs"):
+                    chat_ids(tokenizer, "hello", thinking=False)
+
     def test_acceptance_and_advancement_use_different_denominators(self):
         value = speculation_metrics(dict(proposed_tokens=10, accepted_tokens=3,
             verification_request_rounds=4, emitted_tokens=7))

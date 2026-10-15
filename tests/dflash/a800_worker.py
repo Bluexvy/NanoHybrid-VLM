@@ -10,13 +10,8 @@ import traceback
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from benchmark_utils import (counters_delta, read_workloads, run_requests, summarize,
+from benchmark_utils import (chat_ids, counters_delta, read_workloads, run_requests, summarize,
                              token_digest, write_json)
-
-
-def chat_ids(tokenizer, text, thinking):
-    return tokenizer.apply_chat_template([{"role": "user", "content": text}], tokenize=True,
-        add_generation_prompt=True, enable_thinking=thinking)
 
 
 def run(args, spec):

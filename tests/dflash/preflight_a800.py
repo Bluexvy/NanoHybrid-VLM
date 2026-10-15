@@ -12,7 +12,7 @@ import hashlib
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from benchmark_utils import write_json
+from benchmark_utils import chat_ids, write_json
 
 
 def main():
@@ -52,10 +52,8 @@ def main():
         if not list(Path(args.model).glob("*.safetensors")):
             raise RuntimeError("Target model directory contains no safetensors weights")
         tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
-        ids = tokenizer.apply_chat_template([{"role": "user", "content": "Hello"}],
-            tokenize=True, add_generation_prompt=True, enable_thinking=False)
-        if not ids:
-            raise RuntimeError("Tokenizer chat template produced no tokens")
+        ids = chat_ids(tokenizer, "Hello", thinking=False)
+        report["chat_template_token_count"] = len(ids)
         report["target"] = {"hidden_size": config.text_config.hidden_size,
                             "vocab_size": config.text_config.vocab_size,
                             "num_hidden_layers": config.text_config.num_hidden_layers,

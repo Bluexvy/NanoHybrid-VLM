@@ -67,3 +67,14 @@ Graph、真实接受率、显存峰值和吞吐。没有启动租卡或下载完
 - 本地 CUDA 12.8 / RTX 3060 Laptop：8 组状态重放 Graph 检查、12 组融合验证检查通过，
   包含 FP32/FP16/BF16、非连续输入和 Graph；这些运行也编译了全部输入类型实例。
 - 此轮没有在本地通过完整 PyTorch C++ Binding 或执行完整 27B；仍需服务器重新编译并验收。
+
+## 聊天模板返回类型兼容修复（2026-10-16）
+
+- A800 基线预热请求遇到 `prompt must be ...`：新版 Transformers 的聊天模板默认返回
+  `BatchEncoding`，测试 worker 原先把它直接当作 token 列表传入引擎。
+- worker 与 preflight 共用 `chat_ids`，显式设置 `return_dict=False`、`return_tensors=None`，
+  并检查非空的一维非负整数列表，避免在完整模型加载后才发现不支持的输入类型。
+- 在 Transformers 5.7.0 / 4.52.4 中分别运行 benchmark harness 的 8 项检查，全部通过。
+  新增检查使用内存中构造的真实 fast tokenizer，核对 thinking 开关、实际 token ID 和请求提交；
+  无需模型权重或网络。另检查非法返回格式会立即失败。
+- 这里只验证了输入兼容性；完整 27B / A800 用例仍需服务器重跑。
