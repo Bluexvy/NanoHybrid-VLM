@@ -12,6 +12,13 @@ template <typename T> __device__ __forceinline__ float as_float(T x) { return fl
 template <> __device__ __forceinline__ float as_float(__half x) { return __half2float(x); }
 template <> __device__ __forceinline__ float as_float(__nv_bfloat16 x) { return __bfloat162float(x); }
 
+// PyTorch disables CUDA's implicit half/BF16 constructors in extension builds.
+template <typename T> __device__ __forceinline__ T from_float(float x) { return T(x); }
+template <> __device__ __forceinline__ __half from_float<__half>(float x) { return __float2half_rn(x); }
+template <> __device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float x) {
+    return __float2bfloat16_rn(x);
+}
+
 __device__ __forceinline__ float warp_sum(float x) {
     #pragma unroll
     for (int step = 16; step; step >>= 1) x += __shfl_xor_sync(0xffffffffu, x, step);
@@ -160,11 +167,11 @@ __global__ void verify_conv(VerifyParams vp) {
         #pragma unroll
         for (int i = 0; i < 4; ++i) result += state[i] * weight[i];
         if (vp.activation) result = result / (1.f + expf(-result));
-        output[t] = Input(result);
+        output[t] = from_float<Input>(result);
     }
     Input* updated = static_cast<Input*>(p.conv_output) + row * 4;
     #pragma unroll
-    for (int i = 0; i < 4; ++i) updated[i] = Input(state[i]);
+    for (int i = 0; i < 4; ++i) updated[i] = from_float<Input>(state[i]);
 }
 
 template <typename Input>

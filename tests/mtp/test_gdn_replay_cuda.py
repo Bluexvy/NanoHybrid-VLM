@@ -143,6 +143,9 @@ class NVRTCReplay:
             for expression in expressions:
                 check("nvrtcAddNameExpression", program, expression.encode())
             options = ["--std=c++17", f"--gpu-architecture=compute_{arch}", "--fmad=false",
+                       # Match PyTorch cpp_extension: catch disabled implicit conversions here too.
+                       "-D__CUDA_NO_HALF_OPERATORS__", "-D__CUDA_NO_HALF_CONVERSIONS__",
+                       "-D__CUDA_NO_BFLOAT16_CONVERSIONS__", "-D__CUDA_NO_HALF2_OPERATORS__",
                        "-DGDN_REPLAY_NVRTC", f"--include-path={toolkit / 'include'}",
                        f"--include-path={source.parent}"]
             options_array = (ct.c_char_p * len(options))(*(x.encode() for x in options))

@@ -57,3 +57,13 @@ Graph、真实接受率、显存峰值和吞吐。没有启动租卡或下载完
 还没有完成：完整 27B 的 HF/引擎 Greedy 对齐、A800 NCCL、实际 C++ Binding 编译运行、
 接受率和吞吐。服务器脚本准备好了这些验收所需的引擎基线/投机对比和 Binding 门槛；
 不能把本地小模型通过写成完整 27B 测试通过。
+
+## A800 扩展编译错误修复（2026-10-16）
+
+- 服务器实际编译暴露：PyTorch 扩展定义了 `__CUDA_NO_HALF_CONVERSIONS__` 和
+  `__CUDA_NO_BFLOAT16_CONVERSIONS__`，`verify_conv` 的两处浮点写回不能调用隐式构造函数。
+- 写回改用显式 `__float2half_rn` / `__float2bfloat16_rn`，FP32 写回保持原样。
+  本地 NVRTC 检查现在使用同样的四个 PyTorch half/BF16 限制宏。
+- 本地 CUDA 12.8 / RTX 3060 Laptop：8 组状态重放 Graph 检查、12 组融合验证检查通过，
+  包含 FP32/FP16/BF16、非连续输入和 Graph；这些运行也编译了全部输入类型实例。
+- 此轮没有在本地通过完整 PyTorch C++ Binding 或执行完整 27B；仍需服务器重新编译并验收。
